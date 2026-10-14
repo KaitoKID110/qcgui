@@ -37,11 +37,17 @@ jobs:
       - name: 环境诊断
         # 诊断本身也算一个用例：在**没有 ORCA** 的机器上，它必须给出明确结论
         # 而不是崩掉。缺 ORCA 时它按设计返回 1（"不能算"）—— CI 里这是预期结果，
-        # 所以这里只拦真正的异常退出（>=2）。
+        # 所以只拦真正的异常退出（>=2）。
+        #
+        # 注意结尾必须显式 `exit 0`：Actions 的 pwsh 包装器会在脚本末尾自动追加
+        # `exit $LASTEXITCODE`，最后一条原生命令的退出码会被原样带出去 ——
+        # 光写 Write-Host 不足以把它清掉（写这个文件时踩过，CI 因此红了两次）。
         run: |
           python main.py --doctor
-          if ($LASTEXITCODE -gt 1) { throw "诊断异常退出，退出码 $LASTEXITCODE" }
-          Write-Host "（退出码 $LASTEXITCODE = 缺 ORCA，CI 里属预期）"
+          $code = $LASTEXITCODE
+          if ($code -gt 1) { throw "诊断异常退出，退出码 $code" }
+          Write-Host "（退出码 $code = 缺 ORCA，CI 里属预期）"
+          exit 0
         shell: pwsh
 
       - name: 跑测试
@@ -57,4 +63,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $failed++ }
           }
           if ($failed -gt 0) { throw "$failed 个测试文件失败" }
+          # 同上：必须显式收尾，否则最后一条原生命令的退出码会漏出去
+          exit 0
         shell: pwsh
