@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qcgui — 量化计算工作台</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>qcgui</h1>
+      <p>量化计算工作台 · ORCA</p>
+    </div>
+  </div>
+
+  <div class="topbar-status">
+    <span class="status-chip" id="chip-engine" title="计算引擎">
+      <i class="dot"></i><span class="label">引擎</span><b>检测中…</b>
+    </span>
+    <span class="status-chip" id="chip-tools" title="外部工具">
+      <i class="dot"></i><span class="label">外部工具</span><b>检测中…</b>
+    </span>
+    <span class="status-chip" id="chip-jobs" title="任务存储位置">
+      <i class="dot"></i><span class="label">任务</span><b>—</b>
+    </span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn ghost" id="btn-refresh" title="刷新任务与状态">刷新</button>
+    <button class="btn ghost" id="btn-settings" title="设置外部工具路径">设置</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ============================= 左栏：结构与计算设置 ============================= -->
+  <aside class="panel col-left">
+    <div class="panel-head"><h2>结构</h2></div>
+
+    <div class="panel-body">
+      <div class="dropzone" id="dropzone">
+        <strong>拖放结构文件到此</strong>
+        <span>.xyz / .cjson / .json</span>
+      </div>
+
+      <div class="row">
+        <button class="btn" id="btn-open">打开文件…</button>
+        <button class="btn ghost" id="btn-smiles">从 SMILES</button>
+      </div>
+      <div class="row">
+        <select id="example-select" class="input grow">
+          <option value="">示例结构…</option>
+        </select>
+      </div>
+
+      <div class="structure-info" id="structure-info">
+        <div class="kv"><span>名称</span><b id="info-name">—</b></div>
+        <div class="kv"><span>式量</span><b id="info-formula">—</b></div>
+        <div class="kv"><span>原子数</span><b id="info-atoms">—</b></div>
+        <div class="kv"><span>电荷 / 多重度</span><b id="info-charge">—</b></div>
+      </div>
+
+      <div class="charge-row">
+        <label>电荷 <input type="number" id="input-charge" class="input" value="0" step="1"></label>
+        <label>多重度 <input type="number" id="input-mult" class="input" value="1" step="1" min="1"></label>
+      </div>
+
+      <div class="expr" id="formula-display"></div>
+    </div>
+
+    <div class="panel-head"><h2>计算设置</h2></div>
+    <div class="panel-body">
+      <label class="field">
+        <span>配方（预设）</span>
+        <div class="row">
+          <select id="select-recipe" class="input grow"></select>
+          <button class="btn ghost small" id="btn-fav" title="收藏 / 取消收藏">★</button>
+        </div>
+      </label>
+      <p class="hint mono" id="recipe-keywords"></p>
+      <p class="hint" id="recipe-note"></p>
+
+      <label class="field">
+        <span>任务类型</span>
+        <select id="select-jobtype" class="input"></select>
+      </label>
+
+      <label class="field">
+        <span>方法 / 泛函</span>
+        <input type="text" id="input-method" class="input" list="method-list" value="B3LYP">
+        <datalist id="method-list">
+          <option value="HF"><option value="B3LYP"><option value="B3LYP-D4">
+          <option value="PBE0"><option value="PBE"><option value="M06-2X">
+          <option value="wB97X-D4"><option value="wB97M-V"><option value="r2SCAN">
+          <option value="r2SCAN-3c"><option value="PBEh-3c"><option value="B97-3c">
+          <option value="TPSS"><option value="CAM-B3LYP"><option value="MP2">
+          <option value="DLPNO-MP2"><option value="DLPNO-CCSD(T)"><option value="CCSD(T)">
+        </datalist>
+      </label>
+
+      <label class="field">
+        <span>基组</span>
+        <input type="text" id="input-basis" class="input" list="basis-list" value="def2-SVP">
+        <datalist id="basis-list">
+          <option value="STO-3G"><option value="def2-SVP"><option value="def2-TZVP">
+          <option value="def2-TZVPP"><option value="def2-QZVPP"><option value="pcSseg-2">
+          <option value="6-31G*"><option value="6-311G**"><option value="cc-pVDZ">
+          <option value="cc-pVTZ"><option value="ma-def2-TZVP">
+        </datalist>
+      </label>
+      <p class="hint">复合方法（<code>r2SCAN-3c</code> / <code>PBEh-3c</code> / <code>B97-3c</code>）自带基组，把基组留空即可。</p>
+
+      <label class="field">
+        <span>势能面扫描</span>
+        <select id="select-scan" class="input">
+          <option value="">不扫描</option>
+          <option value="bond">键长</option>
+          <option value="angle">键角</option>
+          <option value="dihedral">二面角</option>
+        </select>
+      </label>
+      <div id="scan-options" hidden>
+        <label class="field">
+          <span>原子编号（从 0 起）</span>
+          <input type="text" id="input-scan-atoms" class="input" placeholder="3 0 1 2">
+        </label>
+        <label class="field">
+          <span>起点 / 终点 / 点数</span>
+          <input type="text" id="input-scan-range" class="input" placeholder="0 120 13">
+        </label>
+        <p class="hint" id="scan-hint"></p>
+      </div>
+
+      <label class="field">
+        <span>溶剂（SMD，留空为气相）</span>
+        <select id="select-solvent" class="input"></select>
+      </label>
+
+      <label class="field">
+        <span>几何来源</span>
+        <select id="select-geometry" class="input">
+          <option value="">当前载入的结构</option>
+        </select>
+      </label>
+      <p class="hint">选一个已完成的任务，就用它**优化后的几何**作为本次计算的起点（几何血缘）。</p>
+
+      <div class="charge-row">
+        <label>并行核数 <input type="number" id="input-nprocs" class="input" value="4" min="1" step="1"></label>
+        <label>内存/进程 <input type="number" id="input-maxcore" class="input" value="2000" min="0" step="500"></label>
+      </div>
+
+      <label class="checkbox" id="wrap-calc-hess">
+        <input type="checkbox" id="input-calc-hess">
+        <span>过渡态优化前先算精确 Hessian</span>
+      </label>
+
+      <div class="run-row">
+        <button class="btn primary big" id="btn-run">▶ 运行</button>
+        <button class="btn danger" id="btn-cancel" disabled>■ 取消</button>
+      </div>
+      <button class="btn ghost full" id="btn-batch" title="多选结构，算相对能量">批量中间体…</button>
+    </div>
+  </aside>
+
+  <!-- ============================= 中栏：3D 查看器 ============================= -->
+  <section class="panel col-viewer">
+    <div class="panel-head">
+      <h2>分子可视化</h2>
+      <div class="viewer-actions">
+        <div class="segmented" id="seg-style">
+          <button data-style="ballstick" class="active">球棍</button>
+          <button data-style="spacefill">空间填充</button>
+          <button data-style="stick">棍状</button>
+          <button data-style="wireframe">线框</button>
+        </div>
+        <div class="segmented" id="seg-color">
+          <button data-color="element" class="active">按元素</button>
+          <button data-color="charge">按电荷</button>
+        </div>
+        <button class="btn ghost small" id="btn-labels" title="在每个原子上显示元素与原子编号（编号从 0 起，填扫描坐标时要用）">原子编号</button>
+        <button class="btn ghost small" id="btn-autorotate">自转</button>
+        <button class="btn ghost small" id="btn-reset">复位</button>
+      </div>
+    </div>
+
+    <div class="viewer-wrap">
+      <canvas id="viewer"></canvas>
+      <div class="viewer-overlay">
+        <div class="overlay-line" id="viewer-caption">尚未载入结构</div>
+        <div class="overlay-line muted" id="viewer-sub">拖拽旋转 · 滚轮缩放 · 右键平移 · 双击复位</div>
+      </div>
+      <div class="viewer-empty" id="viewer-empty">
+        <p>把 <code>.xyz</code> 文件拖进来，或点击左侧「打开文件」</p>
+      </div>
+    </div>
+
+    <div class="trajectory" id="trajectory" hidden>
+      <div class="traj-row">
+        <button class="btn ghost small" id="btn-play">▶ 播放轨迹</button>
+        <input type="range" id="range-frame" min="0" max="0" step="0.05" value="0">
+        <span class="mono" id="label-frame">0 / 0</span>
+        <span class="mono muted" id="label-frame-energy"></span>
+      </div>
+      <canvas id="irc-profile" class="irc-profile" title="能量剖面（点击可跳转）"></canvas>
+    </div>
+
+    <div class="external-bar">
+      <span class="muted">用外部工具打开当前结构：</span>
+      <button class="btn ghost small" data-external="avogadro">Avogadro2</button>
+      <button class="btn ghost small" data-external="multiwfn">Multiwfn</button>
+      <button class="btn ghost small" id="btn-open-folder">结果文件夹</button>
+    </div>
+  </section>
+
+  <!-- ============================= 右栏：任务与结果 ============================= -->
+  <aside class="panel col-right">
+    <div class="panel-head">
+      <h2>任务</h2>
+      <span class="muted mono" id="jobs-count">0</span>
+      <a class="btn ghost small" id="btn-report" href="/api/report.csv" title="把已完成任务导成 CSV">导出 CSV</a>
+    </div>
+    <div class="jobs-list" id="jobs-list">
+      <p class="empty">还没有任务</p>
+    </div>
+
+    <div class="panel-head"><h2>结果</h2><span class="muted mono" id="result-job"></span></div>
+    <div class="result-body" id="result-body">
+      <p class="empty">选中一个任务查看结果</p>
+    </div>
+  </aside>
+
+</main>
+
+<section class="panel panel-log">
+  <div class="panel-head">
+    <h2>运行日志</h2>
+    <div class="log-actions">
+      <span class="conn" id="conn-state">连接中…</span>
+      <label class="checkbox small"><input type="checkbox" id="input-autoscroll" checked><span>自动滚动</span></label>
+      <button class="btn ghost small" id="btn-clear-log">清空</button>
+    </div>
+  </div>
+  <pre class="log" id="log"></pre>
+</section>
+
+<div class="toast-wrap" id="toast-wrap"></div>
+
+<!-- 设置弹窗 -->
+<dialog id="dialog-settings" class="dialog">
+  <form method="dialog">
+    <h3>外部工具路径</h3>
+    <p class="hint">留空则自动探测。修改后立即生效。</p>
+
+    <label class="field"><span>ORCA（orca.exe）</span>
+      <input type="text" id="cfg-orca" class="input" placeholder="留空自动探测"></label>
+    <p class="hint" id="orca-hint"></p>
+
+    <label class="field"><span>Multiwfn</span>
+      <input type="text" id="cfg-multiwfn" class="input" placeholder="自动探测"></label>
+    <label class="field"><span>Avogadro2</span>
+      <input type="text" id="cfg-avogadro" class="input" placeholder="自动探测"></label>
+    <label class="field"><span>obabel</span>
+      <input type="text" id="cfg-obabel" class="input" placeholder="自动探测"></label>
+    <label class="field"><span>网页端口</span>
+      <input type="number" id="cfg-web_port" class="input" min="1024" max="65535"></label>
+    <label class="checkbox"><input type="checkbox" id="cfg-auto_open_browser"><span>启动时自动打开浏览器</span></label>
+
+    <div class="dialog-actions">
+      <button class="btn ghost" value="cancel">取消</button>
+      <button class="btn primary" id="btn-save-settings" value="ok">保存</button>
+    </div>
+  </form>
+  <div class="dialog-actions" style="border-top:1px solid var(--line-soft); padding-top:12px; margin-top:12px">
+    <button class="btn danger" id="btn-shutdown">关闭服务</button>
+  </div>
+</dialog>
+
+<script src="/static/viewer.js"></script>
+<script src="/static/scanblock.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

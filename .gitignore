@@ -1,0 +1,50 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 运行时产生：任务目录、ORCA 的中间文件 ----
+# 注意：目录模式**必须锚定到仓库根**（前面的 /）。
+# 写成 `jobs/` 会把源码包 `qcgui/jobs/` 一起排除掉 —— 实测踩过：
+# 克隆出来少了整个 qcgui.jobs，测试直接 ModuleNotFoundError。
+/jobs/
+/runs/
+*.out
+*.gbw
+*.densities
+*.densitiesinfo
+*.property.txt
+*.property.json
+*.hess
+*.opt
+*.engrad
+*.bibtex
+*.nbo
+*.47
+*.tmp
+*.bas*
+*.tmp.*
+
+# ---- 本机专属，不公开 ----
+# audit/ 是内部缺陷审计报告（含未修复项、本机路径与协作记录）
+/audit/
+# tools/local/ 是只对本机有意义的一次性脚本（编码修复、按本机任务 ID 排查等）
+/tools/local/
+# 本机配置与临时产物
+/config.json
+*.log
+*.bak
+*~
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

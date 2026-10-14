@@ -1,0 +1,24 @@
+# qcgui 运行依赖
+#
+# 版本下限是**保守值**（本机实测可用，见每行注释）。装法：
+#
+#     python -m pip install -r requirements.txt
+#
+# 也可以用 conda / mamba 装 flask 与 rdkit。
+#
+# ---- 必需：没有它界面起不来 ----
+Flask>=3.0            # 实测 3.1.3；界面与 HTTP 接口
+Werkzeug>=3.0         # 实测 3.1.8；Flask 的依赖，测试里直接用它的 make_server
+
+# ---- 可选：缺了不影响启动，只少一项功能 ----
+rdkit>=2023.9         # 实测 2026.3.3；「从 SMILES 生成结构」与构型判断。
+                      # 缺了只能用 xyz / cjson 文件，其余功能照常。
+Pillow>=10.0          # 实测 12.2.0；仅 tools/plot_scan.py 把扫描曲线导成图片。
+
+# ---- 说明 ----
+# * 需要 **Python 3.10+**（用了 `X | None` 类型写法）。
+# * **tkinter** 是标准库的一部分，但部分精简版 Python 不打包它。
+#   桌面界面（--tk）与启动失败时的弹窗需要它；只用网页界面的话不是必须。
+# * **numpy 不是本项目的依赖** —— 由 rdkit 间接带入，代码里没有直接 import。
+# * 量化计算本身由外部程序 ORCA 完成，它不是 Python 包：
+#   装好 ORCA 后，在界面「设置」里填入 orca.exe 的路径，或把它的目录加入 PATH。

@@ -1,0 +1,1882 @@
+/* ==========================================================================
+   qcgui 网页界面 —— 前端逻辑
+   零依赖（本机无外网）。所有数据来自 /api/*，日志走 SSE。
+   ========================================================================== */
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  molecule: null,        // 当前结构 {symbols, coords, name, charge, multiplicity, formula}
+  jobs: [],
+  selectedJob: null,
+  result: null,
+  viewer: null,
+  currentJobId: null,    // 正在跑的任务
+  batchId: null,
+  jobTypes: [],
+  recipes: [],
+  recipe: null,          // 当前选中的配方
+  moleculePath: null,    // 当前结构的来源文件（工具栏外部工具要用）
+  busy: false,
+};
+
+// ------------------------------------------------------------------ 小工具
+
+function esc(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function toast(message, kind) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.textContent = message;
+  $('toast-wrap').appendChild(el);
+  setTimeout(() => {
+    el.style.transition = 'opacity .3s';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 320);
+  }, kind === 'err' ? 6500 : 3800);
+}
+
+async function api(path, options) {
+  const res = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, options));
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    const detail = (data && (data.error || data.message)) || res.statusText;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+function logLine(text, cls) {
+  const pre = $('log');
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text + '\n';
+  pre.appendChild(span);
+  while (pre.childNodes.length > 4000) pre.removeChild(pre.firstChild);
+  if ($('input-autoscroll').checked) pre.scrollTop = pre.scrollHeight;
+}
+
+// ------------------------------------------------------------------ 初始化
+
+async function init() {
+  state.viewer = new MoleculeViewer($('viewer'), { autoRotate: false, bondTolerance: 1.3 });
+  state.viewer.onFrame = (pos, frame) => {
+    $('label-frame').textContent = (Math.floor(pos) + 1) + ' / ' + state.viewer.frameCount;
+    $('label-frame-energy').textContent = frame && frame.energy !== null && frame.energy !== undefined
+      ? 'E = ' + frame.energy.toFixed(6) + ' Ha' : '';
+    profile.current = pos;
+    drawProfile();
+  };
+  window.addEventListener('resize', () => { state.viewer.resize(); drawProfile(); });
+
+  bindUi();
+
+  // ?nosse=1 关闭 EventSource：自动化（无头浏览器）时长连接会让页面永远
+  // 处于"加载中"，--virtual-time-budget 等不到，截图/dump 就出不来。
+  const params0 = new URLSearchParams(location.search);
+  if (params0.get('nosse') !== '1') {
+    connectEvents();
+  } else {
+    $('conn-state').textContent = '已关闭（nosse）';
+    $('conn-state').className = 'conn';
+  }
+
+  try {
+    const status = await api('/api/status');
+    applyStatus(status);
+  } catch (err) {
+    toast('无法获取服务状态: ' + err.message, 'err');
+  }
+  await loadExamples();
+  await loadRecipes();
+  await refreshJobs();
+  // 页面刚打开时如果有任务在跑（例如刷新前就在跑），也要开始兜底轮询
+  startJobWatch();
+  logLine('界面已就绪。', 'l-dim');
+  await applyUrlParams();
+}
+
+// ------------------------------------------------------------------ 配方
+
+async function loadRecipes() {
+  try {
+    const data = await api('/api/recipes');
+    state.recipes = data.recipes || [];
+  } catch (err) {
+    state.recipes = [];
+    logLine('配方加载失败: ' + err.message, 'l-err');
+  }
+  const select = $('select-recipe');
+  const keep = select.value;
+  select.innerHTML = '<option value="">自定义（不用配方）</option>' +
+    state.recipes.map((r) =>
+      `<option value="${esc(r.id)}">${r.favorite ? '★ ' : ''}${esc(r.name)}</option>`
+    ).join('');
+  if (keep && state.recipes.some((r) => r.id === keep)) select.value = keep;
+}
+
+/** 选中配方后，把它带出的方法/基组/溶剂填进控件，并显示 ORCA 关键字。 */
+function applyRecipe() {
+  const id = $('select-recipe').value;
+  const recipe = state.recipes.find((r) => r.id === id) || null;
+  state.recipe = recipe;
+
+  const favBtn = $('btn-fav');
+  if (!recipe) {
+    $('recipe-keywords').textContent = '';
+    $('recipe-note').textContent = '';
+    favBtn.disabled = true;
+    favBtn.style.opacity = '0.4';
+    return;
+  }
+
+  $('select-jobtype').value = recipe.job_type;
+  $('input-method').value = recipe.method;
+  $('input-basis').value = recipe.basis || '';
+  $('select-solvent').value = recipe.solvent || '';
+  $('recipe-keywords').textContent = recipe.orca_keyword_line + ' ' +
+    (recipe.blocks || []).map((b) => '%' + b[0]).join(' ');
+
+  const warn = recipe.parsing === 'partial' ? '　⚠ 能跑通，但结果解析尚未实现' : '';
+  $('recipe-note').textContent = (recipe.note || '') + warn;
+
+  favBtn.disabled = false;
+  favBtn.style.opacity = recipe.favorite ? '1' : '0.4';
+  favBtn.textContent = recipe.favorite ? '★' : '☆';
+}
+
+// ------------------------------------------------------------------ 势能面扫描
+
+// 块的拼法在 scanblock.js 里（不碰 DOM，便于 Node 下测试）
+
+function _scanNumbers(id) {
+  return parseScanNumbers($(id).value);
+}
+
+/** 从界面读扫描设置并拼块；没启用扫描就返回 null。 */
+function scanBlock() {
+  const kind = $('select-scan').value;
+  if (!kind) return null;
+  return buildScanBlock(kind, $('input-scan-atoms').value, $('input-scan-range').value);
+}
+
+/** 扫描开关变化时更新提示，并处理"任务类型必须是几何优化"这条约束。 */
+function updateScanUI() {
+  const kind = $('select-scan').value;
+  const jobSelect = $('select-jobtype');
+  $('scan-options').hidden = !kind;
+
+  if (!kind) {
+    jobSelect.disabled = false;
+    $('scan-hint').textContent = '';
+    return;
+  }
+
+  const spec = SCAN_KINDS[kind];
+  const notes = [`${spec.how}。编号从 0 起，顺序就是结构文件里的顺序。`];
+  $('input-scan-atoms').placeholder = kind === 'bond' ? '0 1'
+    : kind === 'angle' ? '0 1 2' : '3 0 1 2';
+  $('input-scan-range').placeholder = kind === 'bond' ? '1.2 2.2 11' : '0 120 13';
+
+  // 扫描靠"每一步做一次约束下的几何优化"实现，所以底子必须是几何优化。
+  // 配方会决定 job_type，若它给的不是 opt，就退回自定义。
+  if (state.recipe && state.recipe.job_type !== 'opt') {
+    notes.push(`⚠ 配方「${state.recipe.name}」不是几何优化，已切成自定义 —— 扫描需要自己指定方法/基组。`);
+    $('select-recipe').value = '';
+    applyRecipe();
+  }
+  jobSelect.value = 'opt';
+  jobSelect.disabled = true;
+  notes.push('任务类型固定为几何优化。');
+
+  const mol = state.molecule;
+  if (mol && mol.n_atoms !== undefined) {
+    for (const n of _scanNumbers('input-scan-atoms')) {
+      if (n >= mol.n_atoms) {
+        notes.push(`⚠ 编号 ${n} 超出范围（当前结构只有 ${mol.n_atoms} 个原子，编号 0–${mol.n_atoms - 1}）。`);
+        break;
+      }
+    }
+  }
+
+  // 几何层面的检查：实际值对不对得上、区间有没有跨 180° 奇点。
+  // 这些是打字时就能看出来的 —— 等 ORCA 跑完（或崩掉）再看就太晚了。
+  let html = esc(notes.join(' '));
+  const atoms = _scanNumbers('input-scan-atoms');
+  const range = _scanNumbers('input-scan-range');
+  if (mol && mol.coords && mol.coords.length && atoms.length && range.length >= 2) {
+    const issues = scanIssues(kind, atoms, range, mol.symbols || [], mol.coords);
+    if (issues.length) {
+      const mark = { warn: '⚠ ', info: 'ℹ ', ok: '✓ ' };
+      html += '<br>' + issues.map((it) => `<span class="${it.level}">`
+        + `${mark[it.level] || ''}${esc(it.text)}</span>`).join('<br>');
+    }
+  }
+  $('scan-hint').innerHTML = html;
+}
+
+async function toggleFavorite() {  if (!state.recipe) return;
+  const id = state.recipe.id;
+  try {
+    const res = await api('/api/recipes/' + encodeURIComponent(id) + '/favorite', {
+      method: 'POST',
+      body: JSON.stringify({ favorite: !state.recipe.favorite }),
+    });
+    await loadRecipes();
+    $('select-recipe').value = id;
+    applyRecipe();
+    toast(res.favorite ? '已收藏' : '已取消收藏', 'ok');
+  } catch (err) {
+    toast('收藏失败: ' + err.message, 'err');
+  }
+}
+
+/** 几何来源下拉：列出所有已完成任务，供"用它的优化后几何"起算。 */
+function renderGeometryOptions() {
+  const select = $('select-geometry');
+  const keep = select.value;
+  const finished = state.jobs.filter((j) => j.status === 'done');
+  select.innerHTML = '<option value="">当前载入的结构</option>' +
+    finished.map((j) =>
+      `<option value="${esc(j.job_id)}">${esc(j.molecule)} · ${esc(j.job_type)} · ${esc(j.method || '')}</option>`
+    ).join('');
+  if (keep && finished.some((j) => j.job_id === keep)) select.value = keep;
+}
+
+/**
+ * 支持用 URL 参数直接进入某个状态，便于分享链接与自动化截图：
+ *   ?load=<结构文件路径>   载入该结构
+ *   ?job=<任务 id>         选中该任务
+ *   ?demo=1                载入自带的示例分子
+ */
+async function applyUrlParams() {
+  const params = new URLSearchParams(location.search);
+
+  const load = params.get('load');
+  if (load) await loadStructureFromPath(load);
+
+  if (params.get('demo')) {
+    const select = $('example-select');
+    const option = Array.from(select.options).find((o) => /caffeine|benzene/.test(o.textContent));
+    if (option) {
+      select.value = option.value;
+      await loadStructureFromPath(option.value);
+    }
+  }
+
+  const job = params.get('job');
+  // 扫描曲线的显示模式要在 selectJob 之前定好，否则渲染出来的是默认视图
+  if (params.get('scanmode')) state.scanMode = params.get('scanmode');
+  if (job) await selectJob(job);
+
+  // 视图预设：便于分享"我看到的这张图"，也便于自动化截图
+  const style = params.get('style');
+  if (style) {
+    const button = document.querySelector(`[data-style="${style}"]`);
+    if (button) button.click();
+  }
+  const colorMode = params.get('color');
+  if (colorMode) {
+    const button = document.querySelector(`[data-color="${colorMode}"]`);
+    if (button) button.click();
+  }
+  if (params.get('labels') === '1') $('btn-labels').click();
+  if (params.get('scene')) {
+    state.viewer.setStyle(params.get('scene').split(',')[0] === 'spacefill' ? 'spacefill' : state.viewer.style);
+  }
+
+  const recipeId = params.get('recipe');
+  if (recipeId) {
+    $('select-recipe').value = recipeId;
+    applyRecipe();
+  }
+
+  // 直接打开某个批次的相对能量表（便于分享链接）
+  const batchId = params.get('batch');
+  if (batchId) {
+    try {
+      const data = await api('/api/batch/' + encodeURIComponent(batchId));
+      if (data.result) renderBatch(data.result);
+      else logLine('该批次状态：' + data.status, 'l-dim');
+    } catch (err) {
+      toast('批次加载失败: ' + err.message, 'err');
+    }
+  }
+
+  if (params.get('viewertest') === '1') {
+    await runViewerInteractionTest();
+  }
+  if (params.get('scantest') === '1') {
+    await runScanDragTest();
+  }
+  if (params.get('scancheck') === '1') {
+    await runScanHintTest(params.get('scancheck-kind') || 'dihedral');
+  }
+}
+
+/**
+ * 真浏览器验证：扫描提示区有没有把「实际值」和「180° 奇点」显示出来。
+ *
+ * 纯逻辑已经在 Node 里测过了（scanblock.js 的数学对着 ORCA 的 7 个已知
+ * 扫描点校准过），这里验的是**接线** —— 算对了但没渲染出来一样是白搭。
+ */
+async function runScanHintTest(kind) {
+  const out = document.createElement('pre');
+  out.id = 'scancheck-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  try {
+    // 这里**不用任何 await**：结构在 applyUrlParams 里已经加载完，
+    // updateScanUI 本身是同步的。加 setTimeout/rAF 会让无头 Chrome 的
+    // 虚拟时间与钩子对不上，钩子就永远写不出结果（踩过）。
+    const select = $('select-scan');
+    select.value = kind;
+    $('input-scan-atoms').value = '1 2 3 4';
+    $('input-scan-range').value = '90 270 19';
+    updateScanUI();
+
+    const hint = $('scan-hint');
+    lines.push('hint_hidden=' + $('scan-options').hidden);
+    lines.push('has_actual_value=' + /实际值/.test(hint.textContent));
+    lines.push('has_180=' + /180/.test(hint.textContent) + '/' + /奇点/.test(hint.textContent));
+    lines.push('warn_span=' + hint.querySelectorAll('span.warn').length);
+    lines.push('info_span=' + hint.querySelectorAll('span.info').length);
+    lines.push('text=' + hint.textContent.replace(/\s+/g, ' ').trim().slice(0, 240));
+
+    // 再试一个应当"没有风险提示"的设置：区间不跨 180°
+    $('input-scan-range').value = '110 170 7';
+    updateScanUI();
+    lines.push('safe_warn_span=' + hint.querySelectorAll('span.warn').length);
+    lines.push('safe_info_span=' + hint.querySelectorAll('span.info').length);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__SCANCHECK__' + lines.join(' | ') + '__END__';
+}
+
+/**
+ * 在**真实浏览器**里用合成指针事件驱动扫描曲线的拖动，验证：
+ * 拖了之后读数变了、中栏显示的结构真的换成了那个点的几何。
+ *
+ * 需要配合 `?job=<扫描任务id>&scantest=1`。结果写进 DOM 供 `--dump-dom` 读取。
+ */
+async function runScanDragTest() {
+  const lines = [];
+  const out = document.createElement('pre');
+  out.id = 'scantest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px';
+  document.body.appendChild(out);
+
+  try {
+    // 扫描区是 renderResult 里异步插进来的，这里等它出现
+    let section = document.getElementById('scan-section');
+    for (let i = 0; i < 60 && !section; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      section = document.getElementById('scan-section');
+    }
+    if (!section) throw new Error('页面上没有扫描区（这任务是扫描任务吗？）');
+    const svg = section.querySelector('.scan-svg');
+    if (!svg) throw new Error('扫描区里没有曲线 SVG');
+    const profile = state.scanProfile || {};
+    const rect = svg.getBoundingClientRect();
+    lines.push(`chart=${Math.round(rect.width)}x${Math.round(rect.height)}`
+      + ` points=${(profile.points || []).length} geoms=${(profile.geometries || []).length}`);
+    if (!(profile.geometries || []).length) throw new Error('曲线数据里没有逐点几何');
+
+    const snapshot = () => JSON.stringify(state.viewer.coords);
+    const before = snapshot();
+    const readoutBefore = (section.querySelector('#scan-readout') || {}).textContent || '';
+
+    const dispatch = (type, clientX) => svg.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true,
+      clientX, clientY: rect.top + rect.height * 0.5,
+    }));
+
+    // 从左侧 15% 拖到右侧 85%
+    dispatch('pointerdown', rect.left + rect.width * 0.15);
+    const afterDown = JSON.stringify(state.viewer.coords);
+    const idxDown = state.scanIndex;
+    dispatch('pointermove', rect.left + rect.width * 0.85);
+    dispatch('pointerup', rect.left + rect.width * 0.85);
+
+    const after = snapshot();
+    const readoutAfter = (section.querySelector('#scan-readout') || {}).textContent || '';
+    const last = (profile.points || []).length - 1;
+
+    lines.push(`pointerdown  index=${idxDown}  coords_changed=${afterDown !== before ? 'PASS' : 'FAIL'}`);
+    lines.push(`pointermove  index=${state.scanIndex}  coords_changed=`
+      + `${after !== afterDown ? 'PASS' : 'FAIL'}`);
+    lines.push(`readout  "${readoutAfter.replace(/\s+/g, ' ').trim()}"`);
+    lines.push(`readout_changed=${readoutAfter !== readoutBefore ? 'PASS' : 'FAIL'}`);
+    lines.push(`viewer_atoms=${state.viewer.symbols.length}`
+      + ` matches_profile=${state.viewer.symbols.join(',') === (profile.symbols || []).join(',') ? 'PASS' : 'FAIL'}`);
+
+    // 游标也要跟着动
+    const cursor = section.querySelector('.scan-cursor');
+    lines.push(`cursor_visible=${cursor && !cursor.hidden ? 'PASS' : 'FAIL'}`
+      + ` cx=${cursor ? cursor.querySelector('circle').getAttribute('cx') : '—'}`);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__SCANTEST__' + lines.join(' | ') + '__END__';
+}
+
+/**
+ * 在**真实浏览器**里用合成鼠标事件驱动查看器的事件处理器，
+ * 验证拖拽旋转、滚轮缩放、双击复位确实生效，并把结果写进 DOM，
+ * 供无头 Chrome 的 --dump-dom 读取。
+ *
+ * 之所以要这个：无头逻辑测试只能证明投影数学对，证明不了事件绑定对。
+ */
+async function runViewerInteractionTest() {
+  const lines = [];
+  const out = document.createElement('pre');
+  out.id = 'viewertest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;color:#0f0;background:#000;padding:4px';
+  document.body.appendChild(out);
+
+  const canvas = $('viewer');
+  const fire = (type, opts) => canvas.dispatchEvent(new MouseEvent(type, Object.assign({
+    bubbles: true, cancelable: true, view: window,
+  }, opts)));
+
+  try {
+    if (!state.molecule) {
+      // 优先用 ?load= 指定的结构；否则取第一个内置示例（避免写死本机路径）
+      const data = await api('/api/examples');
+      const first = (data.examples || [])[0];
+      if (!first) throw new Error('没有可用的示例结构');
+      await loadStructureFromPath(first.path);
+    }
+    // 等一帧，让 setMolecule 生效
+    await new Promise((r) => requestAnimationFrame(r));
+
+    const v = state.viewer;
+    const rect = canvas.getBoundingClientRect();
+    lines.push(`canvas=${Math.round(rect.width)}x${Math.round(rect.height)} atoms=${v.symbols.length}`);
+
+    // --- 拖拽旋转 ---
+    const rotBefore = [v.rotX, v.rotY];
+    fire('mousedown', { clientX: rect.left + 200, clientY: rect.top + 150, button: 0 });
+    fire('mousemove', { clientX: rect.left + 300, clientY: rect.top + 210, button: 0 });
+    fire('mouseup', { clientX: rect.left + 300, clientY: rect.top + 210, button: 0 });
+    const rotAfter = [v.rotX, v.rotY];
+    const rotated = Math.abs(rotAfter[0] - rotBefore[0]) > 1e-6 || Math.abs(rotAfter[1] - rotBefore[1]) > 1e-6;
+    lines.push(`rotate before=(${rotBefore.map((x) => x.toFixed(3))}) after=(${rotAfter.map((x) => x.toFixed(3))}) ${rotated ? 'PASS' : 'FAIL'}`);
+
+    // --- 滚轮缩放 ---
+    const zoomBefore = v.zoom;
+    canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -200, bubbles: true, cancelable: true }));
+    const zoomAfter = v.zoom;
+    const zoomed = zoomAfter > zoomBefore * 1.01;
+    lines.push(`zoom before=${zoomBefore.toFixed(3)} after=${zoomAfter.toFixed(3)} ${zoomed ? 'PASS' : 'FAIL'}`);
+
+    // --- 右键平移 ---
+    const panBefore = [v.panX, v.panY];
+    fire('mousedown', { clientX: rect.left + 200, clientY: rect.top + 150, button: 2 });
+    fire('mousemove', { clientX: rect.left + 240, clientY: rect.top + 170, button: 2 });
+    fire('mouseup', { clientX: rect.left + 240, clientY: rect.top + 170, button: 2 });
+    const panned = v.panX !== panBefore[0] && v.panY !== panBefore[1];
+    lines.push(`pan before=(${panBefore}) after=(${[v.panX, v.panY]}) ${panned ? 'PASS' : 'FAIL'}`);
+
+    // --- 双击复位 ---
+    fire('dblclick', { clientX: rect.left + 200, clientY: rect.top + 150 });
+    const reset = Math.abs(v.zoom - 1) < 1e-9 && Math.abs(v.panX) < 1e-9 && Math.abs(v.panY) < 1e-9;
+    lines.push(`reset zoom=${v.zoom.toFixed(3)} pan=(${v.panX},${v.panY}) ${reset ? 'PASS' : 'FAIL'}`);
+
+    // --- 样式与着色切换 ---
+    document.querySelector('[data-style="spacefill"]').click();
+    const styleOk = v.style === 'spacefill';
+    document.querySelector('[data-color="charge"]').click();
+    const colorOk = v.colorMode === 'charge';
+    lines.push(`toolbar style=${v.style} color=${v.colorMode} ${styleOk && colorOk ? 'PASS' : 'FAIL'}`);
+
+    // --- 无轨迹时轨迹栏必须真的不占位 ---
+    // 注意要查计算样式：作者 CSS 里的 display 会盖掉 hidden 属性的 UA 规则
+    const trajDisplay = getComputedStyle($('trajectory')).display;
+    lines.push(`trajectory display=${trajDisplay} ${trajDisplay === 'none' ? 'PASS' : 'FAIL'}`);
+
+    const allPass = lines.every((l) => !l.includes('FAIL'));
+    lines.push('VIEWERTEST RESULT: ' + (allPass ? 'PASS' : 'FAIL'));
+  } catch (err) {
+    lines.push('VIEWERTEST RESULT: FAIL (' + (err && err.message) + ')');
+  }
+
+  out.textContent = lines.join('\n');
+  // 同步一份到 console，便于人工排查
+  lines.forEach((l) => console.log('VIEWERTEST ' + l));
+}
+
+function applyStatus(status) {
+  state.jobTypes = status.job_types || [];
+
+  const select = $('select-jobtype');
+  select.innerHTML = state.jobTypes
+    .map((t) => `<option value="${esc(t.value)}">${esc(t.label)}</option>`).join('');
+
+  const solvent = $('select-solvent');
+  solvent.innerHTML = '<option value="">气相</option>' +
+    (status.solvents || []).map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+
+  const engines = status.engines || [];
+  const orca = engines.find((e) => e.name === 'orca') || engines[0];
+  const chipEngine = $('chip-engine');
+  if (orca) {
+    chipEngine.classList.add(orca.available ? 'on' : 'off');
+    chipEngine.querySelector('b').textContent = orca.display_name + (orca.available ? '' : '（不可用）');
+    chipEngine.title = orca.detail || '';
+    if (!orca.available) toast('引擎不可用：' + orca.detail, 'err');
+  } else {
+    chipEngine.classList.add('off');
+    chipEngine.querySelector('b').textContent = '未检测到';
+  }
+
+  const tools = status.tools || {};
+  const names = { multiwfn: 'Multiwfn', avogadro: 'Avogadro2', obabel: 'obabel' };
+  const available = Object.keys(tools).filter((k) => tools[k].available);
+  const chipTools = $('chip-tools');
+  chipTools.classList.add(available.length ? 'on' : 'off');
+  chipTools.querySelector('b').textContent = available.length + ' / ' + Object.keys(tools).length + ' 可用';
+  chipTools.title = Object.keys(tools)
+    .map((k) => `${names[k] || k}: ${tools[k].available ? tools[k].path : '未找到'}`).join('\n');
+
+  $('chip-jobs').querySelector('b').textContent = status.jobs_root || '—';
+  $('chip-jobs').title = status.jobs_root || '';
+
+  const cfg = status.config || {};
+  $('cfg-orca').value = cfg.orca_path || '';
+  $('cfg-multiwfn').value = cfg.multiwfn_path || '';
+  $('cfg-avogadro').value = cfg.avogadro_path || '';
+  $('cfg-obabel').value = cfg.obabel_path || '';
+  $('cfg-web_port').value = cfg.web_port || 8760;
+  $('cfg-auto_open_browser').checked = !!cfg.auto_open_browser;
+
+  // 换机器时最需要看的一句：ORCA 到底找到没有、是从哪找到的。
+  // 只显示"未找到"不够 —— 用户需要知道下一步该做什么。
+  // （orca 变量在上面已经取过了，这里直接用。）
+  const hint = $('orca-hint');
+  if (hint) {
+    hint.innerHTML = orca && orca.available
+      ? `<span class="ok">✓ 已找到：${esc(orca.exe || orca.detail || '')}</span>`
+        + (orca.source ? `（来源：${esc(orca.source)}）` : '')
+      : '<span class="warn">⚠ 没找到 ORCA。填上 orca.exe 的完整路径，'
+        + '或把它所在目录加入 PATH。</span>';
+  }
+}
+
+async function loadExamples() {
+  try {
+    const data = await api('/api/examples');
+    const select = $('example-select');
+    select.innerHTML = '<option value="">示例结构…</option>' +
+      (data.examples || []).map((e) => `<option value="${esc(e.path)}">${esc(e.name)}</option>`).join('');
+  } catch (err) { /* 示例加载失败不致命 */ }
+}
+
+// ------------------------------------------------------------------ 结构
+
+function setMolecule(molecule) {
+  state.molecule = molecule;
+  showStructureInfo({
+    name: molecule.name,
+    formula: molecule.formula && molecule.formula !== '—'
+      ? molecule.formula : formulaOf(molecule.symbols),
+    n_atoms: molecule.n_atoms || (molecule.symbols || []).length,
+    charge: molecule.charge,
+    multiplicity: molecule.multiplicity,
+  });
+  $('input-charge').value = molecule.charge ?? 0;
+  $('input-mult').value = molecule.multiplicity ?? 1;
+
+  $('formula-display').textContent = '';
+
+  state.viewer.setMolecule({ symbols: molecule.symbols, coords: molecule.coords });
+  $('viewer-empty').classList.add('hide');
+  $('viewer-caption').textContent =
+    `${molecule.name || '结构'} · ${molecule.formula || ''} · ${(molecule.symbols || []).length} 原子`;
+  $('trajectory').hidden = true;
+  logLine(`载入结构: ${molecule.name || ''} ${molecule.formula || ''} (${(molecule.symbols || []).length} 原子)`, 'l-dim');
+}
+
+async function loadStructureFromPath(path) {
+  try {
+    const data = await api('/api/structure/load', { method: 'POST', body: JSON.stringify({ path }) });
+    state.moleculePath = data.path || path;
+    setMolecule(data.molecule);
+  } catch (err) {
+    toast('载入失败: ' + err.message, 'err');
+    logLine('载入失败: ' + err.message, 'l-err');
+  }
+}
+
+function readLocalFile(file) {
+  const reader = new FileReader();
+  reader.onload = async () => {
+    try {
+      const data = await api('/api/structure/text', {
+        method: 'POST',
+        body: JSON.stringify({ text: reader.result, name: file.name.replace(/\.[^.]+$/, '') }),
+      });
+      state.moleculePath = null;   // 来自拖放的文本，没有后端路径
+      setMolecule(data.molecule);
+    } catch (err) {
+      toast('解析失败: ' + err.message, 'err');
+      logLine('解析失败: ' + err.message, 'l-err');
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ------------------------------------------------------------------ 任务
+
+async function refreshJobs() {
+  try {
+    const data = await api('/api/jobs?limit=80');
+    state.jobs = data.jobs || [];
+    renderJobs();
+  } catch (err) {
+    logLine('刷新任务失败: ' + err.message, 'l-err');
+  }
+}
+
+/**
+ * 任务列表的**兜底轮询**。
+ *
+ * 界面原来只靠 SSE 推送来刷新任务列表。SSE 一断（服务重启、网络抖动、休眠唤醒），
+ * `finished` 事件就永远收不到，列表会一直停在"运行中" —— 看起来就像任务卡住了。
+ * 实测踩过：重启服务后，用户看到的就是"算完了还显示在运行"。
+ *
+ * 所以加一层兜底：只在**确实有任务没跑完**时每 5 秒拉一次，全部结束就自动停，
+ * 既不会长期打扰服务，也不会漏掉状态变化。
+ */
+function startJobWatch(intervalMs = 5000) {
+  if (state._jobWatch) return;
+  const pending = () => state.jobs.some((j) => j.status === 'running' || j.status === 'queued');
+  if (!pending()) return;
+  state._jobWatch = setInterval(async () => {
+    await refreshJobs();
+    if (!pending()) {
+      clearInterval(state._jobWatch);
+      state._jobWatch = null;
+    }
+  }, intervalMs);
+}
+
+function renderJobs() {
+  const list = $('jobs-list');
+  $('jobs-count').textContent = state.jobs.length;
+  if (!state.jobs.length) {
+    list.innerHTML = '<p class="empty">还没有任务</p>';
+    return;
+  }
+  list.innerHTML = state.jobs.map((job) => {
+    const when = job.created_at ? new Date(job.created_at * 1000).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+    const energy = job.final_energy !== null && job.final_energy !== undefined ? job.final_energy.toFixed(8) : '';
+    const duration = job.duration ? job.duration.toFixed(1) + 's' : '';
+    const selected = job.job_id === state.selectedJob ? ' selected' : '';
+    // 任务成功但某项分析被跳过时，store 会把警告写进 message 并加 ⚠ 前缀。
+    // 卡片上必须带出来 —— 否则列表里是个绿点 DONE，用户不点开就永远发现不了。
+    const warned = job.status === 'done' && (job.message || '').startsWith('⚠');
+    return `<div class="job-card${selected}" data-job="${esc(job.job_id)}" data-status="${esc(job.status)}">
+      <div class="line1">
+        <span class="name">${esc(job.molecule)}</span>
+        <span class="badge ${esc(job.status)}">${esc(job.status)}</span>
+        ${warned ? '<span class="badge warned" title="' + esc(job.message) + '">⚠ 有跳过</span>' : ''}
+        <span class="when">${esc(when)}</span>
+      </div>
+      <div class="line2">
+        <span>${esc(job.job_type)}</span><span>${esc(job.method)}</span>
+        <span class="energy">${esc(energy)}</span><span>${esc(duration)}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.job-card').forEach((card) => {
+    card.addEventListener('click', () => selectJob(card.dataset.job));
+  });
+  renderGeometryOptions();
+}
+
+/** 由元素符号算化学式（C、H 在前，符合有机惯例）。 */
+function formulaOf(symbols) {
+  const counts = {};
+  (symbols || []).forEach((s) => { counts[s] = (counts[s] || 0) + 1; });
+  const order = Object.keys(counts).sort((a, b) => {
+    const rank = (s) => (s === 'C' ? 0 : s === 'H' ? 1 : 2);
+    return rank(a) - rank(b) || a.localeCompare(b);
+  });
+  return order.map((s) => s + (counts[s] > 1 ? counts[s] : '')).join('');
+}
+
+/** 左侧结构面板：既用于载入的结构，也用于任务结果里的几何。 */
+function showStructureInfo(info) {
+  $('info-name').textContent = info.name || '—';
+  $('info-formula').textContent = info.formula || '—';
+  $('info-atoms').textContent = info.n_atoms ?? '—';
+  $('info-charge').textContent = `${info.charge ?? 0} / ${info.multiplicity ?? 1}`;
+}
+
+async function selectJob(jobId) {
+  state.selectedJob = jobId;
+  renderJobs();
+  $('result-job').textContent = jobId.slice(0, 15);
+  try {
+    const data = await api('/api/jobs/' + encodeURIComponent(jobId));
+    state.result = data.result;
+    renderResult(data.job, data.result);
+    if (data.result && data.result.geometry) {
+      state.viewer.setMolecule({
+        symbols: data.result.geometry.symbols,
+        coords: data.result.geometry.coords,
+        charges: (data.result.loewdin_charges && data.result.loewdin_charges.length)
+          ? data.result.loewdin_charges : null,
+      });
+      $('viewer-empty').classList.add('hide');
+      $('viewer-caption').textContent = `${data.job.molecule} · ${data.job.job_type} · ${data.result.status}`;
+      // 用了几何血缘时左侧面板本来是空的，这里用结果几何补上
+      showStructureInfo({
+        name: data.job.molecule || '—',
+        formula: formulaOf(data.result.geometry.symbols),
+        n_atoms: data.result.geometry.symbols.length,
+        charge: data.result.charge,
+        multiplicity: data.result.multiplicity,
+      });
+    }
+    if (data.result && data.result.irc && data.result.irc.files && data.result.irc.files.full_trajectory) {
+      await loadTrajectory(jobId);
+    } else {
+      $('trajectory').hidden = true;
+    }
+  } catch (err) {
+    toast('读取结果失败: ' + err.message, 'err');
+  }
+}
+
+function currentSpecPayload() {
+  const geometryFrom = $('select-geometry').value || null;
+  const charges = {
+    charge: parseInt($('input-charge').value || '0', 10),
+    multiplicity: parseInt($('input-mult').value || '1', 10),
+  };
+  // 用了几何血缘时可以不载入结构 —— 坐标由上游任务的结果给出
+  if (!state.molecule && !geometryFrom) throw new Error('请先载入结构，或选择一个几何来源');
+
+  const scan = scanBlock();        // 没启用扫描时是 null；填错了会抛
+  const shared = {
+    method: $('input-method').value.trim() || 'HF',
+    basis: $('input-basis').value.trim(),
+    solvent: $('select-solvent').value || null,
+    nprocs: parseInt($('input-nprocs').value || '1', 10),
+    maxcore_mb: parseInt($('input-maxcore').value || '2000', 10),
+    geometry_from_job: geometryFrom,
+  };
+  if (scan) shared.extra_blocks = scan;
+
+  if (state.recipe) {
+    // 配方负责 job_type / 关键词 / 块设置；界面上的方法基组只作覆盖
+    return Object.assign({
+      recipe_id: state.recipe.id,
+      molecule: state.molecule ? Object.assign({}, state.molecule, charges) : null,
+    }, shared);
+  }
+
+  return Object.assign({
+    molecule: Object.assign({}, state.molecule, charges),
+    // 扫描时任务类型由扫描面板锁定为几何优化，不看下拉（下拉此时也是禁用的）
+    job_type: scan ? 'opt' : $('select-jobtype').value,
+    calc_hess: $('input-calc-hess').checked,
+  }, shared);
+}
+
+async function runJob() {
+  let payload;
+  try { payload = currentSpecPayload(); }
+  catch (err) { toast(err.message, 'err'); return; }
+
+  $('btn-run').disabled = true;
+  try {
+    const data = await api('/api/jobs', { method: 'POST', body: JSON.stringify(payload) });
+    state.currentJobId = data.job.job_id;
+    $('btn-cancel').disabled = false;
+    logLine('');
+    logLine('▶ 提交任务 ' + data.job.job_id + '  ·  ' + data.summary, 'l-head');
+    await refreshJobs();
+    startJobWatch();
+  } catch (err) {
+    $('btn-run').disabled = false;
+    toast('提交失败: ' + err.message, 'err');
+    logLine('提交失败: ' + err.message, 'l-err');
+  }
+}
+
+async function cancelJob() {
+  const jobId = state.batchId || state.currentJobId;
+  if (!jobId) return;
+  try {
+    const path = state.batchId
+      ? '/api/batch/' + encodeURIComponent(jobId) + '/cancel'
+      : '/api/jobs/' + encodeURIComponent(jobId) + '/cancel';
+    await api(path, { method: 'POST' });
+    logLine('■ 已请求取消 ' + jobId, 'l-dim');
+  } catch (err) {
+    toast('取消失败: ' + err.message, 'err');
+  }
+}
+
+async function runBatch() {
+  let payload;
+  try { payload = currentSpecPayload(); }
+  catch (err) { toast(err.message, 'err'); return; }
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.accept = '.xyz,.cjson,.json';
+  input.addEventListener('change', async () => {
+    const files = Array.from(input.files || []);
+    if (files.length < 2) { toast('批量至少需要两个结构', 'err'); return; }
+    try {
+      const molecules = await Promise.all(files.map((file) => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = async () => {
+          try {
+            const r = await api('/api/structure/text', {
+              method: 'POST',
+              body: JSON.stringify({ text: reader.result, name: file.name.replace(/\.[^.]+$/, '') }),
+            });
+            resolve(r.molecule);
+          } catch (e) { reject(e); }
+        };
+        reader.onerror = () => reject(new Error('读取失败: ' + file.name));
+        reader.readAsText(file);
+      })));
+
+      const body = Object.assign({}, payload, { molecules });
+      delete body.molecule;
+      delete body.geometry_from_job;
+      const data = await api('/api/batch', { method: 'POST', body: JSON.stringify(body) });
+      state.batchId = data.batch_id;
+      $('btn-cancel').disabled = false;
+      logLine('');
+      logLine(`▶ 批量提交 ${molecules.length} 个结构 (${data.batch_id})`, 'l-head');
+      toast('批量任务已提交，完成后会显示相对能量表', 'ok');
+      await refreshJobs();
+      startJobWatch();
+    } catch (err) {
+      toast('批量提交失败: ' + err.message, 'err');
+    }
+  });
+  input.click();
+}
+
+// ------------------------------------------------------------------ 结果渲染
+
+function renderResult(job, result) {
+  const body = $('result-body');
+  if (!result) {
+    body.innerHTML = `<p class="empty">任务状态：${esc(job.status)}${job.message ? ' — ' + esc(job.message) : ''}</p>`;
+    return;
+  }
+
+  const parts = [];
+
+  // 警告放在最前面：这些是"任务成功、但你要的数据其实没有"的情况
+  // （例如请求了 NBO 分析，ORCA 因为没设 NBOEXE 把它静默跳过）。
+  // 埋在其他区块下面等于没提示 —— 用户只会看到绿点然后以为拿到了结果。
+  const warnings = result.warnings || [];
+  if (warnings.length) {
+    parts.push(`<div class="res-warning">
+      <strong>⚠ 有分析被跳过 —— 本次结果不包含你请求的全部内容</strong>
+      ${warnings.map((w) => `<p>${esc(w)}</p>`).join('')}
+    </div>`);
+  }
+
+  parts.push(`<div class="res-section"><h4>概要</h4><dl class="res-grid">
+    <dt>状态</dt><dd class="${result.status === 'done' ? 'hi' : ''}">${esc(result.status)}</dd>
+    <dt>引擎</dt><dd>${esc(result.engine)} ${esc(result.engine_version)}</dd>
+    <dt>方法</dt><dd>${esc(result.method)}</dd>
+    <dt>能量 (Ha)</dt><dd class="hi">${result.final_energy !== null && result.final_energy !== undefined ? result.final_energy.toFixed(10) : '—'}</dd>
+    <dt>基函数 / 电子</dt><dd>${result.n_basis_functions ?? '—'} / ${result.n_electrons ?? '—'}</dd>
+    ${result.timings && result.timings.SUM !== undefined ? `<dt>耗时</dt><dd>${Number(result.timings.SUM).toFixed(1)} s</dd>` : ''}
+  </dl></div>`);
+
+  const t = result.thermo || {};
+  if (Object.keys(t).length) {
+    const kjm = 2625.4996394799, jmolk = 4.3597447222071e-18 * 6.02214076e23;
+    const row = (label, key, factor, unit) => (t[key] !== undefined
+      ? `<dt>${label}</dt><dd>${Number(t[key]).toFixed(6)} Ha · ${(t[key] * factor).toFixed(2)} ${unit}</dd>` : '');
+    parts.push(`<div class="res-section"><h4>热化学 ${t.temperature_K ? '· ' + t.temperature_K + ' K' : ''}</h4><dl class="res-grid">
+      ${row('零点能 ZPE', 'zpe_hartree', kjm, 'kJ/mol')}
+      ${row('内能 U', 'inner_energy_U_hartree', kjm, 'kJ/mol')}
+      ${row('焓 H', 'enthalpy_H_hartree', kjm, 'kJ/mol')}
+      ${row('自由能 G', 'gibbs_free_energy_G_hartree', kjm, 'kJ/mol')}
+      ${t.entropy_S_hartree_per_K !== undefined
+        ? `<dt>熵 S</dt><dd>${(t.entropy_S_hartree_per_K * jmolk).toFixed(2)} J/(mol·K)</dd>` : ''}
+    </dl></div>`);
+  }
+
+  if (result.frequencies && result.frequencies.length) {
+    const real = result.frequencies.filter((f) => Math.abs(f) > 1e-6);
+    parts.push(`<div class="res-section"><h4>振动频率 (cm⁻¹) · 虚频 ${result.n_imaginary_frequencies ?? 0}</h4>
+      <div class="freq-list">${real.map((f) => `<span class="${f < 0 ? 'imag' : ''}">${f.toFixed(1)}</span>`).join('')}</div></div>`);
+  }
+
+  const irc = result.irc || {};
+  if (irc.n_frames) {
+    parts.push(`<div class="res-section"><h4>IRC 反应路径</h4><dl class="res-grid">
+      <dt>轨迹帧数</dt><dd>${irc.n_frames}</dd>
+      ${irc.ts_frame_index !== undefined ? `<dt>过渡态帧</dt><dd>#${irc.ts_frame_index}</dd>` : ''}
+      ${(irc.barriers_kcal || []).length === 2
+        ? `<dt>两端能垒 (kcal/mol)</dt><dd class="hi">${irc.barriers_kcal[0].toFixed(2)} / ${irc.barriers_kcal[1].toFixed(2)}</dd>` : ''}
+    </dl></div>`);
+  }
+
+  const charges = (result.loewdin_charges && result.loewdin_charges.length)
+    ? result.loewdin_charges : (result.mulliken_charges || []);
+  if (charges.length && result.geometry) {
+    // 限高滚动：24 个原子的电荷表会把下面真正重要的轨道/偶极推到看不见
+    parts.push(`<div class="res-section"><h4>原子电荷 (Löwdin)</h4><div class="table-scroll"><table class="data">
+      <tr><th>原子</th><th style="text-align:right">电荷</th></tr>
+      ${result.geometry.symbols.map((s, i) => `<tr><td>${i + 1} ${esc(s)}</td><td class="num">${charges[i] !== undefined ? charges[i].toFixed(4) : '—'}</td></tr>`).join('')}
+    </table></div></div>`);
+  }
+
+  if (result.dipole && result.dipole.magnitude !== null && result.dipole.magnitude !== undefined) {
+    parts.push(`<div class="res-section"><h4>偶极矩</h4><dl class="res-grid">
+      <dt>总偶极 (D)</dt><dd class="hi">${Number(result.dipole.magnitude).toFixed(4)}</dd></dl></div>`);
+  }
+
+  if (result.orbitals && result.orbitals.count) {
+    parts.push(orbitalSection(result, job.job_id));
+  }
+
+  if (result.files && Object.keys(result.files).length) {
+    parts.push(`<div class="res-section"><h4>产出文件</h4><table class="data">
+      ${Object.keys(result.files).map((role) => `<tr><td>${esc(role)}</td>
+        <td style="text-align:right"><a class="link" href="/api/jobs/${encodeURIComponent(job.job_id)}/file/${encodeURIComponent(role)}" target="_blank">查看</a>
+        · <a class="link" href="/api/jobs/${encodeURIComponent(job.job_id)}/file/${encodeURIComponent(role)}?download=1">下载</a></td></tr>`).join('')}
+    </table></div>`);
+  }
+
+  body.innerHTML = parts.join('');
+  bindOrbitalButtons();
+  loadScanSection(job.job_id);      // 扫描任务才有数据，其它任务静默跳过
+}
+
+function renderBatch(payload) {
+  const body = $('result-body');
+  if (!payload) return;
+  const items = (payload.items || []).slice().sort((a, b) => {
+    const av = a.relative_kj === null || a.relative_kj === undefined ? Infinity : a.relative_kj;
+    const bv = b.relative_kj === null || b.relative_kj === undefined ? Infinity : b.relative_kj;
+    return av - bv;
+  });
+  const minV = Math.min.apply(null, items.map((i) => (i.relative_kj === null || i.relative_kj === undefined ? Infinity : i.relative_kj)));
+  body.innerHTML = `<div class="res-section"><h4>批量相对能量 · ${esc(payload.quantity_label || payload.quantity || '')}</h4>
+    <dl class="res-grid">
+      <dt>结构数</dt><dd>${items.length}</dd>
+      <dt>参考（最低）</dt><dd class="hi">${esc(payload.reference_name || '—')}</dd>
+    </dl>
+    <table class="data" style="margin-top:8px">
+      <tr><th>结构</th><th style="text-align:right">Δ kJ/mol</th><th style="text-align:right">Δ kcal/mol</th><th>状态</th></tr>
+      ${items.map((it) => `<tr class="${it.relative_kj === minV ? 'min' : ''}">
+        <td>${esc(it.name)}</td>
+        <td class="num">${it.relative_kj !== null && it.relative_kj !== undefined ? it.relative_kj.toFixed(2) : '—'}</td>
+        <td class="num">${it.relative_kcal !== null && it.relative_kcal !== undefined ? it.relative_kcal.toFixed(2) : '—'}</td>
+        <td>${esc(it.status)}</td></tr>`).join('')}
+    </table></div>`;
+}
+
+// ------------------------------------------------------------------ 轨迹
+
+async function loadTrajectory(jobId) {
+  try {
+    const data = await api('/api/jobs/' + encodeURIComponent(jobId) + '/irc');
+    const frames = data.frames || [];
+    if (!frames.length) { $('trajectory').hidden = true; return; }
+    state.viewer.setTrajectory(frames);
+    const range = $('range-frame');
+    range.max = String(frames.length - 1);
+    range.value = '0';
+    $('label-frame').textContent = '1 / ' + frames.length;
+    $('trajectory').hidden = false;
+
+    // 能量剖面：优先用后端算好的逐帧能量
+    profile.energies = (data.frame_energies && data.frame_energies.length)
+      ? data.frame_energies
+      : frames.map((f) => f.energy);
+    profile.tsIndex = (data.ts_frame_index === undefined || data.ts_frame_index === null)
+      ? null : data.ts_frame_index;
+    profile.current = 0;
+    $('irc-profile').hidden = false;
+    drawProfile();
+
+    logLine(`已载入 IRC 轨迹：${frames.length} 帧` +
+      (profile.tsIndex !== null ? `，过渡态在第 ${profile.tsIndex} 帧` : ''), 'l-dim');
+  } catch (err) {
+    $('trajectory').hidden = true;
+  }
+}
+
+// ------------------------------------------------------------------ IRC 能量剖面
+
+const HARTREE_TO_KCAL = 627.5094740631;
+const HARTREE_TO_EV = 27.211386245988;
+const profile = { energies: [], tsIndex: null, current: 0 };
+
+function drawProfile() {
+  const canvas = $('irc-profile');
+  if (!canvas || canvas.hidden) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 400;
+  const h = canvas.clientHeight || 92;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const values = profile.energies;
+  if (!values.length) return;
+
+  const padL = 46, padR = 12, padT = 12, padB = 16;
+  const plotW = Math.max(10, w - padL - padR);
+  const plotH = Math.max(10, h - padT - padB);
+  const min = Math.min.apply(null, values);
+  const rel = values.map((v) => (v - min) * HARTREE_TO_KCAL);
+  const maxRel = Math.max(1e-6, Math.max.apply(null, rel));
+
+  const X = (i) => padL + (values.length === 1 ? plotW / 2 : (i / (values.length - 1)) * plotW);
+  const Y = (v) => padT + plotH - (v / maxRel) * plotH;
+
+  // 面积
+  ctx.beginPath();
+  ctx.moveTo(X(0), padT + plotH);
+  rel.forEach((v, i) => ctx.lineTo(X(i), Y(v)));
+  ctx.lineTo(X(rel.length - 1), padT + plotH);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  grad.addColorStop(0, 'rgba(47,143,224,.45)');
+  grad.addColorStop(1, 'rgba(47,143,224,.03)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // 曲线
+  ctx.beginPath();
+  rel.forEach((v, i) => (i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v))));
+  ctx.strokeStyle = '#59b0f5';
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+
+  // 过渡态标记
+  if (profile.tsIndex !== null && profile.tsIndex < rel.length) {
+    const tx = X(profile.tsIndex), ty = Y(rel[profile.tsIndex]);
+    ctx.strokeStyle = 'rgba(232,178,58,.7)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(tx, padT); ctx.lineTo(tx, padT + plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#e8b23a';
+    ctx.beginPath(); ctx.arc(tx, ty, 3.2, 0, Math.PI * 2); ctx.fill();
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('TS', tx, padT + 9);
+  }
+
+  // 当前帧游标
+  const ci = Math.round(profile.current);
+  if (ci >= 0 && ci < rel.length) {
+    ctx.strokeStyle = 'rgba(255,255,255,.9)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(X(ci), padT); ctx.lineTo(X(ci), padT + plotH); ctx.stroke();
+  }
+
+  // 坐标轴
+  ctx.fillStyle = '#64758a';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(maxRel.toFixed(1), padL - 6, padT + 8);
+  ctx.fillText('0.0', padL - 6, padT + plotH);
+  ctx.textAlign = 'left';
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.fillText('kcal/mol', 5, padT + 8);
+  ctx.textAlign = 'center';
+  ctx.fillText('反应坐标 →', padL + plotW / 2, h - 4);
+}
+
+function profileFrameAt(clientX) {
+  const canvas = $('irc-profile');
+  const rect = canvas.getBoundingClientRect();
+  const padL = 46, padR = 12;
+  const plotW = Math.max(10, rect.width - padL - padR);
+  const t = (clientX - rect.left - padL) / plotW;
+  return Math.max(0, Math.min(profile.energies.length - 1, Math.round(t * (profile.energies.length - 1))));
+}
+
+// ------------------------------------------------------------------ 分子轨道
+
+/** 能级图（SVG）：占据轨道实线、空轨道虚线，标出 HOMO/LUMO 与间隙。
+
+ *  只画价层窗口 —— 把 80 个轨道连内层一起塞进 250px 会挤成一条黑带，
+ *  而化学上要看的本来就是前线区域。
+ */
+function orbitalDiagram(orb) {
+  const all = (orb.orbitals || []).filter((o) => o.energy !== null);
+  if (!all.length) return '';
+
+  let list = all;
+  let omitted = 0;
+  if (orb.homo_ev !== undefined && orb.lumo_ev !== undefined) {
+    const lo = orb.homo_ev - 16;
+    const hi = orb.lumo_ev + 9;
+    const kept = all.filter((o) => {
+      const ev = o.energy * HARTREE_TO_EV;
+      return ev >= lo && ev <= hi;
+    });
+    if (kept.length >= 3 && kept.length < all.length) {
+      list = kept;
+      omitted = all.length - kept.length;
+    }
+  }
+
+  const W = 330;
+  const H = Math.max(200, Math.min(520, 60 + list.length * 11));
+  const pad = { l: 10, r: 74, t: 16, b: 22 };
+  const plotH = H - pad.t - pad.b;
+  const energies = list.map((o) => o.energy * HARTREE_TO_EV);
+  const emin = Math.min.apply(null, energies);
+  const emax = Math.max.apply(null, energies);
+  const span = Math.max(0.5, emax - emin);
+  const Y = (ev) => pad.t + (1 - (ev - emin) / span) * plotH;
+
+  const homoIndex = orb.homo, lumoIndex = orb.lumo;
+  // 窗口裁剪后 HOMO/LUMO 理论上一定还在，但仍要防住 null，否则整个结果面板会崩
+  const homoOrb = list.find((o) => o.index === homoIndex);
+  const lumoOrb = list.find((o) => o.index === lumoIndex);
+  const parts = [];
+  parts.push(`<svg class="orb-svg" viewBox="0 0 ${W} ${H}" width="100%" height="${H}">`);
+
+  // 间隙底纹
+  if (homoOrb && lumoOrb) {
+    const yh = Y(homoOrb.energy * HARTREE_TO_EV);
+    const yl = Y(lumoOrb.energy * HARTREE_TO_EV);
+    parts.push(`<rect x="0" y="${Math.min(yh, yl).toFixed(1)}" width="${pad.l + 8}" height="${Math.abs(yl - yh).toFixed(1)}" fill="rgba(232,178,58,.10)"/>`);
+  }
+
+  for (const o of list) {
+    const ev = o.energy * HARTREE_TO_EV;
+    const y = Y(ev).toFixed(1);
+    const occupied = (o.occupancy || 0) > 1e-6;
+    let color = occupied ? '#59b0f5' : '#7f8fa6';
+    if (o.index === homoIndex) color = '#e8b23a';
+    if (o.index === lumoIndex) color = '#7ee2b8';
+    const dash = occupied ? '' : ' stroke-dasharray="5 3"';
+    parts.push(`<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" stroke="${color}" stroke-width="${o.index === homoIndex || o.index === lumoIndex ? 2.6 : 1.6}"${dash}/>`);
+    // 占据示意：闭壳层画一对箭头
+    if (occupied) {
+      parts.push(`<text x="${pad.l + 6}" y="${(parseFloat(y) - 3).toFixed(1)}" fill="${color}" font-size="9">↑↓</text>`);
+    }
+    parts.push(`<text x="${W - pad.r + 6}" y="${(parseFloat(y) + 3.5).toFixed(1)}" fill="#94a6bb" font-size="10" font-family="ui-monospace, monospace">${ev.toFixed(2)}</text>`);
+    parts.push(`<text x="${pad.l - 0}" y="${(parseFloat(y) - 3).toFixed(1)}" fill="#64758a" font-size="9">#${o.index}${o.index === homoIndex ? ' HOMO' : o.index === lumoIndex ? ' LUMO' : ''}</text>`);
+  }
+
+  // HOMO-LUMO 间隙标注
+  if (orb.gap_ev !== undefined && homoOrb && lumoOrb) {
+    const yh = Y(homoOrb.energy * HARTREE_TO_EV);
+    const yl = Y(lumoOrb.energy * HARTREE_TO_EV);
+    const xm = W - pad.r - 24;
+    parts.push(`<line x1="${xm}" y1="${yh.toFixed(1)}" x2="${xm}" y2="${yl.toFixed(1)}" stroke="#e8b23a" stroke-width="1"/>`);
+    parts.push(`<text x="${xm - 4}" y="${((yh + yl) / 2 + 3).toFixed(1)}" fill="#e8b23a" font-size="9.5" text-anchor="end">${orb.gap_ev.toFixed(2)} eV</text>`);
+  }
+
+  const note = omitted
+    ? `轨道能级 (eV)　价层窗口内 ${list.length} 个，另有 ${omitted} 个深层/高位轨道未画出`
+    : `轨道能级 (eV)　共 ${orb.count} 个，占据 ${orb.n_electrons} 电子`;
+  parts.push(`<text x="${pad.l}" y="${H - 6}" fill="#64758a" font-size="9.5">${note}</text>`);
+  parts.push('</svg>');
+  return parts.join('');
+}
+
+/** 只列前线轨道附近，避免上百个轨道把面板撑爆。 */
+function frontierOrbitals(orb, span = 4) {
+  const list = orb.orbitals || [];
+  const homo = orb.homo, lumo = orb.lumo;
+  if (homo === null && lumo === null) return list.slice(0, 12);
+  const lo = Math.max(0, (homo === null ? lumo : homo) - span);
+  const hi = Math.min(list.length - 1, (lumo === null ? homo : lumo) + span);
+  return list.slice(lo, hi + 1);
+}
+
+function orbitalSection(result, jobId) {
+  const orb = result.orbitals || {};
+  if (!orb.count) return '';
+
+  const rows = frontierOrbitals(orb).map((o) => {
+    const occupied = (o.occupancy || 0) > 1e-6;
+    const tag = o.index === orb.homo ? 'HOMO' : o.index === orb.lumo ? 'LUMO' : '';
+    const cls = o.index === orb.homo ? 'min' : '';
+    return `<tr class="${cls}">
+      <td>#${o.index} <span class="muted">${tag}</span></td>
+      <td class="num">${o.energy === null ? '—' : (o.energy * HARTREE_TO_EV).toFixed(3)}</td>
+      <td class="num">${o.occupancy === null ? '—' : o.occupancy.toFixed(2)}</td>
+      <td>${esc(o.symmetry || '')}</td>
+      <td style="text-align:right">
+        <button class="btn ghost small" data-orbital="${o.index}" data-job="${esc(jobId)}">导出 cube</button>
+      </td></tr>`;
+  }).join('');
+
+  const gap = orb.gap_ev !== undefined
+    ? `<dt>HOMO–LUMO 间隙</dt><dd class="hi">${orb.gap_ev.toFixed(2)} eV</dd>` : '';
+  const wf = (result.files && result.files.wavefunction)
+    ? `<p class="hint mono">波函数: ${esc(String(result.files.wavefunction).split(/[\\/]/).pop())}</p>`
+    : '<p class="hint">该任务未保存波函数（.gbw），无法导出轨道 cube。</p>';
+
+  return `<div class="res-section"><h4>分子轨道</h4>
+    <dl class="res-grid">
+      <dt>轨道数</dt><dd>${orb.count}</dd>
+      <dt>电子数</dt><dd>${orb.n_electrons}</dd>
+      <dt>点群</dt><dd>${esc(orb.point_group || '—')}</dd>
+      ${gap}
+    </dl>
+    ${orbitalDiagram(orb)}
+    <table class="data" style="margin-top:6px">
+      <tr><th>轨道</th><th style="text-align:right">能量 (eV)</th><th style="text-align:right">占据</th><th>对称</th><th></th></tr>
+      ${rows}
+    </table>
+    ${wf}
+    <div class="row" style="margin-top:8px">
+      <button class="btn ghost small" id="btn-open-multiwfn" data-job="${esc(jobId)}">用 Multiwfn 打开轨道</button>
+      <button class="btn ghost small" id="btn-open-avogadro-mo" data-job="${esc(jobId)}">用 Avogadro2 打开 cube</button>
+    </div>
+    <p class="hint">cube 由 <code>orca_plot</code> 从已有 .gbw 生成，不重跑 SCF；网格默认 50³，可在导出后调整。</p>
+  </div>`;
+}
+
+// ------------------------------------------------------------------ 扫描曲线
+
+// 曲线数据不在 result.json 里（解析要读整个输出文件），按需向后端要一次。
+// 只有真是扫描任务才画，其它任务静默不显示这一节。
+state.scanMode = 'energy';
+state.scanIndex = null;      // 当前预览的是第几个扫描点（null = 没在预览）
+state.scanProfile = null;
+
+function scanSeries(profile, mode) {
+  const pts = profile.points || [];
+  if (mode === 'bond') {
+    return (profile.series || []).map((s) => ({
+      label: s.label,
+      data: pts.map((p, i) => [p.value, s.values[i]])
+        .filter((d) => d[1] !== null && d[1] !== undefined),
+    })).filter((s) => s.data.length);
+  }
+  return [{ label: '相对能量', data: pts.map((p) => [p.value, p.rel_kcal]) }];
+}
+
+// 图表几何：拖动时要靠这几个常量把鼠标位置换算回数据坐标，所以提出来共用
+const SCAN_CHART = { W: 330, H: 186, L: 46, R: 10, T: 12, B: 32 };
+const SCAN_IW = SCAN_CHART.W - SCAN_CHART.L - SCAN_CHART.R;
+
+function scanDiagram(profile, mode, active) {
+  const series = scanSeries(profile, mode);
+  if (!series.length) return '<p class="hint">没有可画的数据</p>';
+
+  const { W, H, L, R, T, B } = SCAN_CHART;
+  const iw = SCAN_IW, ih = H - T - B;
+  const all = series.flatMap((s) => s.data.map((d) => d[1]));
+  const xs = (profile.points || []).map((p) => p.value);
+  if (!all.length || !xs.length) return '';
+
+  let y0 = Math.min.apply(null, all), y1 = Math.max.apply(null, all);
+  if (y1 - y0 < 1e-9) { y0 -= 0.5; y1 += 0.5; }
+  const pad = (y1 - y0) * 0.14;
+  y0 -= pad; y1 += pad;
+  const x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+
+  const px = (v) => L + (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0)) * iw;
+  const py = (v) => T + ih - (v - y0) / (y1 - y0) * ih;
+  const isBond = mode === 'bond';
+  const fmt = (v) => (isBond ? v.toFixed(3) : v.toFixed(2));
+
+  let svg = `<svg class="scan-svg" viewBox="0 0 ${W} ${H}" role="img">`;
+
+  // 横向网格 + y 刻度
+  for (let k = 0; k <= 3; k++) {
+    const v = y0 + (y1 - y0) * k / 3, y = py(v);
+    svg += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${L + iw}" y2="${y.toFixed(1)}"
+      stroke="#dfe3e8" stroke-width="1" stroke-dasharray="3 4"/>`;
+    svg += `<text x="${L - 5}" y="${(y + 3).toFixed(1)}" class="scan-tick"
+      text-anchor="end">${fmt(v)}</text>`;
+  }
+  // x 刻度（最多 6 个）
+  const step = Math.max(1, Math.ceil(xs.length / 6));
+  for (let i = 0; i < xs.length; i += step) {
+    const x = px(xs[i]);
+    svg += `<line x1="${x.toFixed(1)}" y1="${T + ih}" x2="${x.toFixed(1)}" y2="${T + ih + 4}"
+      stroke="#98a2b0" stroke-width="1"/>`;
+    svg += `<text x="${x.toFixed(1)}" y="${T + ih + 15}" class="scan-tick"
+      text-anchor="middle">${xs[i]}</text>`;
+  }
+  svg += `<line x1="${L}" y1="${T}" x2="${L}" y2="${T + ih}" stroke="#98a2b0" stroke-width="1.2"/>`;
+  svg += `<line x1="${L}" y1="${T + ih}" x2="${L + iw}" y2="${T + ih}" stroke="#98a2b0" stroke-width="1.2"/>`;
+
+  // 曲线
+  const colors = ['#2f6fd0', '#8e44ad', '#2ea078'];
+  series.forEach((s, k) => {
+    const d = s.data.map((p, i) => (i ? 'L' : 'M') + px(p[0]).toFixed(1) + ' ' + py(p[1]).toFixed(1)).join(' ');
+    svg += `<path d="${d}" fill="none" stroke="${colors[k % 3]}" stroke-width="2"
+      ${k ? 'stroke-dasharray="5 3"' : ''} stroke-linejoin="round"/>`;
+    s.data.forEach((p) => {
+      svg += `<circle cx="${px(p[0]).toFixed(1)}" cy="${py(p[1]).toFixed(1)}" r="2.2"
+        fill="${colors[k % 3]}"/>`;
+    });
+    if (isBond) {
+      const last = s.data[s.data.length - 1];
+      svg += `<text x="${(px(last[0]) - 4).toFixed(1)}" y="${(py(last[1]) - 5).toFixed(1)}"
+        class="scan-tag" text-anchor="end" fill="${colors[k % 3]}">${esc(s.label)}</text>`;
+    }
+  });
+
+  // 势垒标注
+  if (!isBond && profile.barrier_kcal !== undefined) {
+    const x = px(profile.max_value);
+    svg += `<line x1="${x.toFixed(1)}" y1="${py(0).toFixed(1)}" x2="${x.toFixed(1)}"
+      y2="${py(profile.barrier_kcal).toFixed(1)}" stroke="#c0392b" stroke-width="1.4"/>`;
+    svg += `<text x="${(x + 5).toFixed(1)}" y="${((py(0) + py(profile.barrier_kcal)) / 2).toFixed(1)}"
+      class="scan-barrier" fill="#c0392b">${profile.barrier_kcal.toFixed(2)}</text>`;
+  }
+
+  // 当前构象的游标（拖动时更新，不重画整个图）
+  const hasActive = Number.isInteger(active) && active >= 0 && active < xs.length;
+  const ax = hasActive ? px(xs[active]) : 0;
+  const ay = hasActive ? py(profile.points[active].rel_kcal) : 0;
+  svg += `<g class="scan-cursor" ${hasActive ? '' : 'hidden'}>
+    <line x1="${ax.toFixed(1)}" y1="${T}" x2="${ax.toFixed(1)}" y2="${T + ih}"
+      stroke="#e8b23a" stroke-width="1.4"/>
+    <circle cx="${ax.toFixed(1)}" cy="${ay.toFixed(1)}" r="4.4"
+      fill="#e8b23a" stroke="#1b2430" stroke-width="1.2"/>
+  </g>`;
+
+  svg += `<text x="${L + iw / 2}" y="${H - 3}" class="scan-tick" text-anchor="middle">${
+    esc(profile.coordinate || '扫描坐标')} (${esc(profile.unit || '')})</text>`;
+  svg += `</svg>`;
+  return svg;
+}
+
+function scanSection(profile, jobId) {
+  const bonds = profile.series || [];
+  const modes = [`<button class="btn ghost small" data-scan-mode="energy" data-job="${esc(jobId)}">能量曲线</button>`];
+  if (bonds.length) {
+    modes.push(`<button class="btn ghost small" data-scan-mode="bond" data-job="${esc(jobId)}">键长响应</button>`);
+  }
+  const warn = (profile.warnings || []).map((w) => `<p class="hint warn">${esc(w)}</p>`).join('');
+  return `<div class="res-section" id="scan-section">
+    <h4>扫描曲线 · ${esc(profile.coordinate || '')}</h4>
+    <div class="row scan-modes">${modes.join('')}</div>
+    <div id="scan-chart">${scanDiagram(profile, state.scanMode)}</div>
+    <p class="hint" id="scan-readout">在曲线上<b>按住拖动</b>可以逐点预览构象，中栏会跟着变。</p>
+    <dl class="res-grid">
+      <dt>扫描点数</dt><dd>${(profile.points || []).length}</dd>
+      <dt>势垒</dt><dd class="hi">${(profile.barrier_kcal ?? 0).toFixed(3)} kcal/mol · ${(profile.barrier_kj ?? 0).toFixed(2)} kJ/mol</dd>
+      <dt>极小 / 极大</dt><dd>${profile.min_value}${esc(profile.unit || '')} / ${profile.max_value}${esc(profile.unit || '')}</dd>
+    </dl>
+    <div class="row" style="margin-top:6px">
+      <button class="btn ghost small" id="btn-scan-restore" data-job="${esc(jobId)}">恢复任务结构</button>
+    </div>
+    <p class="hint">能量取自 <code>${esc(profile.energy_file || '')}</code>；曲线不重跑计算，直接解析已有输出。</p>
+    ${warn}
+  </div>`;
+}
+
+/**
+ * 把扫描曲线上的某一点显示出来：移动游标、更新读数、把该点几何送进 3D 查看器。
+ *
+ * 这是"拖动势能图看构象怎么变"的核心 —— 和 IRC 的逐帧播放是同一个思路，
+ * 只是扫描的点少（十几到几十个），直接 drag 比进度条更顺手。
+ */
+function showScanFrame(profile, index, section) {
+  const pts = profile.points || [];
+  const geoms = profile.geometries || [];
+  if (!pts.length) return;
+  index = Math.max(0, Math.min(index, pts.length - 1));
+  state.scanIndex = index;      // 切换图表模式时要能恢复到这个点
+
+  // 游标
+  const svg = section.querySelector('.scan-svg');
+  const xs = pts.map((p) => p.value);
+  const x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+  const iw = SCAN_IW;
+  const px = (v) => SCAN_CHART.L + (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0)) * iw;
+  const yvals = pts.map((p) => p.rel_kcal);
+  let y0 = Math.min.apply(null, yvals), y1 = Math.max.apply(null, yvals);
+  if (y1 - y0 < 1e-9) { y0 -= 0.5; y1 += 0.5; }
+  const pad = (y1 - y0) * 0.14;
+  y0 -= pad; y1 += pad;
+  const py = (v) => SCAN_CHART.T + (SCAN_CHART.H - SCAN_CHART.T - SCAN_CHART.B)
+    - (v - y0) / (y1 - y0) * (SCAN_CHART.H - SCAN_CHART.T - SCAN_CHART.B);
+
+  if (svg) {
+    const cursor = svg.querySelector('.scan-cursor');
+    if (cursor) {
+      const x = px(pts[index].value), y = py(pts[index].rel_kcal);
+      const line = cursor.querySelector('line');
+      const dot = cursor.querySelector('circle');
+      line.setAttribute('x1', x.toFixed(1)); line.setAttribute('x2', x.toFixed(1));
+      dot.setAttribute('cx', x.toFixed(1)); dot.setAttribute('cy', y.toFixed(1));
+      cursor.hidden = false;
+    }
+  }
+
+  // 读数
+  const out = section.querySelector('#scan-readout');
+  if (out) {
+    out.innerHTML = `第 <b>${index + 1}/${pts.length}</b> 点 · ${esc(profile.coordinate || '坐标')} = `
+      + `<b>${pts[index].value}${esc(profile.unit || '')}</b> · 相对能量 `
+      + `<b>${pts[index].rel_kcal.toFixed(3)} kcal/mol</b>（${(pts[index].rel_kcal * 4.184).toFixed(2)} kJ/mol）`;
+  }
+
+  // 3D：把该点的几何换上去
+  const geom = geoms[index];
+  if (geom && profile.symbols && profile.symbols.length && state.viewer) {
+    state.viewer.setMolecule({ symbols: profile.symbols, coords: geom.coords });
+    state.viewer.render();
+  }
+}
+
+/** 在曲线上按下/拖动 → 选最近的那个扫描点。 */
+function attachScanDrag(section, profile) {
+  const svg = section.querySelector('.scan-svg');
+  const pts = profile.points || [];
+  if (!svg || pts.length < 2 || !(profile.geometries || []).length) return;
+
+  const xs = pts.map((p) => p.value);
+  const x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+  let dragging = false;
+
+  const indexAt = (clientX) => {
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return 0;
+    // 先把客户端坐标换算回 viewBox 坐标，再换算成数据值
+    const vx = (clientX - rect.left) * (SCAN_CHART.W / rect.width);
+    const t = Math.max(0, Math.min(1, (vx - SCAN_CHART.L) / SCAN_IW));
+    const value = x0 + t * (x1 - x0);
+    let best = 0, bestD = Infinity;
+    xs.forEach((v, i) => {
+      const d = Math.abs(v - value);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    return best;
+  };
+
+  const move = (ev) => { if (dragging) showScanFrame(profile, indexAt(ev.clientX), section); };
+
+  svg.addEventListener('pointerdown', (ev) => {
+    dragging = true;
+    if (svg.setPointerCapture) { try { svg.setPointerCapture(ev.pointerId); } catch (e) { /* 忽略 */ } }
+    svg.classList.add('dragging');
+    showScanFrame(profile, indexAt(ev.clientX), section);
+    ev.preventDefault();
+  });
+  svg.addEventListener('pointermove', move);
+  const stop = () => { dragging = false; svg.classList.remove('dragging'); };
+  svg.addEventListener('pointerup', stop);
+  svg.addEventListener('pointercancel', stop);
+  svg.addEventListener('pointerleave', stop);
+}
+
+async function loadScanSection(jobId) {
+  const body = $('result-body');
+  let data;
+  try {
+    data = await api('/api/jobs/' + encodeURIComponent(jobId) + '/scan');
+  } catch (err) {
+    return;                                   // 不是扫描任务，静默跳过
+  }
+  if (!data || !data.points || !data.points.length) return;
+
+  // 放在结果面板**最前面**：扫描任务里曲线就是头号结果，
+  // 追加到末尾的话会被挤到滚动区下面，等于没显示。
+  // 有警告横幅时排在它后面（警告讲的是"数据缺了"，优先级更高）。
+  const holder = document.createElement('div');
+  holder.innerHTML = scanSection(data, jobId);
+  const node = holder.firstElementChild;
+  const warning = body.querySelector('.res-warning');
+  if (warning) warning.after(node);
+  else body.prepend(node);
+
+  // 切模式只重画图，游标和拖动都要重新挂（innerHTML 换掉了 SVG）
+  const redraw = () => {
+    $('scan-chart').innerHTML = scanDiagram(data, state.scanMode, state.scanIndex);
+    attachScanDrag(node, data);
+    if (Number.isInteger(state.scanIndex)) showScanFrame(data, state.scanIndex, node);
+  };
+  node.querySelectorAll('[data-scan-mode]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.scanMode === state.scanMode);
+    btn.addEventListener('click', () => {
+      state.scanMode = btn.dataset.scanMode;
+      node.querySelectorAll('[data-scan-mode]').forEach((b) =>
+        b.classList.toggle('active', b.dataset.scanMode === state.scanMode));
+      redraw();
+    });
+  });
+
+  const restore = node.querySelector('#btn-scan-restore');
+  if (restore) {
+    restore.addEventListener('click', async () => {
+      state.scanIndex = null;
+      await selectJob(jobId);               // 重新载入任务自带的几何
+      toast('已恢复任务结构');
+    });
+  }
+
+  state.scanProfile = data;
+  state.scanIndex = null;
+  attachScanDrag(node, data);
+}
+
+async function exportOrbital(button) {
+  const jobId = button.dataset.job;
+  const mo = button.dataset.orbital;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = '导出中…';
+  try {
+    const res = await api(`/api/jobs/${encodeURIComponent(jobId)}/orbitals/${mo}/cube`,
+      { method: 'POST', body: JSON.stringify({ grid: 60 }) });
+    toast(res.message, 'ok');
+    logLine('✔ ' + res.message, 'l-ok');
+    button.textContent = '下载 cube';
+    button.disabled = false;
+    button.onclick = () => window.open(res.url, '_blank');
+  } catch (err) {
+    toast('导出失败: ' + err.message, 'err');
+    logLine('✖ 轨道导出失败: ' + err.message, 'l-err');
+    button.textContent = original;
+    button.disabled = false;
+  }
+}
+
+/** 用 Multiwfn 打开：先把 .gbw 转成 Molden（Multiwfn 能读），再交给它。 */
+async function openOrbitalsInMultiwfn(jobId) {
+  try {
+    const made = await api(`/api/jobs/${encodeURIComponent(jobId)}/molden`, { method: 'POST' });
+    if (!made.ok) { toast(made.message, 'err'); return; }
+    const res = await api('/api/external', {
+      method: 'POST',
+      body: JSON.stringify({ tool: 'multiwfn', job_id: jobId, role: 'molden' }),
+    });
+    toast(res.message, res.ok ? 'ok' : 'err');
+    logLine((res.ok ? '✔ ' : '✖ ') + res.message, res.ok ? 'l-ok' : 'l-err');
+  } catch (err) {
+    toast('Multiwfn 调用失败: ' + err.message, 'err');
+  }
+}
+
+/** 用 Avogadro2 打开轨道 cube（Avogadro 能直接渲染等值面）。 */
+async function openOrbitalsInAvogadro(jobId) {
+  const res0 = await api(`/api/jobs/${encodeURIComponent(jobId)}/orbitals`);
+  const cubes = Object.keys(res0.cubes || {});
+  if (!cubes.length) { toast('还没有导出任何轨道 cube，请先点某个轨道的「导出 cube」', 'err'); return; }
+  const role = cubes[cubes.length - 1];
+  try {
+    const res = await api('/api/external', {
+      method: 'POST',
+      body: JSON.stringify({ tool: 'avogadro', job_id: jobId, role }),
+    });
+    toast(res.message, res.ok ? 'ok' : 'err');
+  } catch (err) {
+    toast('Avogadro2 调用失败: ' + err.message, 'err');
+  }
+}
+
+function bindOrbitalButtons() {
+  document.querySelectorAll('[data-orbital]').forEach((button) => {
+    button.addEventListener('click', () => exportOrbital(button));
+  });
+  const mw = $('btn-open-multiwfn');
+  if (mw) mw.addEventListener('click', () => openOrbitalsInMultiwfn(mw.dataset.job));
+  const av = $('btn-open-avogadro-mo');
+  if (av) av.addEventListener('click', () => openOrbitalsInAvogadro(av.dataset.job));
+}
+
+// ------------------------------------------------------------------ SSE
+
+function connectEvents() {
+  const source = new EventSource('/api/events');
+  // SSE 重连说明中间漏过事件（服务重启/网络抖动），立刻补一次，
+  // 否则任务列表会停在旧状态。
+  source.onopen = () => {
+    $('conn-state').textContent = '实时连接中';
+    $('conn-state').className = 'conn on';
+    refreshJobs().then(startJobWatch);
+  };
+  source.onerror = () => { $('conn-state').textContent = '连接断开，重试中…'; $('conn-state').className = 'conn off'; };
+
+  source.onmessage = (ev) => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch (e) { return; }
+    const kind = data.event;
+
+    if (kind === 'hello') return;
+
+    if (kind === 'log') {
+      const line = data.line || '';
+      let cls = '';
+      if (/ERROR|Error:|错误|失败|❌/.test(line)) cls = 'l-err';
+      else if (/✅|完成|NORMALLY/.test(line)) cls = 'l-ok';
+      else if (/^\s*$/.test(line)) cls = '';
+      logLine(line, cls);
+      return;
+    }
+
+    if (kind === 'running') {
+      logLine('  worker 已启动 · ' + (data.job_dir || ''), 'l-dim');
+      refreshJobs();
+      return;
+    }
+
+    if (kind === 'finished') {
+      logLine((data.status === 'done' ? '✔ 任务完成' : '✖ 任务结束: ' + data.status), data.status === 'done' ? 'l-ok' : 'l-err');
+      $('btn-run').disabled = false;
+      $('btn-cancel').disabled = true;
+      state.currentJobId = null;
+      refreshJobs().then(() => selectJob(data.job_id));
+      return;
+    }
+
+    if (kind === 'error' || kind === 'failed') {
+      logLine('✖ ' + (data.message || ''), 'l-err');
+      $('btn-run').disabled = false;
+      $('btn-cancel').disabled = true;
+      refreshJobs();
+      return;
+    }
+
+    if (kind === 'batch_item') {
+      const item = data.item || {};
+      logLine(`    [${item.status}] ${item.name}` + (item.value !== null && item.value !== undefined ? '  ' + item.value.toFixed(8) + ' Ha' : ''), 'l-dim');
+      return;
+    }
+
+    if (kind === 'batch_done') {
+      logLine('✔ 批量计算完成', 'l-ok');
+      $('btn-run').disabled = false;
+      $('btn-cancel').disabled = true;
+      state.batchId = null;
+      renderBatch(data.batch);
+      refreshJobs();
+      if (data.batch && data.batch.saved && data.batch.saved.csv) {
+        logLine('  表格: ' + data.batch.saved.csv, 'l-dim');
+      }
+      return;
+    }
+
+    if (kind === 'batch_failed') {
+      logLine('✖ 批量失败: ' + (data.message || ''), 'l-err');
+      $('btn-run').disabled = false;
+      $('btn-cancel').disabled = true;
+      state.batchId = null;
+      return;
+    }
+  };
+}
+
+// ------------------------------------------------------------------ 交互绑定
+
+function bindUi() {
+  $('btn-run').addEventListener('click', runJob);
+  $('btn-cancel').addEventListener('click', cancelJob);
+  $('btn-batch').addEventListener('click', runBatch);
+  $('select-recipe').addEventListener('change', () => { applyRecipe(); updateScanUI(); });
+  $('select-scan').addEventListener('change', updateScanUI);
+  $('input-scan-atoms').addEventListener('input', updateScanUI);
+  $('btn-fav').addEventListener('click', toggleFavorite);
+  $('btn-refresh').addEventListener('click', async () => {
+    try { applyStatus(await api('/api/status')); } catch (e) { /* ignore */ }
+    await refreshJobs();
+    toast('已刷新');
+  });
+
+  $('btn-open').addEventListener('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.xyz,.cjson,.json';
+    input.addEventListener('change', () => { if (input.files[0]) readLocalFile(input.files[0]); });
+    input.click();
+  });
+
+  $('example-select').addEventListener('change', (e) => {
+    if (e.target.value) loadStructureFromPath(e.target.value);
+  });
+
+  $('btn-smiles').addEventListener('click', async () => {
+    const smiles = prompt('输入 SMILES：');
+    if (!smiles) return;
+    try {
+      const data = await api('/api/structure/smiles', { method: 'POST', body: JSON.stringify({ smiles }) });
+      state.moleculePath = null;
+      setMolecule(data.molecule);
+    } catch (err) { toast('生成失败: ' + err.message, 'err'); }
+  });
+
+  // 拖放
+  const dz = $('dropzone');
+  dz.addEventListener('click', () => $('btn-open').click());
+  ['dragenter', 'dragover'].forEach((evt) => dz.addEventListener(evt, (e) => {
+    e.preventDefault(); dz.classList.add('hover');
+  }));
+  ['dragleave', 'drop'].forEach((evt) => dz.addEventListener(evt, (e) => {
+    e.preventDefault(); dz.classList.remove('hover');
+  }));
+  dz.addEventListener('drop', (e) => {
+    const file = e.dataTransfer.files[0];
+    if (file) readLocalFile(file);
+  });
+  document.addEventListener('dragover', (e) => e.preventDefault());
+  document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer && e.dataTransfer.files[0];
+    if (file) readLocalFile(file);
+  });
+
+  // 查看器控制
+  $('seg-style').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    $('seg-style').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+    state.viewer.setStyle(btn.dataset.style);
+  });
+  $('seg-color').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    $('seg-color').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+    state.viewer.setColorMode(btn.dataset.color);
+  });
+  $('btn-labels').addEventListener('click', (e) => {
+    const on = !e.target.classList.contains('active');
+    e.target.classList.toggle('active', on);
+    state.viewer.setLabels(on);
+  });
+  $('btn-autorotate').addEventListener('click', (e) => {
+    const on = !e.target.classList.contains('active');
+    e.target.classList.toggle('active', on);
+    state.viewer.setAutoRotate(on);
+    if (on) spin(); else cancelAnimationFrame(state._spin);
+  });
+  $('btn-reset').addEventListener('click', () => state.viewer.resetView());
+
+  // 轨迹
+  $('range-frame').addEventListener('input', (e) => {
+    state.viewer.pause();
+    $('btn-play').textContent = '▶ 播放轨迹';
+    state.viewer.setFrame(parseFloat(e.target.value));
+  });
+  // 能量剖面：点击/拖动直接跳帧
+  const prof = $('irc-profile');
+  let scrubbing = false;
+  const scrubTo = (clientX) => {
+    const index = profileFrameAt(clientX);
+    $('range-frame').value = String(index);
+    state.viewer.pause();
+    $('btn-play').textContent = '▶ 播放轨迹';
+    state.viewer.setFrame(index);
+  };
+  prof.addEventListener('mousedown', (e) => { scrubbing = true; scrubTo(e.clientX); e.preventDefault(); });
+  window.addEventListener('mousemove', (e) => { if (scrubbing) scrubTo(e.clientX); });
+  window.addEventListener('mouseup', () => { scrubbing = false; });
+  $('btn-play').addEventListener('click', () => {
+    if (state.viewer.playing) {
+      state.viewer.pause();
+      $('btn-play').textContent = '▶ 播放轨迹';
+    } else {
+      $('btn-play').textContent = '⏸ 暂停';
+      state.viewer.play(14);
+      const sync = () => {
+        if (!state.viewer.playing) return;
+        $('range-frame').value = String(state.viewer.framePos);
+        requestAnimationFrame(sync);
+      };
+      sync();
+    }
+  });
+
+  // 外部工具
+  document.querySelectorAll('[data-external]').forEach((btn) => {
+    btn.addEventListener('click', () => openExternal(btn.dataset.external));
+  });
+  $('btn-open-folder').addEventListener('click', () => openExternal('explorer'));
+
+  // 日志
+  $('btn-clear-log').addEventListener('click', () => { $('log').textContent = ''; });
+
+  // 设置
+  const dialog = $('dialog-settings');
+  $('btn-settings').addEventListener('click', () => dialog.showModal());
+  $('btn-save-settings').addEventListener('click', async (e) => {
+    e.preventDefault();
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        body: JSON.stringify({
+          orca_path: $('cfg-orca').value.trim(),
+          multiwfn_path: $('cfg-multiwfn').value.trim(),
+          avogadro_path: $('cfg-avogadro').value.trim(),
+          obabel_path: $('cfg-obabel').value.trim(),
+          web_port: parseInt($('cfg-web_port').value || '8760', 10),
+          auto_open_browser: $('cfg-auto_open_browser').checked,
+        }),
+      });
+      dialog.close();
+      applyStatus(await api('/api/status'));
+      toast('设置已保存', 'ok');
+    } catch (err) { toast('保存失败: ' + err.message, 'err'); }
+  });
+
+  $('btn-shutdown').addEventListener('click', async () => {
+    if (!confirm('确定关闭本地服务吗？正在运行的任务会被取消。')) return;
+    try { await api('/api/shutdown', { method: 'POST' }); } catch (e) { /* 服务正在退出 */ }
+    document.body.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
+      'color:#94a6bb;font-family:system-ui;font-size:14px">服务已关闭，可以关闭此标签页。</div>';
+  });
+}
+
+function spin() {
+  const step = () => {
+    state.viewer.rotY += 0.006;
+    state.viewer._schedule();
+    state._spin = requestAnimationFrame(step);
+  };
+  cancelAnimationFrame(state._spin);
+  step();
+}
+
+async function openExternal(tool) {
+  const payload = { tool };
+  // 后端按工具挑它真能读的文件（Multiwfn 读不了 .gbw、Avogadro 读不了 .inp，
+  // 以前这里硬传 role 正是"点了没反应"的原因）
+  if (state.selectedJob) {
+    payload.job_id = state.selectedJob;
+  } else if (state.moleculePath) {
+    payload.path = state.moleculePath;
+  }
+  if (!payload.job_id && !payload.path) {
+    toast('请先选中一个任务，或从文件载入一个结构', 'err');
+    return;
+  }
+
+  try {
+    const res = await api('/api/external', { method: 'POST', body: JSON.stringify(payload) });
+    if (res.ok) { toast(res.message, 'ok'); logLine('✔ ' + res.message, 'l-ok'); }
+    else { toast(res.message, 'err'); logLine('✖ ' + res.message, 'l-err'); }
+  } catch (err) {
+    toast('调用失败: ' + err.message, 'err');
+  }
+}
+
+document.addEventListener('DOMContentLoaded', init);

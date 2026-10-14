@@ -1,0 +1,26 @@
+# 环境安装：
+#   conda env create -f environment.yml
+#   conda activate qcgui
+#   python main.py --doctor        # 先诊断一遍，确认 ORCA 找得到
+#
+# 不想用 conda 的话见 requirements.txt（pip 装法）。
+#
+# 注意：ORCA 不是 conda 包，需要单独安装。装好后任选一种让程序找到它：
+#       ① 界面顶栏「设置」里填 orca.exe 的完整路径（换机器时最省事）
+#       ② 把 orca.exe 所在目录加入 PATH
+#       ③ 设环境变量 QCGUI_ORCA_EXE 指向它
+#       什么都不做也行 —— 它会在各盘符根 / Program Files / 桌面上自动找。
+#       ORCA 为学术免费授权，但不开源、不可随本工具再分发。
+name: qcgui
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10      # 需要 3.10+（代码里用了 `X | None` 写法）
+  - flask=3.*        # 网页界面后端（纯 Python，无需编译）
+  - werkzeug         # Flask 的依赖；测试里直接用它的 make_server
+  - psi4=1.10        # 备用引擎（开源，可分发）；纯 ORCA 用法可以不装
+  - rdkit            # SMILES / 结构处理（缺了只少这一项功能）
+  - numpy            # 由 rdkit 间接带入；代码里没有直接 import
+  - pillow           # 仅 tools/plot_scan.py 导图片用
+  - customtkinter=5.2.2   # 旧的桌面界面仍保留，可用 --tk 启动
+  - pytest
