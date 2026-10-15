@@ -3,9 +3,9 @@ name: tests
 # 在 Windows 上跑测试套件。
 #
 # 说明：
-# * **不需要 ORCA** —— 所有真跑 ORCA 的用例在检测不到引擎时会自动跳过，
-#   没装的项不会让 CI 变红。
-# * 需要浏览器/Node 的用例同样会自动跳过。
+# * **不需要 ORCA** —— 所有真跑 ORCA 的用例在检测不到引擎时会自动跳过。
+# * 需要浏览器/Node 的用例：GitHub 的 Windows runner **自带 Chrome 和 Node**，
+#   所以它们会真的跑起来（不是跳过）—— 这也是最容易失败的一类。
 # * 想在 CI 里跑全部用例，得自备 ORCA（受其许可限制，不能随仓库分发）。
 
 on:
@@ -34,6 +34,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: 环境信息
+        # 出问题时这些是最常需要的上下文（尤其是浏览器版本差异导致的失败）
+        run: |
+          python -c "import sys; print('Python', sys.version)"
+          python -m pip list --format=columns
+          node --version
+          Get-Command chrome.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+          if (Test-Path $chrome) { & $chrome --version }
+          exit 0
+        shell: pwsh
+
       - name: 环境诊断
         # 诊断本身也算一个用例：在**没有 ORCA** 的机器上，它必须给出明确结论
         # 而不是崩掉。缺 ORCA 时它按设计返回 1（"不能算"）—— CI 里这是预期结果，
@@ -51,18 +63,33 @@ jobs:
         shell: pwsh
 
       - name: 跑测试
+        # 关键：失败时用 `::error::` 工作流命令把**哪个测试文件、哪条断言**写成
+        # annotation。否则 GitHub 只显示一句"Process completed with exit code 1"，
+        # 而日志要通过 API 下载（本项目就被限流卡住过，只能靠人肉贴图）。
         env:
           # 无头 CI 上不启动 Tk 窗口
           QCGUI_SKIP_GUI_TESTS: "1"
           PYTHONIOENCODING: utf-8
         run: |
-          $failed = 0
+          $failed = @()
           Get-ChildItem tests/test_*.py | Sort-Object Name | ForEach-Object {
-            Write-Host "--- $($_.Name) ---"
-            python $_.FullName
-            if ($LASTEXITCODE -ne 0) { $failed++ }
+            $name = $_.Name
+            Write-Host "===== $name ====="
+            $out = (python $_.FullName 2>&1 | Out-String)
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) {
+              $failed += $name
+              $why = ($out -split "`r?`n" |
+                Where-Object { $_ -match '\[ FAIL \]|Traceback|Error:|ModuleNotFound' } |
+                Select-Object -First 3) -join ' ⏐ '
+              if (-not $why) { $why = ($out -split "`r?`n" | Select-Object -Last 3) -join ' ⏐ ' }
+              Write-Host "::error file=tests/$name::失败：$why"
+            }
           }
-          if ($failed -gt 0) { throw "$failed 个测试文件失败" }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::$($failed.Count) 个测试文件失败：$($failed -join ', ')"
+            throw "有测试文件失败"
+          }
           # 同上：必须显式收尾，否则最后一条原生命令的退出码会漏出去
           exit 0
         shell: pwsh

@@ -1,0 +1,31 @@
+# 统一换行符：仓库里一律用 LF，检出时也保持 LF。
+#
+# 为什么需要：Windows 上 git 的 core.autocrlf 默认会把文本文件检出成 CRLF。
+# 本地开发机常常早就设过 autocrlf=false（本项目就是），于是**本机 LF、
+# CI 上 CRLF** —— 这类差异会让"本机全绿、远端全红"的怪事反复出现，
+# 而且极难定位（踩过一次：测试依赖了本机 core.quotepath 配置）。
+#
+# 显式钉死 eol=lf，让两端看到完全相同的字节。
+* text=auto eol=lf
+
+# 二进制文件不要做任何换行转换
+*.png   binary
+*.ico   binary
+*.jpg   binary
+*.pdf   binary
+*.docx  binary
+*.gbw   binary
+*.7z    binary
+*.exe   binary
+
+# 文档与代码都是文本
+*.md    text eol=lf
+*.py    text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.txt   text eol=lf
+*.xyz   text eol=lf
+*.inp   text eol=lf
