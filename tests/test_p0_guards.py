@@ -35,33 +35,40 @@ def test_same_second_submissions_get_distinct_ids():
     两次提交拿到同一个 id，于是两个 worker 争同一个 ``.out`` 互相截断、
     索引只剩一行、``cancel()`` 只杀得掉一个留下孤儿进程。
 
-    先确认"不加防护就会撞"（证明这个用例测的是真问题），再确认 store 会岔开。
+    .. important::
+       **不要用"连续调两次 make_job_id 看是否相同"当作前提** —— 那是竞态的：
+       两次调用之间若跨过秒边界，时间戳就变了。本用例在 CI 的 3.12 上正是
+       这么红的（3.10 没跨秒所以过了，成了偶发）。
+       这里用**固定时间戳**验前提、用 **mock** 造出必然的碰撞场景，全程无竞态。
     """
+    from unittest.mock import patch
+
     store = JobStore(Path(tempfile.mkdtemp(prefix="qcgui_ids_")) / "jobs")
     spec = _spec()
 
-    # 前提：id 生成确实只精确到秒 —— 同一秒内完全相同
-    assert make_job_id(spec) == make_job_id(spec), "前提不成立：id 生成本来就不同"
+    # 前提：id 只精确到秒 —— 用固定时间戳验，不依赖"两次调用在同一秒内"
+    fixed_when = 1_700_000_000.0
+    assert make_job_id(spec, when=fixed_when) == make_job_id(spec, when=fixed_when), \
+        "前提不成立：同一时刻的 id 应当完全相同"
 
-    first = store.create(spec)
-    second = store.create(spec)
-    third = store.create(spec)
+    # 把 id 生成钉死，制造出**必然的碰撞**（不再靠"同一秒内提交"这种运气）
+    fixed = "20200101-000000-379c497308a116f5"
+    with patch("qcgui.jobs.store.make_job_id", return_value=fixed):
+        first = store.create(spec)
+        second = store.create(spec)
+        third = store.create(spec)
 
     ids = [first.job_id, second.job_id, third.job_id]
-    assert len(set(ids)) == 3, f"同秒三次提交拿到了重复 id：{ids}"
+    assert ids == [fixed, f"{fixed}-2", f"{fixed}-3"], f"冲突时应当加后缀：{ids}"
     # 目录必须各不相同，否则两个 ORCA 会互相截断
     dirs = {store.job_dir(i) for i in ids}
     assert len(dirs) == 3, f"任务目录重复：{dirs}"
-    # 索引里应当是 3 行，不是 1 行
-    assert len(store.list(limit=100)) == 3, "INSERT OR REPLACE 把前一条覆盖掉了"
-    # 第一个仍是"时间戳+指纹"的原格式，后缀只在冲突时加
-    assert first.job_id.startswith(make_job_id(spec)), first.job_id
-    assert second.job_id.startswith(first.job_id), second.job_id
-    print(f"    三个 id: {[i.split('-', 2)[-1] for i in ids]}")
-
+    # 索引里应当是 3 行，不是 1 行（INSERT OR REPLACE 会覆盖）
+    assert len(store.list(limit=100)) == 3, "前一条被覆盖掉了"
     # 指纹仍然相同 —— "同参数可复跑"的原意保住了（只是不再覆盖前一次）
     fps = {r.fingerprint for r in store.list(limit=100)}
     assert len(fps) == 1, fps
+    print(f"    三个 id: {ids}")
     print("    指纹一致（同参数可复跑），但 id 与目录各不相同")
 
 
