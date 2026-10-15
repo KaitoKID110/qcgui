@@ -20,6 +20,75 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 STATUS_UNKNOWN = "unknown"
 
+#: 问题严重度
+SEVERITY_BLOCKING = "blocking"   # 结果不可用：拿到的不是你要的东西
+SEVERITY_MAJOR = "major"         # 结果可能不可用：几何可能没到位
+SEVERITY_MINOR = "minor"         # 主结果可用，只是某一项附带分析缺失
+
+#: 结论取值
+VERDICT_OK = "ok"                # 可以用
+VERDICT_LIMITED = "limited"      # 可以用，但有前提
+VERDICT_UNUSABLE = "unusable"    # 不能用
+
+_VERDICT_LABELS = {
+    VERDICT_OK: "结果可用",
+    VERDICT_LIMITED: "结果可用，但有限制",
+    VERDICT_UNUSABLE: "结果不可用",
+}
+
+#: ORCA 明确说了"没收敛"的措辞。注意 ``The optimization has not yet converged``
+#: 是**每个中间圈都会打印**的（真实语料里出现 265 次），绝不能当判据。
+NONCONVERGED_MARKERS = (
+    "did not converge but reached the maximum",
+    "reached the maximum number of optimization cycles",
+)
+#: ORCA 报告收敛的措辞（两者总是一起出现）
+CONVERGED_MARKERS = ("THE OPTIMIZATION HAS CONVERGED", "HURRAY")
+
+
+def describe_convergence_problem(text: str) -> str | None:
+    """输出文本里有没有"优化没收敛"的证据？有就返回说明，正常返回 ``None``。
+
+    放在模型层（而不是引擎里）是为了让**界面也能用** —— 收敛检查是后来加的，
+    之前存下的结果没有这个结论；而读取时补算要读输出文件，界面又不能 import 引擎。
+
+    判据是**证据式**的：只在有明确证据时报，绝不猜。
+
+    * 有 ``did not converge ... reached the maximum`` → "跑满步数未收敛"
+    * 有 ``THE OPTIMIZATION HAS CONVERGED`` / ``HURRAY`` → 正常
+    * 两者都没有 → "没有收敛公告"
+
+    这个三分法在真实任务库上核过：43 个几何优化类任务里 36 个有收敛公告、
+    1 个明确跑满步数，其余全是被取消/失败的 —— 不产生误报。
+    """
+    if not text:
+        return None
+    if any(marker in text for marker in NONCONVERGED_MARKERS):
+        return ("优化**没有收敛**：跑满了最大优化圈数就停了（ORCA 仍打印了正常终止）。"
+                "这个几何还没到位，别直接拿去做单点能或频率 —— 加大优化圈数或换个起点重算。")
+    if any(marker in text for marker in CONVERGED_MARKERS):
+        return None
+    return ("优化过程**没有报告收敛**（输出里找不到 ``THE OPTIMIZATION HAS CONVERGED``），"
+            "但 ORCA 正常结束了。这个几何可能还没到位，别直接拿去做单点能或频率。")
+
+
+@dataclass
+class Issue:
+    """一条影响"这个结果能不能用"的问题。
+
+    为什么要有严重度：``warnings`` 是一串给人看的字符串，分不出
+    "某项分析被跳过"（主结果照样能用）和"算出来的分子已经不是你要的了"
+    （结果根本不能用）。结论判定需要后者的信息。
+    """
+
+    #: 机器可读标识，便于统计与测试（不要靠匹配 message 文本）
+    code: str
+    severity: str
+    message: str
+
+    def to_dict(self) -> dict:
+        return {"code": self.code, "severity": self.severity, "message": self.message}
+
 
 @dataclass
 class Result:
@@ -39,6 +108,10 @@ class Result:
     #: 典型场景：用户请求了 NBO 分析，ORCA 因为没设 NBOEXE 把它**静默跳过**，
     #: 任务照常 TERMINATED NORMALLY —— 界面上会是绿点，但一个 NBO 数都没有。
     warnings: list[str] = field(default_factory=list)
+
+    #: 结构化的问题（带严重度）。``warnings`` 是它的可读投影。
+    #: 界面上的"任务结论"由它算出来，见 :attr:`verdict`。
+    issues: list[Issue] = field(default_factory=list)
 
     # --- 方法与任务 ---
     job_type: str = ""
@@ -87,6 +160,55 @@ class Result:
         return self.status == STATUS_DONE
 
     @property
+    def verdict(self) -> str:
+        """这个结果能不能用：``ok`` / ``limited`` / ``unusable``。
+
+        这是本项目最该被看见的一个判断。已有三次教训都属于同一类 ——
+        **算错了却显示绿色成功**（静默跳过的 NBO、消除成丁二烯却报 done 的扫描、
+        跑满 50 圈没收敛的过渡态）。用户不会去翻日志，只会看那个绿点。
+
+        判据偏保守：只要有任何警告而又没有结构化信息，也算"有限制"。
+        """
+        if self.status != STATUS_DONE:
+            return VERDICT_UNUSABLE
+        severities = {issue.severity for issue in self.issues}
+        if SEVERITY_BLOCKING in severities:
+            return VERDICT_UNUSABLE
+        if severities & {SEVERITY_MAJOR, SEVERITY_MINOR}:
+            return VERDICT_LIMITED
+        if self.warnings:
+            # 有警告但没标严重度（老的结果文件）：保守处理
+            return VERDICT_LIMITED
+        return VERDICT_OK
+
+    @property
+    def verdict_label(self) -> str:
+        return _VERDICT_LABELS.get(self.verdict, self.verdict)
+
+    @property
+    def verdict_reason(self) -> str:
+        """一句话说清为什么是这个结论（给用户看的）。"""
+        if self.status == STATUS_FAILED:
+            return self.message or "计算没有正常结束"
+        if self.status == STATUS_CANCELLED:
+            return "任务被取消，结果不完整"
+        if self.status not in (STATUS_DONE,):
+            return f"任务状态为 {self.status or '未知'}"
+
+        blocking = [i for i in self.issues if i.severity == SEVERITY_BLOCKING]
+        if blocking:
+            return blocking[0].message
+        major = [i for i in self.issues if i.severity == SEVERITY_MAJOR]
+        if major:
+            return major[0].message
+        minor = [i for i in self.issues if i.severity == SEVERITY_MINOR]
+        if minor:
+            return f"附带分析有缺失（{len(minor)} 项），主结果本身没受影响"
+        if self.warnings:
+            return self.warnings[0]
+        return "全部检查通过：没有跳过项、成键未变化、优化已收敛"
+
+    @property
     def n_imaginary_frequencies(self) -> int:
         """虚频个数。极小点应为 0，过渡态应为 1。"""
         return sum(1 for f in self.frequencies if f < 0)
@@ -103,6 +225,10 @@ class Result:
         # 否则界面拿不到虚频数（判断过渡态的关键指标）
         data["n_imaginary_frequencies"] = self.n_imaginary_frequencies
         data["ok"] = self.ok
+        # 结论也带上：界面不用自己重新推导一套判据（那样两边迟早会不一致）
+        data["verdict"] = self.verdict
+        data["verdict_label"] = self.verdict_label
+        data["verdict_reason"] = self.verdict_reason
         return data
 
     def to_json(self, indent: int = 2) -> str:
@@ -117,7 +243,22 @@ class Result:
     @classmethod
     def from_dict(cls, data: dict) -> "Result":
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in data.items() if k in known})
+        payload = {k: v for k, v in data.items() if k in known}
+        # issues 必须还原成 Issue 对象：JSON 里是 dict，直接塞回去会让
+        # verdict 之类的属性在 `issue.severity` 上炸（读旧结果就中招）。
+        raw = payload.get("issues") or []
+        restored: list[Issue] = []
+        for item in raw:
+            if isinstance(item, Issue):
+                restored.append(item)
+            elif isinstance(item, dict):
+                restored.append(Issue(
+                    code=str(item.get("code", "unknown")),
+                    severity=str(item.get("severity", SEVERITY_MINOR)),
+                    message=str(item.get("message", "")),
+                ))
+        payload["issues"] = restored
+        return cls(**payload)
 
     @classmethod
     def load(cls, path: str | Path) -> "Result":

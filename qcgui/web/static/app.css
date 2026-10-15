@@ -376,7 +376,38 @@ select.input { cursor: pointer; }
 
 .result-body { padding: 11px 13px; overflow-y: auto; flex: 1; }
 
-/* "任务成功但你要的数据没有"的警告：必须比普通区块显眼得多 */
+/* 任务结论横幅：这个结果能不能用？
+   必须比普通区块显眼得多 —— 用户不会去翻日志，只会看这一块。 */
+.res-verdict {
+  margin: 0 0 14px; padding: 10px 12px; font-size: 12px; line-height: 1.55;
+  border: 1px solid var(--line-soft); border-left-width: 4px;
+  border-radius: 5px; background: var(--bg-soft); color: var(--text);
+}
+.res-verdict-head { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+.res-verdict-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 17px; height: 17px; border-radius: 50%; font-size: 11px; font-weight: 700;
+  color: #fff; flex: none;
+}
+.res-verdict-why { margin: 0; color: var(--text-dim); }
+.res-verdict-list { margin: 7px 0 0; padding-left: 18px; }
+.res-verdict-list li { margin-top: 4px; }
+.res-verdict-list b { color: var(--text); }
+
+/* 三档：绿 / 琥珀 / 红 */
+.res-verdict.ok { border-color: #2ea078; border-left-color: #2ea078; background: rgba(46, 160, 120, .10); }
+.res-verdict.ok .res-verdict-icon { background: #2ea078; }
+.res-verdict.ok .res-verdict-head strong { color: #2ea078; }
+
+.res-verdict.limited { border-color: var(--warn, #b8860b); border-left-color: var(--warn, #b8860b); background: rgba(184, 134, 11, .12); }
+.res-verdict.limited .res-verdict-icon { background: var(--warn, #b8860b); }
+.res-verdict.limited .res-verdict-head strong { color: var(--warn, #b8860b); }
+
+.res-verdict.unusable { border-color: #c0392b; border-left-color: #c0392b; background: rgba(192, 57, 43, .13); }
+.res-verdict.unusable .res-verdict-icon { background: #c0392b; }
+.res-verdict.unusable .res-verdict-head strong { color: #c0392b; }
+
+/* 旧的警告块保留（IRC 等地方还在用） */
 .res-warning {
   margin: 0 0 14px; padding: 10px 12px; font-size: 12px; line-height: 1.55;
   border: 1px solid var(--warn, #b8860b);
@@ -389,7 +420,7 @@ select.input { cursor: pointer; }
 .res-warning p { margin: 0; }
 .res-warning p + p { margin-top: 6px; }
 
-/* 任务卡片上的"有分析被跳过"标记（绿点 DONE 旁边） */
+/* 任务卡片上的结论标记（绿点 DONE 旁边） */
 .badge.warned { color: var(--warn); border-color: rgba(232, 178, 58, .5); cursor: help; }
 
 .res-section { margin-bottom: 14px; }

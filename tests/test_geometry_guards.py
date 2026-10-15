@@ -22,6 +22,7 @@ from qcgui.model.geometry import (  # noqa: E402
     scan_actual_values,
     scan_warnings,
 )
+from qcgui.model import SEVERITY_BLOCKING, SEVERITY_MAJOR  # noqa: E402
 
 # 乙烷（含一个被"挪走"的氢，用来造出成键变化）
 ETHANE = {
@@ -202,10 +203,13 @@ def test_engine_warns_when_the_molecule_changed():
     broken[6] = [4.9, 2.0, 0.0]
     broken[3] = [4.2, 2.6, 0.0]
     changed = Result(status="done", geometry={"symbols": symbols, "coords": broken})
-    warn = _check_connectivity(spec, changed)
-    assert warn, "成键变了却没报警"
-    assert "不是原来的分子" in warn[0], warn
-    print(f"    引擎报出：{warn[0][:60]}…")
+    issues = _check_connectivity(spec, changed)
+    assert issues, "成键变了却没报警"
+    # 断言结构化字段：这条必须是 blocking，因为结果根本不能用
+    assert issues[0].severity == SEVERITY_BLOCKING, issues[0]
+    assert issues[0].code == "connectivity_changed", issues[0]
+    assert "不是原来的分子" in issues[0].message, issues[0]
+    print(f"    引擎报出：{issues[0].message[:52]}…")
 
     # 单点能任务不做这个检查（几何就是输入几何）
     energy_spec = JobSpec(molecule=molecule, job_type=JobType.ENERGY,
@@ -230,8 +234,11 @@ def test_engine_warns_when_optimization_did_not_converge():
 
     maxed = ("The optimization did not converge but reached the maximum\n"
              "number of optimization cycles.\n****ORCA TERMINATED NORMALLY****")
-    warn = _check_convergence(spec, maxed)
-    assert warn and "没有收敛" in warn[0], warn
+    issues = _check_convergence(spec, maxed)
+    assert issues, "跑满圈数没收敛却没报警"
+    assert issues[0].severity == SEVERITY_MAJOR, issues[0]
+    assert issues[0].code == "not_converged", issues[0]
+    assert "没有收敛" in issues[0].message, issues[0]
 
     # 中间圈那句 "not yet converged" 绝不能当判据（语料里出现 265 次）
     intermediate = ("The optimization has not yet converged - more geometry cycles are needed\n"

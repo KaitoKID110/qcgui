@@ -221,6 +221,72 @@ def test_scan_curve_drag_changes_the_displayed_geometry():
     assert "pointermove  index=2" in text, f"拖到最右侧应选中最后一个点：{text}"
 
 
+def test_interaction_fixes_in_real_browser():
+    """三处修复必须在真页面里生效（审计 F1/F2 + P0 结论横幅）。
+
+    都是"接线"层面的问题 —— 纯逻辑测试证明不了，而本项目已经踩过
+    "DOM 里有但用户看不见"（扫描区被插到滚动区下面）这种坑。
+
+    * F1 SSE 断开时「运行」按钮永久禁用 → 看门狗要能恢复
+    * F2 快速切换任务时结果面板串台 → 过期响应要被丢弃
+    * P0 结论横幅要真的渲染出来，且带上正确的严重度类名
+    """
+    from qcgui.model import JobSpec, JobType, Molecule, Result
+
+    server = Server()
+    try:
+        # 造一个"算完但分子变了"的任务：这正是结论横幅最该拦下的一类
+        symbols = ["C", "C", "O", "H", "H", "H", "H"]
+        before = [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [2.9, 0.0, 0.0],
+                  [-0.6, 0.9, 0.0], [-0.6, -0.9, 0.0], [1.5, 0.9, 0.0], [3.86, 0.0, 0.0]]
+        after = [list(c) for c in before]
+        after[2] = [4.2, 2.0, 0.0]
+        after[6] = [4.9, 2.0, 0.0]
+        after[3] = [4.2, 2.6, 0.0]
+        body = "\n".join(f"{s} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}"
+                         for s, c in zip(symbols, before))
+        molecule = Molecule.from_xyz(f"{len(symbols)}\nbroken\n{body}\n", name="broken")
+        spec = JobSpec(molecule=molecule, job_type=JobType.OPT, method="HF", basis="STO-3G")
+        job_id = "20200101-000000-fixtest"
+        server.manager.store.create(spec, job_id=job_id)
+        job_dir = server.manager.store.job_dir(job_id)
+        (job_dir / "jobspec.json").write_text(spec.canonical_json(), encoding="utf-8")
+        Result(status="done", job_type="opt", method="HF",
+               geometry={"symbols": symbols, "coords": after, "units": "angstrom"},
+               job_dir=str(job_dir)).save(job_dir / "result.json")
+        # 索引里的状态也要改成 done —— 直接写 result.json 绕过了 save_result，
+        # 而"运行"按钮的看门狗**看的是索引状态**（踩过：不改的话它永远等下去，
+        # 诊断输出 F1_polls=99 就是这么来的）
+        server.manager.store.update(job_id, status="done", final_energy=-1.0)
+
+        chrome = _browser()
+        profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
+        url = f"{server.base}/?nosse=1&fixtest={job_id}"
+        proc = subprocess.run(
+            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+             "--window-size=1500,1000", "--virtual-time-budget=30000",
+             f"--user-data-dir={profile}", "--dump-dom", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        dom = proc.stdout or ""
+    finally:
+        server.close()
+
+    match = re.search(r"__FIXTEST__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到交互测试输出\nDOM 片段:\n{dom[:600]}"
+    text = match.group(1)
+    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+
+    assert "ERROR" not in text, text
+    for key in ("F1_button_restored", "F1_cancel_disabled", "F2_stale_discarded",
+                "verdict_banner"):
+        assert f"{key}=PASS" in text, f"{key} 没通过：{text}"
+    # 结论横幅的严重度类名要对 —— 这一条是 blocking，必须落成 unusable
+    assert "class=unusable" in text, f"结论横幅的类名不对：{text}"
+    assert "结果不可用" in text, text
+    print("    三处修复在真页面里都生效")
+
+
 def test_page_loads_without_javascript_errors():
     """页面首屏不得抛 JS 异常：用一个会渲染失败的探针检测。"""
     server = Server()

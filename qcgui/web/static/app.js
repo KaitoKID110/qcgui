@@ -318,6 +318,67 @@ async function applyUrlParams() {
   if (params.get('scancheck') === '1') {
     await runScanHintTest(params.get('scancheck-kind') || 'dihedral');
   }
+  if (params.get('fixtest')) {
+    await runInteractionFixTest(params.get('fixtest'));
+  }
+}
+
+/**
+ * 真浏览器验证两处**交互修复**（审计 F1 / F2）：
+ *
+ * * F1 「运行」按钮在 SSE 断开后永久禁用 —— 看门狗要能把它恢复
+ * * F2 快速切换任务时结果面板串台 —— 过期的响应要被丢弃
+ *
+ * 两处都是"接线"层面的问题，纯逻辑测试证明不了，必须在真页面里点。
+ */
+async function runInteractionFixTest(jobId) {
+  const out = document.createElement('pre');
+  out.id = 'fixtest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  try {
+    // --- F1：按钮兜底恢复 ---
+    $('btn-run').disabled = true;
+    $('btn-cancel').disabled = false;
+    state._runWatchPolls = 0;
+    // 用一个**已经结束**的任务，间隔调短便于测试
+    watchRunButton(jobId, 150);
+    const t0 = Date.now();
+    const restored = await new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve(false), 15000);
+      const poll = setInterval(() => {
+        if (!$('btn-run').disabled) { clearInterval(poll); clearTimeout(deadline); resolve(true); }
+      }, 50);
+    });
+    lines.push(`F1_button_restored=${restored ? 'PASS' : 'FAIL'}`);
+    lines.push(`F1_cancel_disabled=${$('btn-cancel').disabled ? 'PASS' : 'FAIL'}`);
+    lines.push(`F1_polls=${state._runWatchPolls || 0} elapsed=${Date.now() - t0}ms`);
+    lines.push(`F1_has_watch=${state._runWatch ? 'yes' : 'no'}`);
+
+    // --- F2：过期响应必须被丢弃 ---
+    // 先确认这次请求真的成功了 —— 否则 state.result 不变，
+    // 断言会因为"请求失败"而**假通过**
+    await selectJob(jobId);
+    lines.push(`F2_selected=${state.selectedJob === jobId ? 'PASS' : 'FAIL'}`
+      + ` result_loaded=${state.result ? 'yes' : 'no'}`);
+    const settled = state.result;
+    const stale = selectJob(jobId);      // 不 await
+    state.jobToken += 1;                 // 模拟"期间用户又点了别的任务"
+    await stale;
+    lines.push(`F2_stale_discarded=${state.result === settled ? 'PASS' : 'FAIL'}`);
+    lines.push(`F2_token=${state.jobToken}`);
+
+    // --- P0：结论横幅真的渲染出来了（三档取一）---
+    const banner = document.querySelector('.res-verdict');
+    lines.push(`verdict_banner=${banner ? 'PASS' : 'FAIL'}`
+      + ` class=${banner ? banner.className.replace('res-verdict', '').trim() : '—'}`);
+    lines.push(`verdict_text="${banner ? banner.textContent.replace(/\s+/g, ' ').trim().slice(0, 90) : ''}"`);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__FIXTEST__' + lines.join(' | ') + '__END__';
 }
 
 /**
@@ -683,14 +744,22 @@ function renderJobs() {
     const energy = job.final_energy !== null && job.final_energy !== undefined ? job.final_energy.toFixed(8) : '';
     const duration = job.duration ? job.duration.toFixed(1) + 's' : '';
     const selected = job.job_id === state.selectedJob ? ' selected' : '';
-    // 任务成功但某项分析被跳过时，store 会把警告写进 message 并加 ⚠ 前缀。
+    // 结果有问题时 store 会把结论写进 message 并加前缀：
+    //   ⛔ = 结果不可用（算出来的分子都变了）  ⚠ = 可用但有限制
     // 卡片上必须带出来 —— 否则列表里是个绿点 DONE，用户不点开就永远发现不了。
-    const warned = job.status === 'done' && (job.message || '').startsWith('⚠');
+    const msg = job.message || '';
+    const unusable = job.status === 'done' && msg.startsWith('⛔');
+    const warned = job.status === 'done' && msg.startsWith('⚠');
+    const badge = unusable
+      ? '<span class="badge warned" title="' + esc(msg) + '">⛔ 结果不可用</span>'
+      : warned
+        ? '<span class="badge warned" title="' + esc(msg) + '">⚠ 有限制</span>'
+        : '';
     return `<div class="job-card${selected}" data-job="${esc(job.job_id)}" data-status="${esc(job.status)}">
       <div class="line1">
         <span class="name">${esc(job.molecule)}</span>
         <span class="badge ${esc(job.status)}">${esc(job.status)}</span>
-        ${warned ? '<span class="badge warned" title="' + esc(job.message) + '">⚠ 有跳过</span>' : ''}
+        ${badge}
         <span class="when">${esc(when)}</span>
       </div>
       <div class="line2">
@@ -729,8 +798,13 @@ async function selectJob(jobId) {
   state.selectedJob = jobId;
   renderJobs();
   $('result-job').textContent = jobId.slice(0, 15);
+  // 请求序号：快速点两个任务时，**慢的那个响应后到会把面板覆盖掉** ——
+  // 标题和高亮是后点的那个，结果区却是先点的那个（审计 F2，实测复现）。
+  // 回来时对不上序号就整段丢弃。
+  const token = ++state.jobToken;
   try {
     const data = await api('/api/jobs/' + encodeURIComponent(jobId));
+    if (token !== state.jobToken) return;
     state.result = data.result;
     renderResult(data.job, data.result);
     if (data.result && data.result.geometry) {
@@ -753,6 +827,8 @@ async function selectJob(jobId) {
     }
     if (data.result && data.result.irc && data.result.irc.files && data.result.irc.files.full_trajectory) {
       await loadTrajectory(jobId);
+      // 轨迹是异步的，回来时也要确认没被后点的任务顶掉（否则会把 A 的曲线插进 B 的面板）
+      if (token !== state.jobToken) return;
     } else {
       $('trajectory').hidden = true;
     }
@@ -797,6 +873,46 @@ function currentSpecPayload() {
   }, shared);
 }
 
+/**
+ * 「运行」按钮的**兜底恢复**（审计 F1，高危）。
+ *
+ * 提交后按钮靠 SSE 的 `finished` 事件恢复。SSE 一断（服务重启、网络抖动、
+ * 休眠唤醒），事件就永远收不到 —— 按钮**永久灰掉，唯一自救是刷新页面**。
+ * 实测：`?nosse=1` 下任务已经 failed，按钮仍是 disabled。
+ *
+ * 这里加一层与 SSE 无关的兜底：轮询任务状态，看到它结束就恢复。
+ * 连不上服务超过一定次数也恢复 —— 宁可让用户能再点一次，
+ * 也别把界面变成只读的。
+ */
+function watchRunButton(jobId, intervalMs = 4000) {
+  if (!jobId) return;
+  if (state._runWatch) clearInterval(state._runWatch);
+  const MAX_UNREACHABLE = 15;      // 约 1 分钟
+  let unreachable = 0;
+  const restore = (why) => {
+    if (state._runWatch) { clearInterval(state._runWatch); state._runWatch = null; }
+    $('btn-run').disabled = false;
+    $('btn-cancel').disabled = true;
+    if (why) logLine('· ' + why, 'l-dim');
+  };
+  state._runWatch = setInterval(async () => {
+    state._runWatchPolls = (state._runWatchPolls || 0) + 1;
+    try {
+      const data = await api('/api/jobs/' + encodeURIComponent(jobId));
+      unreachable = 0;
+      const status = (data.job || {}).status;
+      if (status && status !== 'running' && status !== 'queued') {
+        restore(`任务已结束（${status}），按钮已恢复`);
+      }
+    } catch (err) {
+      unreachable += 1;
+      if (unreachable >= MAX_UNREACHABLE) {
+        restore('连不上服务，先恢复「运行」按钮避免界面卡死');
+      }
+    }
+  }, intervalMs);
+}
+
 async function runJob() {
   let payload;
   try { payload = currentSpecPayload(); }
@@ -809,8 +925,14 @@ async function runJob() {
     $('btn-cancel').disabled = false;
     logLine('');
     logLine('▶ 提交任务 ' + data.job.job_id + '  ·  ' + data.summary, 'l-head');
+    // 提交时后端已经算过扫描设置了，有问题当场说出来 —— 算力花出去就晚了
+    for (const w of (data.warnings || [])) {
+      logLine('⚠ 扫描设置: ' + w, 'l-err');
+      toast('扫描设置有问题，见日志', 'err');
+    }
     await refreshJobs();
     startJobWatch();
+    watchRunButton(data.job.job_id);
   } catch (err) {
     $('btn-run').disabled = false;
     toast('提交失败: ' + err.message, 'err');
@@ -880,6 +1002,46 @@ async function runBatch() {
 
 // ------------------------------------------------------------------ 结果渲染
 
+/**
+ * 任务结论横幅：这个结果能不能用？
+ *
+ * 判据全部在后端算（``Result.verdict`` / ``verdict_reason`` / ``issues``）——
+ * 前端**不重新推导一套**，否则两边迟早就判得不一致。
+ */
+const VERDICT_META = {
+  ok: { icon: '✓', cls: 'ok' },
+  limited: { icon: '!', cls: 'limited' },
+  unusable: { icon: '✕', cls: 'unusable' },
+};
+const SEVERITY_ORDER = { blocking: 0, major: 1, minor: 2 };
+const SEVERITY_LABEL = { blocking: '不可用', major: '需注意', minor: '提示' };
+
+function verdictBanner(result) {
+  // 后端没给结论（老的结果文件）时按状态兜底
+  const verdict = result.verdict || (result.status === 'done' ? 'limited' : 'unusable');
+  const meta = VERDICT_META[verdict] || VERDICT_META.limited;
+  // 展示时去掉 markdown 的星号：这里是纯文本渲染，留着会显示成字面量
+  const plain = (text) => esc(String(text || '').replace(/\*\*/g, ''));
+  const issues = (result.issues || [])
+    .slice()
+    .sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9));
+
+  const detail = issues.length
+    ? `<ul class="res-verdict-list">${issues.map((i) =>
+      `<li><b>${esc(SEVERITY_LABEL[i.severity] || i.severity)}</b> ${plain(i.message)}</li>`
+    ).join('')}</ul>`
+    : '';
+
+  return `<div class="res-verdict ${meta.cls}">
+    <div class="res-verdict-head">
+      <span class="res-verdict-icon">${meta.icon}</span>
+      <strong>${esc(result.verdict_label || '任务结论')}</strong>
+    </div>
+    <p class="res-verdict-why">${plain(result.verdict_reason)}</p>
+    ${detail}
+  </div>`;
+}
+
 function renderResult(job, result) {
   const body = $('result-body');
   if (!result) {
@@ -889,16 +1051,11 @@ function renderResult(job, result) {
 
   const parts = [];
 
-  // 警告放在最前面：这些是"任务成功、但你要的数据其实没有"的情况
-  // （例如请求了 NBO 分析，ORCA 因为没设 NBOEXE 把它静默跳过）。
-  // 埋在其他区块下面等于没提示 —— 用户只会看到绿点然后以为拿到了结果。
-  const warnings = result.warnings || [];
-  if (warnings.length) {
-    parts.push(`<div class="res-warning">
-      <strong>⚠ 有分析被跳过 —— 本次结果不包含你请求的全部内容</strong>
-      ${warnings.map((w) => `<p>${esc(w)}</p>`).join('')}
-    </div>`);
-  }
+  // **结论横幅放在最前面** —— 这是用户唯一一定会看到的地方。
+  // 本项目已有三次教训都属于同一类：算错了却显示绿色成功
+  // （静默跳过的 NBO、消除成丁二烯却报 done 的扫描、跑满 50 圈没收敛的过渡态）。
+  // 以前只列"有分析被跳过"，把"分子已经变了"这种更严重的事也混在同一档里。
+  parts.push(verdictBanner(result));
 
   parts.push(`<div class="res-section"><h4>概要</h4><dl class="res-grid">
     <dt>状态</dt><dd class="${result.status === 'done' ? 'hi' : ''}">${esc(result.status)}</dd>
@@ -1267,6 +1424,8 @@ function orbitalSection(result, jobId) {
 state.scanMode = 'energy';
 state.scanIndex = null;      // 当前预览的是第几个扫描点（null = 没在预览）
 state.scanProfile = null;
+//: selectJob 的请求序号：防止慢响应后到把结果面板覆盖成旧任务
+state.jobToken = 0;
 
 function scanSeries(profile, mode) {
   const pts = profile.points || [];
@@ -1617,7 +1776,13 @@ function connectEvents() {
     $('conn-state').className = 'conn on';
     refreshJobs().then(startJobWatch);
   };
-  source.onerror = () => { $('conn-state').textContent = '连接断开，重试中…'; $('conn-state').className = 'conn off'; };
+  source.onerror = () => {
+    $('conn-state').textContent = '连接断开，重试中…';
+    $('conn-state').className = 'conn off';
+    // SSE 断了之后 finished 事件就收不到了 —— 「运行」按钮会永久禁用。
+    // 这里用与 SSE 无关的轮询兜底恢复（审计 F1）。
+    if (state.currentJobId) watchRunButton(state.currentJobId);
+  };
 
   source.onmessage = (ev) => {
     let data;

@@ -57,7 +57,8 @@ def main() -> int:
         if result is not None:
             conn = _check_connectivity(spec, result)
             if conn:
-                conn_hits.append((record.job_id, record.status, conn[0][:110]))
+                # 这两个函数现在返回带严重度的 Issue 对象
+                conn_hits.append((record.job_id, record.status, conn[0].message[:110]))
         if text:
             conv = _check_convergence(spec, text)
             if conv:

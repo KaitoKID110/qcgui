@@ -208,6 +208,26 @@ class ScanSpec:
         return False
 
 
+#: 会移动原子的任务类型。单点能的"输出几何"就是输入几何，比成键没意义。
+MOVING_JOB_TYPES = frozenset({"opt", "opt_freq", "ts", "ts_freq"})
+
+
+def describe_connectivity_change(symbols, coords_before, coords_after) -> str | None:
+    """成键变了就返回一句描述，没变返回 ``None``。
+
+    抽出来是为了让**引擎和界面都能用**：引擎在算完时判一次，
+    界面在读旧结果时还能再判一次 —— 因为检查是后加的，
+    之前存下来的结果文件里没有这个结论（实测：那个消除成丁二烯的任务
+    在历史库里仍然显示"结果可用"，正是这个原因）。
+
+    这个检查很便宜（只比对坐标，不读大文件），所以读取时重算完全可接受。
+    """
+    change = connectivity_change(symbols, coords_before, coords_after)
+    if not change.changed:
+        return None
+    return f"成键发生变化（{change.describe(symbols)}）"
+
+
 def parse_scan_blocks(blocks) -> list[ScanSpec]:
     """从 ``extra_blocks`` 里解析 ``%geom`` 的 ``Scan`` 段。
 

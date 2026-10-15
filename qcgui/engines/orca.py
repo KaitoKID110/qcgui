@@ -18,7 +18,15 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from ..model import JobSpec, JobType, Result
+from ..model import (
+    SEVERITY_BLOCKING,
+    SEVERITY_MAJOR,
+    SEVERITY_MINOR,
+    Issue,
+    JobSpec,
+    JobType,
+    Result,
+)
 from ..model.molecule import BOHR_TO_ANGSTROM
 from ..model.trajectory import read_xyz_frames
 from ..orcatools import find_tool, orca_executable
@@ -78,8 +86,11 @@ def _requested_analyses(spec: JobSpec) -> set[str]:
     return tokens
 
 
-def _check_connectivity(spec: JobSpec, result: Result) -> list[str]:
+def _check_connectivity(spec: JobSpec, result: Result) -> list[Issue]:
     """算完的分子**还是不是你要的那个分子**？
+
+    严重度 **blocking**：这个几何不能当作目标分子的结构用，
+    所以整个结果判为不可用。
 
     实测踩过：一个带 ``%geom Scan`` 的优化任务，产物是 1,3-丁二烯 + 水
     （C–O 断裂、H 转移到 O），而任务状态是 ``done``、**零警告** ——
@@ -109,11 +120,15 @@ def _check_connectivity(spec: JobSpec, result: Result) -> list[str]:
     if not change.changed:
         return []
     name = spec.molecule.name or "原分子"
-    return [
-        f"算出来的**已经不是原来的分子**了：成键发生变化（{change.describe(symbols)}）。"
-        f"这个几何不能当作 {name} 的结构用 —— 检查一下任务设置（尤其扫描的原子编号与范围），"
-        f"或者用别的起点重算。"
-    ]
+    return [Issue(
+        code="connectivity_changed",
+        severity=SEVERITY_BLOCKING,
+        message=(
+            f"算出来的**已经不是原来的分子**了：成键发生变化（{change.describe(symbols)}）。"
+            f"这个几何不能当作 {name} 的结构用 —— 检查一下任务设置（尤其扫描的原子编号与范围），"
+            f"或者用别的起点重算。"
+        ),
+    )]
 
 
 def _check_convergence(spec: JobSpec, text: str) -> list[str]:
@@ -136,32 +151,35 @@ def _check_convergence(spec: JobSpec, text: str) -> list[str]:
 
     注意 ``The optimization has not yet converged`` 是**每个中间圈都会打印**
     的（语料里出现 265 次），绝不能拿它当判据。
+
+    判据本身在 :func:`qcgui.model.result.describe_convergence_problem` —— 放在模型层
+    是为了让界面读旧结果时也能用同一套措辞（界面不能 import 引擎）。
     """
+    from ..model.result import describe_convergence_problem
+
     if spec.job_type not in (JobType.OPT, JobType.OPT_FREQ, JobType.TS, JobType.TS_FREQ):
         return []
     if _TERMINATION_MARKER not in text:
         return []          # 没正常终止的话，"失败"判定已经覆盖了
-    if "did not converge but reached the maximum" in text \
-            or "reached the maximum number of optimization cycles" in text:
-        return [
-            "优化**没有收敛**：跑满了最大优化圈数就停了（ORCA 仍打印了正常终止）。"
-            "这个几何还没到位，别直接拿去做单点能或频率 —— 加大优化圈数或换个起点重算。"
-        ]
-    if "THE OPTIMIZATION HAS CONVERGED" in text or "HURRAY" in text:
+    problem = describe_convergence_problem(text)
+    if not problem:
         return []
-    return [
-        "优化过程**没有报告收敛**（输出里找不到 ``THE OPTIMIZATION HAS CONVERGED``），"
-        "但 ORCA 正常结束了。这个几何可能还没到位，别直接拿去做单点能或频率。"
-    ]
+    code = "not_converged" if "跑满" in problem else "no_convergence_notice"
+    return [Issue(code=code, severity=SEVERITY_MAJOR, message=problem)]
 
 
-def _collect_warnings(text: str, spec: JobSpec) -> list[str]:
-    """找出"任务成功、但某项分析被悄悄跳过"的情况。"""
+def _collect_issues(text: str, spec: JobSpec) -> list[Issue]:
+    """找出"任务成功、但某项分析被悄悄跳过"的情况。
+
+    严重度是 **minor**：主结果（能量/几何）照样能用，缺的只是某一项附带分析。
+    用户仍然需要知道 —— 否则他会以为 NBO 数据在里面。
+    """
     tokens = _requested_analyses(spec)
-    found: list[str] = []
+    found: list[Issue] = []
     for marker, triggers, message in _SILENT_SKIPS:
         if marker in text and tokens & set(triggers):
-            found.append(message)
+            found.append(Issue(code="analysis_skipped", severity=SEVERITY_MINOR,
+                               message=message))
     return found
 
 
@@ -380,14 +398,17 @@ class OrcaEngine(Engine):
             result.status = "failed"
             result.message = _first_error(text) or "ORCA 未正常终止"
 
-        # 任务成功也可能"少了东西"：某项分析被静默跳过了。这类情况必须报出来，
-        # 否则界面上是绿点，用户以为拿到了数据。
-        result.warnings = _collect_warnings(text, spec)
-
-        # 更严重的一种"少了东西"：算出来的**已经不是你要的分子**了。
-        result.warnings.extend(_check_connectivity(spec, result))
-        # 优化没收敛也是"任务成功但结果不能用"。
-        result.warnings.extend(_check_convergence(spec, text))
+        # 任务成功也可能"少了东西"。分三档，严重度决定界面上的"结论"：
+        #   minor    —— 某项附带分析被静默跳过（主结果可用）
+        #   major    —— 优化没到位（几何可能不能用）
+        #   blocking —— 算出来的分子已经变了（结果根本不能用）
+        result.issues = (
+            _collect_issues(text, spec)
+            + _check_connectivity(spec, result)
+            + _check_convergence(spec, text)
+        )
+        # warnings 是给界面直接显示的可读投影，保持兼容
+        result.warnings = [issue.message for issue in result.issues]
 
         return result
 

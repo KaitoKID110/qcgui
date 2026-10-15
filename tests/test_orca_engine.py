@@ -145,28 +145,33 @@ def test_silently_skipped_analysis_is_reported():
     正常终止、退出码 0 —— 任务状态是"成功"，但一个 NBO 数都没有。
     这种"绿点但没数据"比直接报错危险得多。
     """
-    from qcgui.engines.orca import _collect_warnings
+    from qcgui.engines.orca import _collect_issues
 
     nbo_spec = JobSpec(
         molecule=_water(), job_type=JobType.ENERGY, method="HF", basis="STO-3G",
         extra_keywords=("NBO",),
     )
     marker = "Environment variable NBOEXE for nbo6.exe or nbo5.exe not set! Skipping NBO-Analysis"
-    assert _collect_warnings(marker, nbo_spec), "请求了 NBO 却没报警"
+    issues = _collect_issues(marker, nbo_spec)
+    assert issues, "请求了 NBO 却没报警"
+    # 断言**结构化字段**而不是消息文本 —— 改文案不该弄坏测试，
+    # 而"跳过附带分析"必须是 minor（主结果仍然可用）
+    assert issues[0].code == "analysis_skipped", issues[0]
+    assert issues[0].severity == "minor", issues[0]
 
     # %nbo 块形式也一样要认出来
     block_spec = JobSpec(
         molecule=_water(), job_type=JobType.ENERGY, method="HF", basis="STO-3G",
         extra_blocks=(("nbo", 'NBOKEYLIST = "$NBO $END"'),),
     )
-    assert _collect_warnings("Skipping NBO-Analysis", block_spec)
+    assert _collect_issues("Skipping NBO-Analysis", block_spec)
 
     # 没请求 NBO 就不该报 —— 否则就是噪声
     plain = JobSpec(molecule=_water(), job_type=JobType.ENERGY, method="HF", basis="STO-3G")
-    assert not _collect_warnings(marker, plain)
+    assert not _collect_issues(marker, plain)
 
     # SCF 收敛策略的 "skipping pre-diagonalization" 是正常输出，绝不能当成"跳过分析"
-    assert not _collect_warnings(
+    assert not _collect_issues(
         "Warning: op=0 Small HOMO/LUMO gap (   0.037) - skipping pre-diagonalization", plain
     )
 

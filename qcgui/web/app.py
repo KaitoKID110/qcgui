@@ -227,8 +227,89 @@ def molecule_from_payload(data: dict) -> Molecule:
     )
 
 
-def _result_payload(result) -> dict | None:
-    return result.to_dict() if result is not None else None
+def _read_output_tail(job_dir: str, limit: int = 300_000) -> str:
+    """只读 ORCA 输出的**尾部**。
+
+    收敛公告在文件最后，没必要读整个 17 MB。
+    """
+    try:
+        outs = sorted(Path(job_dir).glob("*.out"))
+        if not outs:
+            return ""
+        path = outs[0]
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+            return fh.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
+def _result_payload(result, spec=None) -> dict | None:
+    """结果的可序列化形式，并按需**补算**读取时才能判的检查。
+
+    为什么要在读的时候补：这两项检查都是后来才加的，之前存下的
+    ``result.json`` 里没有对应结论 —— 实测那个消除成丁二烯的任务
+    在历史库里仍然显示"结果可用"，而这正是最该被拦下的一条。
+
+    两项都便宜（成键只比坐标；收敛只读输出尾部），放在读取路径上没问题。
+    """
+    if result is None:
+        return None
+    from ..model import Issue, SEVERITY_BLOCKING, SEVERITY_MAJOR
+    from ..model.geometry import MOVING_JOB_TYPES, describe_connectivity_change
+    from ..model.result import describe_convergence_problem
+
+    data = result.to_dict()
+    issues = list(result.issues or [])
+    known = {i.code for i in issues}
+    job_type = getattr(getattr(spec, "job_type", None), "value", None) if spec else None
+    added = False
+
+    if spec is not None and job_type in MOVING_JOB_TYPES \
+            and "connectivity_changed" not in known:
+        geometry = result.geometry or {}
+        coords_after = geometry.get("coords")
+        before = getattr(spec.molecule, "coords", None)
+        if coords_after and before and len(geometry.get("symbols") or before) == len(before):
+            try:
+                described = describe_connectivity_change(
+                    list(geometry.get("symbols") or spec.molecule.symbols),
+                    before, coords_after,
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                described = None
+            if described:
+                issues.append(Issue(
+                    code="connectivity_changed",
+                    severity=SEVERITY_BLOCKING,
+                    message=(f"算出来的**已经不是原来的分子**了：{described}。"
+                             f"这个几何不能当作 {spec.molecule.name or '原分子'} 的结构用。"),
+                ))
+                added = True
+
+    if spec is not None and job_type in MOVING_JOB_TYPES \
+            and not ({"not_converged", "no_convergence_notice"} & known):
+        # 只有正常结束的任务才谈得上"收敛公告"；失败的任务由状态判定覆盖
+        if result.status == "done":
+            text = _read_output_tail(result.job_dir)
+            problem = describe_convergence_problem(text) if text else None
+            if problem:
+                issues.append(Issue(code="not_converged", severity=SEVERITY_MAJOR,
+                                    message=problem))
+                added = True
+
+    if added:
+        result.issues = issues
+        result.warnings = [i.message for i in issues]
+        data["issues"] = [i.to_dict() for i in issues]
+        data["warnings"] = [i.message for i in issues]
+        # 结论跟着重算 —— 否则同一次响应里的字段会自相矛盾
+        data["verdict"] = result.verdict
+        data["verdict_label"] = result.verdict_label
+        data["verdict_reason"] = result.verdict_reason
+    return data
 
 
 def molecule_from_job(manager: JobManager, job_id: str) -> Molecule:
@@ -598,7 +679,8 @@ def create_app(manager: JobManager | None = None) -> Flask:
         if record is None:
             return jsonify({"error": "任务不存在"}), 404
         result = mgr.store.load_result(job_id)
-        return jsonify({"job": record.to_dict(), "result": _result_payload(result)})
+        return jsonify({"job": record.to_dict(),
+                        "result": _result_payload(result, mgr.store.load_spec(job_id))})
 
     @app.post("/api/jobs")
     def api_job_create():

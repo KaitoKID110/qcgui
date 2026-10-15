@@ -167,11 +167,19 @@ class JobStore:
         job_dir = self.job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
         path = result.save(job_dir / "result.json")
-        # 警告也写进 message：任务列表只显示 message，不写进去的话
+        # 结论也写进 message：任务列表只显示 message，不写进去的话
         # 用户看到绿点"done"就以为一切正常，不会去点开结果面板。
+        #
+        # 前缀区分严重度，界面据此上不同颜色的徽章：
+        #   ⛔ 结果不可用（算出来的分子都变了）
+        #   ⚠ 可用但有限制（某项分析被跳过 / 优化没到位）
         message = result.message
-        if not message and result.warnings:
-            message = "⚠ " + result.warnings[0]
+        if not message:
+            verdict = result.verdict
+            if verdict == "unusable":
+                message = "⛔ " + result.verdict_reason
+            elif verdict == "limited":
+                message = "⚠ " + result.verdict_reason
         self.update(
             job_id,
             status=result.status,
