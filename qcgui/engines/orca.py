@@ -1021,6 +1021,51 @@ def _scan_bond_series(frames: list[tuple[float, list]]) -> list[dict]:
     return series
 
 
+def _scan_changed_frames(job_dir: Path, symbols, geometries) -> list[int]:
+    """扫描里哪些帧的成键和起始结构不一样（返回 0 起的下标）。
+
+    参照物优先用**输入分子**（``jobspec.json`` 里那一份），而不是第一帧 ——
+    扫描的第一帧本身就可能已经跑歪了，拿它当基准会把"从头就是错的"
+    误判成"没变化"（实测那个消除任务正是第 0 个点就已经变了）。
+
+    读不到 jobspec 时才退回用第一帧。
+
+    检查很便宜（只比坐标、不读大文件），所以对**每一帧**都做。
+    """
+    from ..model.geometry import connectivity_change
+
+    if not symbols or len(geometries) < 2:
+        return []
+    coords = [g.get("coords") for g in geometries]
+    if any(not c for c in coords):
+        return []
+
+    reference = None
+    spec_path = job_dir / "jobspec.json"
+    if spec_path.is_file():
+        try:
+            data = json.loads(spec_path.read_text(encoding="utf-8"))
+            mol = data.get("molecule") or {}
+            ref_symbols = list(mol.get("symbols") or [])
+            ref_coords = mol.get("coords") or []
+            if ref_symbols == list(symbols) and len(ref_coords) == len(symbols):
+                reference = ref_coords
+        except (OSError, ValueError, KeyError, TypeError):
+            reference = None
+    if reference is None:
+        reference = coords[0]
+
+    changed: list[int] = []
+    for index, frame in enumerate(coords):
+        try:
+            change = connectivity_change(list(symbols), reference, frame)
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        if change.changed:
+            changed.append(index)
+    return changed
+
+
 def parse_scan_profile(job_dir: Path) -> dict | None:
     """解析 ORCA 松弛扫描：每个点的坐标值、能量，以及重原子键长。
 
@@ -1070,6 +1115,19 @@ def parse_scan_profile(job_dir: Path) -> dict | None:
             "单点能不一致，势垒可能有约 1 kcal/mol 的偏差。"
         )
 
+    # 扫描的**每一帧**也要查成键 —— 曲线画得再漂亮，如果分子早就变了，
+    # 那条曲线讲的就不是你要的反应。实测踩过：一个二面角扫描在第 0 个点就把
+    # 醇消成了丁二烯 + 水，19 个点全是消除产物，而外部看到的是"一条像样的曲线"。
+    changed_frames = _scan_changed_frames(job_dir, symbols, geometries)
+    if changed_frames:
+        preview = "、".join(str(i + 1) for i in changed_frames[:6])
+        warnings.append(
+            f"扫描过程中分子结构发生了变化：{len(changed_frames)}/{len(geometries)} 个扫描点"
+            f"的成键与起始结构不同（例如第 {preview} 个点）。"
+            f"**除非你就是在扫键的断裂或形成**，否则这些点算的不是你想要的那个分子，"
+            f"曲线和势垒都不能直接用。"
+        )
+
     return {
         "energy_file": energy_file.name,
         "coordinate": name,
@@ -1082,6 +1140,7 @@ def parse_scan_profile(job_dir: Path) -> dict | None:
         "series": series,
         "symbols": symbols,
         "geometries": geometries,
+        "changed_frames": changed_frames,
         "warnings": warnings,
     }
 

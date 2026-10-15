@@ -151,8 +151,24 @@ class ConnectivityChange:
         return "；".join(parts)
 
 
+#: 判定"成键**变化**"时的回滞带（占截断半径的比例）。
+#:
+#: 为什么需要：用硬阈值时，键长刚好卡在截断半径附近的键会因**正常热振动**
+#: 来回翻转。实测：拿仓库里 70 个真实结构各加 ±0.05 Å 抖动，硬阈值下有
+#: **2 个**被翻转（``rig_meo_ben_R2.20``、``rigid_R1.45``）—— 也就是说
+#: 这个守卫会误报。
+#:
+#: 加 10% 回滞带后，只有"**明确越界**"才算变化：断裂要求
+#: ``d_after > cutoff × 1.1``，新成要求 ``d_before > cutoff × 1.1``。
+#: 代价是判据略微变严 —— 但对本项目的用途（抓"醇被消成烯 + 水"这种
+#: 键长变化两倍以上的剧变）完全够用，而误报的代价大得多：
+#: 一个会乱叫的守卫，用户很快就会学会忽略它。
+_BOND_HYSTERESIS = 0.10
+
+
 def connectivity_change(symbols, coords_before, coords_after,
-                        tolerance: float = _BOND_TOLERANCE) -> ConnectivityChange:
+                        tolerance: float = _BOND_TOLERANCE,
+                        hysteresis: float = _BOND_HYSTERESIS) -> ConnectivityChange:
     """比较前后两套几何的成键。
 
     这是抓"**算出来的分子已经不是你要的分子**"最可靠的手段：
@@ -161,13 +177,29 @@ def connectivity_change(symbols, coords_before, coords_after,
     实测踩过：一个带 ``%geom Scan`` 的优化任务，产物是 1,3-丁二烯 + 水
     （C–O 断裂、H 转移到 O），而任务状态是 ``done``、零警告 ——
     用户只能靠肉眼看出结构不对。
+
+    带**回滞带**：只有明确越过阈值才算变化，避免边界上的键被热振动翻转
+    （见 :data:`_BOND_HYSTERESIS`）。
     """
-    before = bond_set(symbols, coords_before, tolerance)
-    after = bond_set(symbols, coords_after, tolerance)
-    return ConnectivityChange(
-        broken=sorted(before - after),
-        formed=sorted(after - before),
-    )
+    before_pairs = bond_set(symbols, coords_before, tolerance)
+    after_pairs = bond_set(symbols, coords_after, tolerance)
+
+    def _cut(i: int, j: int) -> float:
+        ri = COVALENT_RADII.get(symbols[i], 0.77)
+        rj = COVALENT_RADII.get(symbols[j], 0.77)
+        return tolerance * (1.0 + hysteresis) * (ri + rj)
+
+    # 断裂：原来在成键范围内，现在**明确**超出（越过了回滞带）
+    broken = [
+        pair for pair in before_pairs
+        if distance(coords_after[pair[0]], coords_after[pair[1]]) > _cut(*pair)
+    ]
+    # 新成：原来**明确**不在成键范围内，现在进了截断半径
+    formed = [
+        pair for pair in (after_pairs - before_pairs)
+        if distance(coords_before[pair[0]], coords_before[pair[1]]) > _cut(*pair)
+    ]
+    return ConnectivityChange(broken=sorted(broken), formed=sorted(formed))
 
 
 # ------------------------------------------------------------------ 扫描设置
