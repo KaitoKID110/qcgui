@@ -87,11 +87,22 @@ async function init() {
     $('conn-state').className = 'conn';
   }
 
+  // 取服务状态。失败时**不能装作没事**：任务类型、溶剂等下拉都是从它填的，
+  // 拿不到就全是空的，此时点「运行」必然失败、而且报的是
+  // `'' is not a valid JobType` 这种看不懂的错（审计 F4）。
+  // 所以先重试几次，仍失败就明确禁用提交并告诉用户怎么办 ——
+  // "看起来能用但一定失败"比"明确说不能用"糟糕得多。
   try {
-    const status = await api('/api/status');
-    applyStatus(status);
+    applyStatus(await loadStatusWithRetry());
   } catch (err) {
-    toast('无法获取服务状态: ' + err.message, 'err');
+    $('btn-run').disabled = true;
+    $('btn-run').title = '服务状态获取失败，暂时无法提交';
+    $('chip-engine').className = 'chip off';
+    $('chip-engine').querySelector('b').textContent = '状态获取失败';
+    logLine('✖ 无法获取服务状态：' + err.message
+      + ' —— 已禁用「运行」（任务类型等选项来自服务状态，现在都是空的）。'
+      + '请点右上角「刷新」重试。', 'l-err');
+    toast('无法获取服务状态，已禁用「运行」—— 点「刷新」重试', 'err');
   }
   await loadExamples();
   await loadRecipes();
@@ -100,6 +111,25 @@ async function init() {
   startJobWatch();
   logLine('界面已就绪。', 'l-dim');
   await applyUrlParams();
+}
+
+/**
+ * 取服务状态，失败时退避重试。
+ *
+ * 服务刚起来、或瞬时抖动时，一次失败不该把界面打成半初始化状态
+ * （审计 F4：芯片永远显示"检测中…"、下拉全空、提交必然失败）。
+ */
+async function loadStatusWithRetry(attempts = 3) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await api('/api/status');
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts) await new Promise((r) => setTimeout(r, 400 * i));
+    }
+  }
+  throw lastErr;
 }
 
 // ------------------------------------------------------------------ 配方
@@ -485,6 +515,24 @@ async function runScanDragTest() {
     const cursor = section.querySelector('.scan-cursor');
     lines.push(`cursor_visible=${cursor && !cursor.hidden ? 'PASS' : 'FAIL'}`
       + ` cx=${cursor ? cursor.querySelector('circle').getAttribute('cx') : '—'}`);
+
+    // --- F5：切到「键长响应」模式后，游标圆点必须落在**键长那条曲线**上 ---
+    // 以前无论哪种模式都用 rel_kcal 换算 y，键长模式下圆点会飞到曲线之外
+    // （实测偏离最近数据点 37px）。
+    const bondBtn = section.querySelector('[data-scan-mode="bond"]');
+    if (bondBtn) {
+      bondBtn.click();
+      await new Promise((r) => setTimeout(r, 50));
+      const c2 = section.querySelector('.scan-cursor');
+      const dot = c2 && c2.querySelector('circle');
+      const cy = dot ? parseFloat(dot.getAttribute('cy')) : NaN;
+      // 图的 y 轴绘图区是 viewBox 的 12 ~ 154（见 SCAN_CHART）
+      const inside = Number.isFinite(cy) && cy >= 10 && cy <= 156;
+      lines.push(`F5_bond_cursor_cy=${Number.isFinite(cy) ? cy.toFixed(1) : '—'}`
+        + ` inside_plot=${inside ? 'PASS' : 'FAIL'}`);
+    } else {
+      lines.push('F5_bond_cursor=SKIP(无键长响应)');
+    }
   } catch (err) {
     lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
   }
@@ -854,6 +902,11 @@ function currentSpecPayload() {
     nprocs: parseInt($('input-nprocs').value || '1', 10),
     maxcore_mb: parseInt($('input-maxcore').value || '2000', 10),
     geometry_from_job: geometryFrom,
+    // 电荷/多重度必须**同时发在顶层**：走「几何来源」时后端用的是上游任务
+    // 的结果几何 + 上游那次计算的电荷/多重度，嵌在 molecule 里的那份根本不被采用
+    // —— 只发 molecule 的话，用户改的值会被静默忽略（审计 F3）。
+    charge: charges.charge,
+    multiplicity: charges.multiplicity,
   };
   if (scan) shared.extra_blocks = scan;
 
@@ -1580,9 +1633,13 @@ function showScanFrame(profile, index, section) {
   const x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
   const iw = SCAN_IW;
   const px = (v) => SCAN_CHART.L + (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0)) * iw;
-  const yvals = pts.map((p) => p.rel_kcal);
+  // 游标 y 必须取**当前模式对应的那条曲线**的值。
+  // 以前一律用 pts[index].rel_kcal —— 在「键长响应」模式下图的 y 轴是键长，
+  // 拿能量去换算会让圆点落到所有曲线之外（实测偏离最近数据点 37px，审计 F5）。
+  const series = scanSeries(profile, state.scanMode);
+  const yvals = series.flatMap((s) => s.data.map((d) => d[1]));
   let y0 = Math.min.apply(null, yvals), y1 = Math.max.apply(null, yvals);
-  if (y1 - y0 < 1e-9) { y0 -= 0.5; y1 += 0.5; }
+  if (!yvals.length || y1 - y0 < 1e-9) { y0 -= 0.5; y1 += 0.5; }
   const pad = (y1 - y0) * 0.14;
   y0 -= pad; y1 += pad;
   const py = (v) => SCAN_CHART.T + (SCAN_CHART.H - SCAN_CHART.T - SCAN_CHART.B)
@@ -1591,7 +1648,11 @@ function showScanFrame(profile, index, section) {
   if (svg) {
     const cursor = svg.querySelector('.scan-cursor');
     if (cursor) {
-      const x = px(pts[index].value), y = py(pts[index].rel_kcal);
+      // 取当前模式第一条曲线在这个 x 上的值；找不到就退回能量
+      const first = series[0];
+      const hit = first ? first.data.find((d) => d[0] === pts[index].value) : null;
+      const yValue = hit ? hit[1] : pts[index].rel_kcal;
+      const x = px(pts[index].value), y = py(yValue);
       const line = cursor.querySelector('line');
       const dot = cursor.querySelector('circle');
       line.setAttribute('x1', x.toFixed(1)); line.setAttribute('x2', x.toFixed(1));

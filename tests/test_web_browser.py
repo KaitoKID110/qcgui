@@ -215,6 +215,9 @@ def test_scan_curve_drag_changes_the_displayed_geometry():
                 "matches_profile", "cursor_visible", "coords_changed=PASS"):
         assert key in text, f"缺少 {key} 的结果：{text}"
     assert "FAIL" not in text, text
+    # F5：「键长响应」模式下游标不能画到图外（审计 F5）
+    assert "F5_bond_cursor_cy" in text, text
+    assert "SKIP" in text or "inside_plot=PASS" in text, text
     # 拖动必须真的换了构象
     assert text.count("coords_changed=PASS") >= 2, text
     # 拖到最右侧应当选中最后一个点

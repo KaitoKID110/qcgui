@@ -312,6 +312,37 @@ def _result_payload(result, spec=None) -> dict | None:
     return data
 
 
+def _apply_charge_multiplicity(molecule: Molecule, payload: dict) -> Molecule:
+    """把**顶层的** ``charge`` / ``multiplicity`` 应用到分子上。
+
+    为什么需要单独处理：走「几何来源」时，分子是从上游任务的结果几何重建的，
+    电荷与多重度取的是**上游那次计算**的值。用户在界面里把电荷改成 -1、
+    多重度改成 2，那两个数只写在顶层字段里 —— 以前被**静默忽略**，
+    于是算的是另一个自旋/电荷态，而且不报任何错（审计 F3）。
+    对带电体系（比如 MeO⁻ 进攻）来说这会让整个结果对应错误的状态。
+
+    给了就覆盖，**没给就沿用** —— 不能把上游的 0/1 无脑盖成默认值。
+    """
+    from dataclasses import replace
+
+    updates: dict = {}
+    for key, label in (("charge", "电荷"), ("multiplicity", "多重度")):
+        if key not in payload:
+            continue
+        raw = payload[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"{label}必须是整数，收到 {type(raw).__name__}")
+        value = int(raw)
+        if key == "charge" and not (-20 <= value <= 20):
+            raise ValueError(f"电荷 {value} 超出合理范围（-20 ~ 20）")
+        if key == "multiplicity" and value < 1:
+            raise ValueError(f"多重度必须 ≥ 1，收到 {value}")
+        updates[key] = value
+    if not updates:
+        return molecule
+    return replace(molecule, **updates)
+
+
 def molecule_from_job(manager: JobManager, job_id: str) -> Molecule:
     """取某个已完成任务的结果几何，作为下一个计算的起点。
 
@@ -702,15 +733,18 @@ def create_app(manager: JobManager | None = None) -> Flask:
             except (ValueError, TypeError, KeyError) as exc:
                 return jsonify({"error": f"结构无效: {exc}"}), 400
 
-        if payload.get("charge") is not None:
-            try:
-                molecule = molecule.with_charge_multiplicity(
-                    _int_field(payload, "charge", 0) or 0,
-                    _int_field(payload, "multiplicity", molecule.multiplicity)
-                    or molecule.multiplicity,
-                )
-            except (ValueError, TypeError) as exc:
-                return jsonify({"error": f"电荷/多重度无效: {exc}"}), 400
+        # 顶层的 charge / multiplicity 覆盖分子自带的那份。
+        #
+        # 为什么必须放在这里：走「几何来源」时分子是从上游任务的结果几何重建的
+        # （:func:`molecule_from_job`），电荷与多重度取的是**上游那次计算**的值；
+        # 用户在界面里改了，值只写在顶层字段里。以前这里的条件写成
+        # `if payload.get("charge") is not None`，于是**只改多重度会完全没反应**；
+        # 而前端当时也根本没发顶层字段 —— 两个缺陷叠起来就是"填了 -1/2 却被
+        # 静默忽略"（审计 F3）。对带电体系来说，这会让整个结果对应错误的状态。
+        try:
+            molecule = _apply_charge_multiplicity(molecule, payload)
+        except (ValueError, TypeError) as exc:
+            return jsonify({"error": f"电荷/多重度无效: {exc}"}), 400
 
         recipe = None
         try:
