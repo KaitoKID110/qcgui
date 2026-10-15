@@ -30,6 +30,7 @@ from .model.bondorder import (
     BondOrderResult,
     parse_bond_orders,
 )
+from .model.orbcomp import OrbitalComposition
 
 #: Multiwfn 启动很慢（要读波函数、建积分），给它足够的余量
 DEFAULT_TIMEOUT = 900
@@ -40,6 +41,69 @@ def multiwfn_available() -> tuple[bool, str]:
     if not exe:
         return False, "没有找到 Multiwfn（可设置 QCGUI_MULTIWfn 或放进 PATH）"
     return True, exe
+
+
+def run_orbital_composition(
+    molden_path: str | Path,
+    job_dir: str | Path,
+    partition: str = "mulliken",
+    request: str = "homo",
+    timeout: int = DEFAULT_TIMEOUT,
+) -> "OrbitalComposition":
+    """跑一次轨道成分分析（Multiwfn 菜单 8）。
+
+    ``request`` 是轨道选择：``homo`` / ``lumo`` / ``homo-1`` / ``lumo+1`` / ``all``，
+    对应 Multiwfn 接受的 ``h`` / ``l`` / ``h-1`` / ``l+1`` / ``a``。
+
+    回答"这个轨道主要在哪几个原子上"—— 界面上光有能级图看不出这个。
+    """
+    from .model.orbcomp import ORBITAL_CHOICES, ORBITAL_PARTITIONS, parse_orbital_composition
+
+    molden = Path(molden_path)
+    target = Path(job_dir)
+    label = ORBITAL_PARTITIONS.get(partition, (None, partition, None))[1]
+    result = OrbitalComposition(
+        partition=partition, partition_label=label,
+        request=request, request_label=ORBITAL_CHOICES.get(request, (None, request))[1],
+    )
+
+    exe, _ = resolve_tool("multiwfn")
+    if not exe:
+        result.problems.append("没有找到 Multiwfn —— 轨道成分分析需要它")
+        return result
+    if not molden.is_file():
+        result.problems.append(f"找不到波函数文件：{molden.name}（先跑 orca_2mkl -molden）")
+        return result
+
+    sub = ORBITAL_PARTITIONS.get(partition, ("1", "", ""))[0]
+    orbital = ORBITAL_CHOICES.get(request, ("h", ""))[0]
+    # 菜单 8 -> 分区方式 -> 轨道 -> q。最后一定要给 q，否则它一直等输入把任务挂死。
+    script = f"8\n{sub}\n{orbital}\nq\n"
+    try:
+        proc = subprocess.run(
+            [exe, str(molden)], input=script, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout, cwd=str(target),
+        )
+    except subprocess.TimeoutExpired:
+        result.problems.append(f"Multiwfn 超过 {timeout} 秒还没结束，已放弃")
+        return result
+    except OSError as exc:
+        result.problems.append(f"启动 Multiwfn 失败：{exc}")
+        return result
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    raw_name = ORBITAL_PARTITIONS.get(partition, (None, None, f"orbcomp_{partition}.txt"))[2]
+    try:
+        (target / raw_name).write_text(output, encoding="utf-8")
+    except OSError as exc:
+        result.problems.append(f"原始输出没能落盘（{exc}），下面是从内存里解析的")
+
+    parsed = parse_orbital_composition(output, partition=partition, request=request)
+    # 头部信息（轨道号/能量/占据）以解析出来的为准；解析失败时保留请求信息
+    parsed.problems = result.problems + parsed.problems
+    parsed.request_label = result.request_label
+    parsed.partition_label = result.partition_label
+    return parsed
 
 
 def _menu_script(kind: str) -> str:

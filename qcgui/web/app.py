@@ -941,6 +941,55 @@ def create_app(manager: JobManager | None = None) -> Flask:
             }), 400
         return jsonify(result.to_dict())
 
+    @app.get("/api/jobs/<job_id>/orbital-composition")
+    def api_job_orbital_composition(job_id: str):
+        """轨道成分分析（Multiwfn 菜单 8）：**这个轨道主要在哪几个原子上**。
+
+        光有轨道能级图看不出这个，而它对判断反应位点常常比能级本身更有用。
+
+        ``partition`` = mulliken / stout / scpa，``orbital`` = homo / lumo /
+        homo-1 / lumo+1 / all。同样按需调用，惰性导入引擎侧。
+        """
+        from ..model.orbcomp import ORBITAL_CHOICES, ORBITAL_PARTITIONS
+
+        record = mgr.store.get(job_id)
+        if record is None:
+            return jsonify({"error": "任务不存在"}), 404
+
+        partition = request.args.get("partition", "mulliken")
+        orbital = request.args.get("orbital", "homo")
+        if partition not in ORBITAL_PARTITIONS:
+            return jsonify({"error": f"不支持的布居方式 {partition!r}",
+                            "supported": sorted(ORBITAL_PARTITIONS)}), 400
+        if orbital not in ORBITAL_CHOICES:
+            return jsonify({"error": f"不支持的轨道选择 {orbital!r}",
+                            "supported": sorted(ORBITAL_CHOICES)}), 400
+
+        job_dir = mgr.store.job_dir(job_id)
+        molden = sorted(job_dir.glob("*.molden.input"))
+        if not molden:
+            gbw = sorted(job_dir.glob("*.gbw"))
+            if not gbw:
+                return jsonify({"error": "这个任务没有波函数文件（.gbw）—— "
+                                         "轨道成分分析需要它"}), 400
+            from .. import orcatools
+            run = orcatools.make_molden(job_dir, gbw[0].name)
+            if not run.ok:
+                return jsonify({"error": f"生成 molden 失败：{run.message}"}), 400
+            molden = sorted(job_dir.glob("*.molden.input"))
+            if not molden:
+                return jsonify({"error": "orca_2mkl 没有产出 molden 文件"}), 400
+
+        from ..multiwfn import run_orbital_composition
+        result = run_orbital_composition(molden[0], job_dir,
+                                        partition=partition, request=orbital)
+        if not result.ok:
+            return jsonify({
+                "error": "；".join(result.problems) or "Multiwfn 没有给出轨道成分",
+                "supported": sorted(ORBITAL_PARTITIONS),
+            }), 400
+        return jsonify(result.to_dict())
+
     @app.get("/api/jobs/<job_id>/file/<role>")
     def api_job_file(job_id: str, role: str):
         record = mgr.store.get(job_id)
