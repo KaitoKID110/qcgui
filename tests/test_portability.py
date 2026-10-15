@@ -221,8 +221,15 @@ def test_all_source_files_are_tracked_by_git():
         print("    跳过：不是 git 工作区")
         return
 
-    proc = subprocess.run([git, "ls-files"], cwd=str(repo), capture_output=True,
-                          text=True, encoding="utf-8", errors="replace", timeout=120)
+    # `-c core.quotepath=false` 不能省：git 默认把非 ASCII 路径**转义**成
+    # `\346\212\200...`，于是中文文件名（使用手册.md 等）会被判成"没被跟踪"。
+    # 本机恰好设过 quotepath=false 所以一直是绿的 —— 而 CI 是全新克隆，
+    # 没有这个配置，**只有 CI 红**。测试不该依赖仓库的本地配置。
+    proc = subprocess.run(
+        [git, "-c", "core.quotepath=false", "ls-files"],
+        cwd=str(repo), capture_output=True,
+        text=True, encoding="utf-8", errors="replace", timeout=120,
+    )
     if proc.returncode != 0:
         print("    跳过：git ls-files 失败")
         return
