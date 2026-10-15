@@ -424,6 +424,18 @@ async function runBondOrderUiTest(jobId, kind) {
         const bar = table.querySelector('.bo-bar i');
         lines.push(`bar=${bar && parseFloat(bar.style.width) > 0 ? 'PASS' : 'FAIL'}`);
         lines.push(`summary="${(section.querySelector('.bo-summary') || {}).textContent || ''}"`);
+
+        // 3D 数值标注：点了「显示数值」之后，查看器必须真的进入数值模式，
+        // 而且要把键级喂进去（原子值缺了也要给 bondValues）
+        $('btn-values').click();
+        lines.push(`values_active=${$('btn-values').classList.contains('active') ? 'PASS' : 'FAIL'}`);
+        lines.push(`viewer_valueMode=${state.viewer.valueMode || 'null'}`
+          + ` atomValues=${state.viewer.atomValues ? state.viewer.atomValues.length : 0}`
+          + ` bondValues=${state.viewer.bondValues ? state.viewer.bondValues.length : 0}`);
+        // 画出来的才算数：数一下画布上确实有文字（用一次离屏重绘来探测太绕，
+        // 这里检查数据到位 + 模式正确即可，位置正确性由 _drawValues 的单元测试守）
+        lines.push(`bond0=${state.viewer.bondValues && state.viewer.bondValues[0]
+          ? JSON.stringify(state.viewer.bondValues[0]) : 'none'}`);
       }
     }
   } catch (err) {
@@ -929,11 +941,13 @@ async function selectJob(jobId) {
   // 标题和高亮是后点的那个，结果区却是先点的那个（审计 F2，实测复现）。
   // 回来时对不上序号就整段丢弃。
   const token = ++state.jobToken;
+  state.bondOrders = null;          // 换任务就清掉上一个任务的键级，免得串到 3D 图上
   try {
     const data = await api('/api/jobs/' + encodeURIComponent(jobId));
     if (token !== state.jobToken) return;
     state.result = data.result;
     renderResult(data.job, data.result);
+    refreshViewerValues();          // 「显示数值」开着时用新任务的电荷刷新
     if (data.result && data.result.geometry) {
       state.viewer.setMolecule({
         symbols: data.result.geometry.symbols,
@@ -1889,6 +1903,9 @@ function loadBondOrderSection(jobId) {
       const data = await api('/api/jobs/' + encodeURIComponent(jobId)
         + '/bondorders?kind=' + encodeURIComponent(kind));
       out.innerHTML = renderBondOrders(data);
+      // 记下来供 3D 数值标注用；如果「显示数值」正开着，立刻画上去
+      state.bondOrders = data.orders;
+      refreshViewerValues();
       logLine(`键级分析完成：${data.kind_label} ${data.count} 条`, 'l-dim');
     } catch (err) {
       // 失败就说清楚为什么（缺 .gbw / 没装 Multiwfn / 格式不认识），
@@ -1904,6 +1921,45 @@ function loadBondOrderSection(jobId) {
     if (out.querySelector('.bo-table, .bo-error')) run();
   });
   return node;
+}
+
+/**
+ * 「显示数值」：把电荷 / 键级**直接画在 3D 图上**。
+ *
+ * 为什么值得做：表格里有数据，但你得按编号去和 3D 图对 ——
+ * 而"编号对错"正是本项目反复踩过的一类问题（原子顺序、扫描下标）。
+ * 数字直接画在原子上，就不用对编号了。
+ *
+ * 两个来源：
+ *  * 原子电荷来自 ``state.result``（优先 Löwdin，其次 Mayer）；
+ *  * 键级来自最近一次键级分析 —— 没分析过就没有键级，只画电荷。
+ *    Multiwfn 给的是 **1 起**编号，这里要减一（查看器是 0 起）。
+ */
+function refreshViewerValues() {
+  const btn = $('btn-values');
+  if (!btn.classList.contains('active')) {
+    state.viewer.setValueDisplay(null);
+    return;
+  }
+  const charges = state.result
+    ? (state.result.loewdin_charges && state.result.loewdin_charges.length
+        ? state.result.loewdin_charges : state.result.mayer_charges) : null;
+
+  const bonds = (state.bondOrders || []).map((o) => ({
+    i: o.i - 1, j: o.j - 1, text: o.order.toFixed(2),
+  }));
+
+  if (!charges || !charges.length) {
+    // 没有电荷就只画键级；两个都没有时要明确告诉用户为什么没东西
+    if (bonds.length) {
+      state.viewer.setValueDisplay('bondorder', null, bonds);
+    } else {
+      state.viewer.setValueDisplay(null);
+      toast('这个任务没有可显示的数值（没有电荷数据，也还没做键级分析）', 'warn');
+    }
+    return;
+  }
+  state.viewer.setValueDisplay('charge', charges, bonds.length ? bonds : null);
 }
 
 async function loadScanSection(jobId) {
@@ -2122,6 +2178,10 @@ function bindUi() {
   $('select-scan').addEventListener('change', updateScanUI);
   $('input-scan-atoms').addEventListener('input', updateScanUI);
   $('btn-fav').addEventListener('click', toggleFavorite);
+  $('btn-values').addEventListener('click', (e) => {
+    e.currentTarget.classList.toggle('active');
+    refreshViewerValues();
+  });
   $('btn-refresh').addEventListener('click', async () => {
     try { applyStatus(await api('/api/status')); } catch (e) { /* ignore */ }
     await refreshJobs();

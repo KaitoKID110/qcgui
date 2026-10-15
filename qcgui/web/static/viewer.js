@@ -120,6 +120,11 @@
       this.colorMode = 'element'; // element | charge
       this.showLabels = false;
       this.showAxes = false;
+      // 3D 图上的**数值**标注（电荷 / 键级）。和元素标签是两回事：
+      // 标签告诉你"这是哪个原子"，数值告诉你"它带多少电荷 / 这根键级多少"。
+      this.valueMode = null;      // null | 'charge' | 'bondorder'
+      this.atomValues = null;
+      this.bondValues = null;
 
       this.rotX = -0.35;
       this.rotY = 0.6;
@@ -447,6 +452,8 @@
           // 带上原子编号：填扫描坐标 / 看轨道成分都要用到它，
           // 光有元素符号根本分不清哪个碳是几号（编号从 0 起，与 ORCA 一致）
           label: this.symbols[i] + i,
+          // 数值标注要用它把电荷/键级对到原子上（0 起）
+          index: i,
         });
       }
       const bondW = this.style === 'wireframe' ? 0.045
@@ -477,7 +484,10 @@
         else this._drawAtom(ctx, p);
       }
 
-      if (this.showLabels) this._drawLabels(ctx, prims);
+      // 数值模式也要走这一条：_drawLabels 内部会按 valueMode 分支。
+      // 以前只判 showLabels，于是「显示数值」开着、数据也喂进去了，
+      // 画面上却一个数字都没有 —— **数据对 ≠ 用户看得见**（截图才发现）。
+      if (this.showLabels || this.valueMode) this._drawLabels(ctx, prims);
       if (this.showAxes) this._drawAxes(ctx, pr);
     }
 
@@ -509,7 +519,27 @@
       ctx.stroke();
     }
 
+    /**
+     * 在 3D 图里**直接显示数值**（电荷 / 键级）。
+     *
+     * 为什么需要：光看球和棍看不出"这个原子带多少电荷""这根键的键级是多少"，
+     * 得回表格里按编号去找 —— 而**编号和 3D 图对不上是很容易出错的**
+     * （本项目已经因为编号/顺序问题踩过坑）。直接把数字画在图上就不用对编号了。
+     *
+     * ``mode``：``'charge'`` 画原子电荷，``'bondorder'`` 画键中点的键级。
+     * ``atomValues`` 按原子序（**0 起**，与 ORCA 输入一致）给出；
+     * ``bondValues`` 是 ``[{ i, j, text }]``，其中 i/j 也是 **0 起**
+     * （Multiwfn 给的是 1 起，调用方负责减一）。
+     */
+    setValueDisplay(mode, atomValues, bondValues) {
+      this.valueMode = mode || null;
+      this.atomValues = atomValues || null;
+      this.bondValues = bondValues || null;
+      this._schedule();
+    }
+
     _drawLabels(ctx, prims) {
+      if (this.valueMode) return this._drawValues(ctx, prims);
       // 白字 + 深色描边。原来用"黑字打底、白字错开半像素"的假阴影，
       // 压在跟文字同色系的球面上根本读不出来（实测就是这么糊的）。
       const atoms = prims.filter((p) => p.kind === 'atom' && p.radius >= 5);
@@ -533,8 +563,53 @@
       }
     }
 
-    _drawAxes(ctx, pr) {
-      const origin = this._toScreen(this._rotate([pr.ox, pr.oy, pr.oz], pr), pr);
+    /**
+     * 真正把数值画出来。
+     *
+     * 两个来源画在不同位置，颜色也分开，免得混起来看错：
+     * 原子电荷画在球心（白），键级画在键中点（浅黄）。
+     */
+    _drawValues(ctx, prims) {
+      const atoms = prims.filter((p) => p.kind === 'atom');
+      if (!atoms.length) return;
+      // 数值比元素符号长，字号要比标签小一档，否则原子多时会糊成一片
+      const size = atoms.length > 40 ? 9 : atoms.length > 20 ? 10 : 11;
+      ctx.font = `600 ${size}px ui-monospace, Consolas, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.lineJoin = 'round';
+      ctx.miterLimit = 2;
+      const outline = Math.max(2.5, size * 0.36);
+      const put = (text, x, y, color) => {
+        ctx.lineWidth = outline;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.92)';
+        ctx.strokeText(text, x, y);
+        ctx.fillStyle = color;
+        ctx.fillText(text, x, y);
+      };
+
+      if (this.bondValues && this.bondValues.length) {
+        const at = new Map(atoms.map((p) => [p.index, p.screen]));
+        for (const b of this.bondValues) {
+          const a = at.get(b.i), c = at.get(b.j);
+          if (!a || !c) continue;
+          put(b.text, (a[0] + c[0]) / 2, (a[1] + c[1]) / 2, '#ffe08a');
+        }
+      }
+
+      if (this.atomValues && this.atomValues.length) {
+        for (const p of atoms) {
+          const value = this.atomValues[p.index];
+          if (value === null || value === undefined) continue;
+          const text = typeof value === 'number'
+            ? (Math.abs(value) < 0.0005 ? '0' : value.toFixed(3))
+            : String(value);
+          put(text, p.screen[0], p.screen[1], '#ffffff');
+        }
+      }
+    }
+
+    _drawAxes(ctx, pr) {      const origin = this._toScreen(this._rotate([pr.ox, pr.oy, pr.oz], pr), pr);
       const len = this.radius * 1.35;
       const axes = [
         [[len, 0, 0], '#ff6b6b', 'x'],
