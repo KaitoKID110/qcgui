@@ -889,6 +889,58 @@ def create_app(manager: JobManager | None = None) -> Flask:
             return jsonify({"error": "该任务没有扫描数据（不是势能面扫描）"}), 404
         return jsonify(profile)
 
+    @app.get("/api/jobs/<job_id>/bondorders")
+    def api_job_bond_orders(job_id: str):
+        """键级分析（Multiwfn）—— 补上"化学解释"这块能力。
+
+        这些分析（Mayer/Wiberg/FBO/LBO 键级、轨道成分、模糊空间）
+        **都不需要买 NBO**，用已经装好的 Multiwfn 就能做。
+
+        流程：``.gbw`` --(orca_2mkl)--> ``.molden.input`` --(Multiwfn)--> 键级表。
+        按需调用（Multiwfn 要建积分矩阵），结果不塞进 ``result.json``。
+
+        惰性导入引擎/外部工具：界面进程不导入它们（架构第 1 条）。
+        """
+        from ..model.bondorder import BOND_ORDER_KINDS
+
+        record = mgr.store.get(job_id)
+        if record is None:
+            return jsonify({"error": "任务不存在"}), 404
+
+        kind = request.args.get("kind", "mayer")
+        if kind not in BOND_ORDER_KINDS:
+            return jsonify({
+                "error": f"不支持的键级类型 {kind!r}",
+                "supported": sorted(BOND_ORDER_KINDS),
+            }), 400
+
+        job_dir = mgr.store.job_dir(job_id)
+        molden = sorted(job_dir.glob("*.molden.input"))
+        if not molden:
+            # 还没有 molden：用 ORCA 自带的 orca_2mkl 现转一个
+            gbw = sorted(job_dir.glob("*.gbw"))
+            if not gbw:
+                return jsonify({
+                    "error": "这个任务没有波函数文件（.gbw）—— "
+                             "键级分析需要它，请用带波函数输出的方法重算"}),
+            from .. import orcatools
+            run = orcatools.make_molden(job_dir, gbw[0].name)
+            if not run.ok:
+                return jsonify({"error": f"生成 molden 失败：{run.message}"}), 400
+            molden = sorted(job_dir.glob("*.molden.input"))
+            if not molden:
+                return jsonify({"error": "orca_2mkl 没有产出 molden 文件"}), 400
+
+        from ..multiwfn import run_bond_order_analysis
+        result = run_bond_order_analysis(molden[0], job_dir, kind=kind)
+        if not result.ok:
+            return jsonify({
+                "error": "；".join(result.problems) or "Multiwfn 没有给出键级数据",
+                "kind": kind,
+                "supported": sorted(BOND_ORDER_KINDS),
+            }), 400
+        return jsonify(result.to_dict())
+
     @app.get("/api/jobs/<job_id>/file/<role>")
     def api_job_file(job_id: str, role: str):
         record = mgr.store.get(job_id)
