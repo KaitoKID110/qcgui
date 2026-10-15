@@ -79,10 +79,17 @@ jobs:
             Write-Host $out
             if ($LASTEXITCODE -ne 0) {
               $failed += $name
-              $why = ($out -split "`r?`n" |
-                Where-Object { $_ -match '\[ FAIL \]|Traceback|Error:|ModuleNotFound' } |
-                Select-Object -First 3) -join ' ⏐ '
-              if (-not $why) { $why = ($out -split "`r?`n" | Select-Object -Last 3) -join ' ⏐ ' }
+              # 优先抓自家 runner 打印的 `失败: <用例名> -> <原因>` 那行 ——
+              # 它最准。退而求其次才去看 [ FAIL ] / Traceback。
+              # （早先的过滤器会先匹配到被测代码自己打到 stderr 的
+              #  "SMILES Parse Error" 之类，把真正的失败行挤掉了。）
+              $lines = $out -split "`r?`n"
+              $why = ($lines | Where-Object { $_ -match '^\s*失败:\s' } | Select-Object -First 4) -join ' ⏐ '
+              if (-not $why) {
+                $why = ($lines | Where-Object { $_ -match '\[ FAIL \]|Traceback|ModuleNotFoundError' } |
+                  Select-Object -First 4) -join ' ⏐ '
+              }
+              if (-not $why) { $why = ($lines | Select-Object -Last 5) -join ' ⏐ ' }
               Write-Host "::error file=tests/$name::失败：$why"
             }
           }

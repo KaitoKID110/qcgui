@@ -98,14 +98,28 @@ def test_mo_cube_name_matches_orca_plot_convention():
 
 
 def test_missing_tool_and_gbw_are_reported_not_raised():
+    """缺文件 / 缺工具都要返回失败对象并给出消息，而不是抛异常。
+
+    .. note::
+       两种情形都必须能过。**CI 上没有 orca_plot**，此时代码正确地先报
+       "工具缺失"而不是"文件不存在" —— 以前这里写死了文件那条消息，
+       于是只有 CI 红（本机装了 ORCA，永远走文件那条分支）。
+    """
     run = orcatools.export_mo_cube(Path(tempfile.gettempdir()), "不存在.gbw", 0)
-    assert run.ok is False
-    assert "找不到波函数文件" in run.message
+    assert run.ok is False, f"应当返回失败对象，实际 ok={run.ok}"
+    assert run.message, "失败时必须给出说明"
 
     run2 = orcatools.make_molden(Path(tempfile.gettempdir()), "不存在.gbw")
-    assert run2.ok is False
-    assert run2.message
-    print("    缺文件时返回失败对象而不是抛异常")
+    assert run2.ok is False, f"应当返回失败对象，实际 ok={run2.ok}"
+    assert run2.message, "失败时必须给出说明"
+
+    # 有工具时走"文件不存在"分支；没有工具时走"工具缺失"分支 —— 两者都对
+    if orcatools.find_tool("orca_plot"):
+        assert "找不到波函数文件" in run.message, run.message
+    else:
+        assert ("orca_plot" in run.message or "找不到" in run.message
+                or "未找到" in run.message), run.message
+    print(f"    缺文件时返回失败对象：{run.message[:60]}")
 
 
 # ------------------------------------------------------------------ 引擎解析

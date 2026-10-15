@@ -78,11 +78,21 @@ def test_resolve_falls_back_when_configured_path_is_wrong():
 
 
 def test_missing_tool_gives_actionable_message():
-    """工具缺失时，报错要说明去哪里改，而不是抛异常。"""
+    """工具缺失时，报错要说明去哪里改，而不是抛异常。
+
+    .. note::
+       本机装了 Avogadro 时，这里其实测的是"**文件**不存在"；
+       CI 上没装，才真的走到"**工具**缺失"分支。两种都必须是失败对象 +
+       可操作的消息，所以断言放宽到"说了问题在哪"，并且**带上消息** ——
+       否则 CI 只显示一句空的 AssertionError，没法定位。
+    """
     result = external.view_with_avogadro("Z:/nope.xyz")
-    assert result.ok is False
-    assert result.tool == "avogadro"
-    assert "找不到" in result.message or "不存在" in result.message
+    assert result.ok is False, f"应当失败，实际 ok={result.ok}"
+    assert result.tool == "avogadro", result.tool
+    assert result.message, "失败时必须给出说明"
+    low = result.message.lower()
+    assert ("找不到" in result.message or "不存在" in result.message
+            or "avogadro" in low), f"消息没有指出问题在哪：{result.message!r}"
     print(f"    {result.message}")
 
 
@@ -105,9 +115,18 @@ def test_multiwfn_batch_actually_loads_file():
 
 
 def test_multiwfn_reports_missing_file():
+    """文件不存在时必须给出可操作的说明。
+
+    .. note::
+       本机装了 Multiwfn 时走"文件不存在"分支；**CI 上没装 Multiwfn**，
+       代码正确地先报"工具缺失"。两种都是合理的失败，断言必须都能过 ——
+       以前写死了"不存在"，于是只有 CI 红。
+    """
     result = external.run_multiwfn(Path(tempfile.gettempdir()) / "not-here.xyz")
-    assert result.ok is False
-    assert "不存在" in result.message
+    assert result.ok is False, f"应当失败，实际 ok={result.ok}"
+    assert result.message, "失败时必须给出说明"
+    assert ("不存在" in result.message or "找不到" in result.message
+            or "Multiwfn" in result.message), f"消息没有指出问题在哪：{result.message!r}"
     print(f"    {result.message}")
 
 
