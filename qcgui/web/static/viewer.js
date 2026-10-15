@@ -232,10 +232,17 @@
       if (!this.frames.length) return;
       this.playing = true;
       const step = 1 / Math.max(1, fps || 12);
+      const last = this.frames.length - 1;
       const tick = () => {
         if (!this.playing) return;
         let next = this.framePos + step;
-        if (next >= this.frames.length - 1) next = 0;
+        if (next > last) {
+          // 到末尾时**先把最后一帧显示出来**，下一拍才回起点循环。
+          // 以前是 `if (next >= last) next = 0` —— 直接跳回起点，
+          // 于是**最后一帧永远看不到**（审计）。
+          // 对 IRC 来说最后一帧就是产物结构，恰恰是最该看的一帧。
+          next = this.framePos < last ? last : 0;
+        }
         this.setFrame(next);
         this._playTimer = setTimeout(tick, 1000 / Math.max(1, fps || 12));
       };

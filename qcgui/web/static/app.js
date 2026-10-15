@@ -114,6 +114,18 @@ async function init() {
 }
 
 /**
+ * 设置状态芯片的 on/off 类时**必须先把另一个清掉**。
+ *
+ * 以前是 `chip.classList.add('off')` 这种写法 —— 只加不减，两个类会同时存在。
+ * 后果：引擎从"不可用"变成"可用"后，`off` 还挂在上面，**红点永远消不掉**，
+ * 用户以为服务出问题了（审计）。所以统一走这个函数。
+ */
+function setChipState(chip, on) {
+  chip.classList.remove('on', 'off');
+  chip.classList.add(on ? 'on' : 'off');
+}
+
+/**
  * 取服务状态，失败时退避重试。
  *
  * 服务刚起来、或瞬时抖动时，一次失败不该把界面打成半初始化状态
@@ -251,7 +263,12 @@ function updateScanUI() {
   $('scan-hint').innerHTML = html;
 }
 
-async function toggleFavorite() {  if (!state.recipe) return;
+async function toggleFavorite() {
+  // 没选配方时以前是**静默 return** —— 按钮看着能点，点了什么也不发生（审计）。
+  if (!state.recipe) {
+    toast('请先在上方选一个配方，★ 用来收藏它', 'warn');
+    return;
+  }
   const id = state.recipe.id;
   try {
     const res = await api('/api/recipes/' + encodeURIComponent(id) + '/favorite', {
@@ -261,7 +278,12 @@ async function toggleFavorite() {  if (!state.recipe) return;
     await loadRecipes();
     $('select-recipe').value = id;
     applyRecipe();
-    toast(res.favorite ? '已收藏' : '已取消收藏', 'ok');
+    // 按钮的视觉状态要跟着变，否则看不出到底收藏上没有
+    const fav = !!res.favorite;
+    const btn = $('btn-fav');
+    btn.textContent = fav ? '★ 已收藏' : '☆ 收藏';
+    btn.classList.toggle('active', fav);
+    toast(fav ? '已收藏' : '已取消收藏', 'ok');
   } catch (err) {
     toast('收藏失败: ' + err.message, 'err');
   }
@@ -640,12 +662,12 @@ function applyStatus(status) {
   const orca = engines.find((e) => e.name === 'orca') || engines[0];
   const chipEngine = $('chip-engine');
   if (orca) {
-    chipEngine.classList.add(orca.available ? 'on' : 'off');
+    setChipState(chipEngine, !!orca.available);
     chipEngine.querySelector('b').textContent = orca.display_name + (orca.available ? '' : '（不可用）');
     chipEngine.title = orca.detail || '';
     if (!orca.available) toast('引擎不可用：' + orca.detail, 'err');
   } else {
-    chipEngine.classList.add('off');
+    setChipState(chipEngine, false);
     chipEngine.querySelector('b').textContent = '未检测到';
   }
 
@@ -653,7 +675,7 @@ function applyStatus(status) {
   const names = { multiwfn: 'Multiwfn', avogadro: 'Avogadro2', obabel: 'obabel' };
   const available = Object.keys(tools).filter((k) => tools[k].available);
   const chipTools = $('chip-tools');
-  chipTools.classList.add(available.length ? 'on' : 'off');
+  setChipState(chipTools, available.length > 0);
   chipTools.querySelector('b').textContent = available.length + ' / ' + Object.keys(tools).length + ' 可用';
   chipTools.title = Object.keys(tools)
     .map((k) => `${names[k] || k}: ${tools[k].available ? tools[k].path : '未找到'}`).join('\n');
@@ -881,7 +903,21 @@ async function selectJob(jobId) {
       $('trajectory').hidden = true;
     }
   } catch (err) {
+    // 请求失败时**必须把面板清成明确的错误态**：以前只弹一句 toast，
+    // 结果区仍旧显示**上一个任务**的内容，而标题已经是新任务了 ——
+    // 用户会把别人的数据当成这次的（审计）。这和 F2 是同一类问题：
+    // 面板显示的不是你以为的那次任务。
+    if (token !== state.jobToken) return;
+    state.result = null;
+    $('result-body').innerHTML =
+      '<div class="res-verdict unusable">'
+      + '<div class="res-verdict-head"><span class="res-verdict-icon">✕</span>'
+      + '<b>读不出这个任务的结果</b></div>'
+      + `<div class="res-verdict-why">${esc(err.message)}</div>`
+      + '<ul class="res-verdict-list"><li>面板里原本显示的是<b>上一个</b>任务的内容，'
+      + '已经清掉了 —— 免得把它当成这次的。</li></ul></div>';
     toast('读取结果失败: ' + err.message, 'err');
+    logLine('✖ 读取结果失败：' + err.message, 'l-err');
   }
 }
 
