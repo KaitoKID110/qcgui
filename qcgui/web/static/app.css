@@ -504,3 +504,56 @@ table.data tr.min td { color: #9ecbff; }
   .topbar { flex-wrap: wrap; }
   .topbar-status { order: 3; width: 100%; margin-left: 0; }
 }
+
+/* ------------------------------------------------------------ 键级分析 */
+/* Multiwfn 的键级表。用相对最强键的横条，扫一眼就能看出哪根键弱。 */
+
+.bo-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 4px;
+  flex-wrap: wrap;
+}
+.bo-controls select { max-width: 168px; }
+.bo-controls .muted { font-size: 11px; }
+.bo-summary { font-size: 11.5px; margin: 4px 0 6px; color: var(--text-dim); }
+.bo-summary b { color: var(--text); }
+
+.bo-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.bo-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--line);
+  padding: 3px 6px;
+}
+.bo-table td { padding: 2px 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); }
+.bo-label { white-space: nowrap; }
+.bo-num { text-align: right; width: 58px; }
+.bo-bar { width: 44%; }
+.bo-bar i {
+  display: block;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--accent);
+  opacity: 0.75;
+}
+
+.bo-loading, .bo-note {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 6px 0;
+}
+.bo-error {
+  font-size: 11.5px;
+  color: var(--danger, #f87171);
+  padding: 6px 0;
+  line-height: 1.5;
+}
+

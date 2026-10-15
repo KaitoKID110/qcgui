@@ -373,6 +373,63 @@ async function applyUrlParams() {
   if (params.get('fixtest')) {
     await runInteractionFixTest(params.get('fixtest'));
   }
+  if (params.get('botest')) {
+    await runBondOrderUiTest(params.get('botest'), params.get('bokind') || 'mayer');
+  }
+}
+
+/**
+ * 真浏览器验证键级界面（P2 的 Multiwfn 集成）。
+ *
+ * 后端早就有测试了，但**界面是新写的、必须真点一遍** ——
+ * 本项目已经因为"DOM 里有但用户看不见"吃过一次亏（结论横幅被扫描区挤下去）。
+ */
+async function runBondOrderUiTest(jobId, kind) {
+  const out = document.createElement('pre');
+  out.id = 'botest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  try {
+    const section = document.getElementById('bondorder-section');
+    lines.push(`section=${section ? 'PASS' : 'FAIL'}`);
+    if (section) {
+      // 位置：必须排在结论横幅（和扫描区）**之后**，但仍在面板可见区内
+      const body = $('result-body');
+      const kids = Array.from(body.children).map((n) => n.id || n.className);
+      lines.push(`order=${kids.join('>')}`);
+      const rect = section.getBoundingClientRect();
+      lines.push(`visible=${rect.width > 40 && rect.height > 10 ? 'PASS' : 'FAIL'}`
+        + ` w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+
+      $('bo-kind').value = kind;
+      $('bo-run').click();
+      const table = await new Promise((resolve) => {
+        const deadline = setTimeout(() => resolve(null), 180000);
+        const poll = setInterval(() => {
+          const t = section.querySelector('.bo-table');
+          const e = section.querySelector('.bo-error');
+          if (t || e) { clearInterval(poll); clearTimeout(deadline); resolve(t || e); }
+        }, 150);
+      });
+      if (!table) {
+        lines.push('table=TIMEOUT');
+      } else if (table.classList.contains('bo-error')) {
+        lines.push(`table=ERROR ${table.textContent.slice(0, 120)}`);
+      } else {
+        const rows = table.querySelectorAll('tbody tr');
+        const first = rows.length ? rows[0].textContent.replace(/\s+/g, ' ').trim() : '';
+        lines.push(`table=PASS rows=${rows.length} first="${first}"`);
+        const bar = table.querySelector('.bo-bar i');
+        lines.push(`bar=${bar && parseFloat(bar.style.width) > 0 ? 'PASS' : 'FAIL'}`);
+        lines.push(`summary="${(section.querySelector('.bo-summary') || {}).textContent || ''}"`);
+      }
+    }
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__BOTEST__' + lines.join(' | ') + '__END__';
 }
 
 /**
@@ -1223,6 +1280,7 @@ function renderResult(job, result) {
   body.innerHTML = parts.join('');
   bindOrbitalButtons();
   loadScanSection(job.job_id);      // 扫描任务才有数据，其它任务静默跳过
+  loadBondOrderSection(job.job_id); // 键级要手动点「开始分析」才跑
 }
 
 function renderBatch(payload) {
@@ -1752,6 +1810,100 @@ function attachScanDrag(section, profile) {
   svg.addEventListener('pointerup', stop);
   svg.addEventListener('pointercancel', stop);
   svg.addEventListener('pointerleave', stop);
+}
+
+/**
+ * 键级分析（Multiwfn）—— 补上"化学解释"这块能力。
+ *
+ * Mayer / Wiberg / Mulliken / FBO / LBO 键级**都不需要买 NBO**，
+ * 用已装好的 Multiwfn 就能做。键级能直接看出成键强弱、离域程度、
+ * 哪些键在反应中变弱。
+ *
+ * 刻意**不自动跑**：Multiwfn 要读波函数、建积分，大分子上并不便宜，
+ * 而多数时候用户并不需要它。给一个明确的按钮，点了才算。
+ */
+function bondOrderSection() {
+  const kinds = [['mayer', 'Mayer 键级'], ['wiberg', 'Wiberg 键级（Löwdin）'],
+                 ['mulliken', 'Mulliken 键级'], ['fuzzy', '模糊键级 FBO'],
+                 ['lbo', 'Laplacian 键级 LBO']];
+  return `<div class="res-section" id="bondorder-section">
+    <div class="res-section-head">键级分析 <span class="muted">Multiwfn</span></div>
+    <div class="bo-controls">
+      <select id="bo-kind">${kinds.map(([v, t]) =>
+        `<option value="${v}">${esc(t)}</option>`).join('')}</select>
+      <button class="btn small" id="bo-run">开始分析</button>
+      <span class="muted" id="bo-hint">键级看的是成键强弱与离域，不需要 NBO</span>
+    </div>
+    <div id="bo-body"></div>
+  </div>`;
+}
+
+/** 把键级表画出来。空结果不该走到这里（失败会先渲染成错误态）。 */
+function renderBondOrders(data) {
+  const top = data.orders[0];
+  const rows = data.orders.map((o) => {
+    // 相对最强键的比例条，扫一眼就能看出哪根键弱
+    const pct = Math.max(2, Math.round((o.order / Math.max(0.001, top.order)) * 100));
+    return `<tr><td class="bo-label">${esc(o.label)}</td>`
+      + `<td class="bo-num">${o.order.toFixed(3)}</td>`
+      + `<td class="bo-bar"><i style="width:${pct}%"></i></td></tr>`;
+  }).join('');
+  const warn = data.problems && data.problems.length
+    ? `<div class="bo-note">${data.problems.map((p) => esc(p)).join('；')}</div>` : '';
+  return `<div class="bo-summary">共 <b>${data.count}</b> 条（阈值 ${data.threshold ?? '—'}）`
+    + `，最强 <b>${esc(top.label)}</b> = ${top.order.toFixed(3)}</div>`
+    + `<table class="bo-table"><thead><tr><th>键</th><th>键级</th><th>相对强弱</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>${warn}`;
+}
+
+/**
+ * 把键级区挂到结果面板上。
+ *
+ * 插入顺序必须是 **结论横幅 → 扫描曲线 → 键级**：
+ * 结论横幅永远最上面（那是"这个结果能不能用"），扫描曲线是扫描任务的头号结果。
+ * 这两个顺序都踩过坑（结论横幅被扫描区挤到滚动区下面），所以这里显式避让。
+ */
+function loadBondOrderSection(jobId) {
+  const body = $('result-body');
+  const old = document.getElementById('bondorder-section');
+  if (old) old.remove();
+
+  const holder = document.createElement('div');
+  holder.innerHTML = bondOrderSection();
+  const node = holder.firstElementChild;
+  const anchor = document.getElementById('scan-section')
+    || body.querySelector('.res-verdict, .res-warning');
+  if (anchor) anchor.after(node);
+  else body.prepend(node);
+
+  const runBtn = node.querySelector('#bo-run');
+  const kindSel = node.querySelector('#bo-kind');
+  const out = node.querySelector('#bo-body');
+
+  const run = async () => {
+    const kind = kindSel.value;
+    runBtn.disabled = true;
+    out.innerHTML = '<div class="bo-loading">Multiwfn 分析中…（要读波函数、建积分，'
+      + '大分子可能要几十秒）</div>';
+    try {
+      const data = await api('/api/jobs/' + encodeURIComponent(jobId)
+        + '/bondorders?kind=' + encodeURIComponent(kind));
+      out.innerHTML = renderBondOrders(data);
+      logLine(`键级分析完成：${data.kind_label} ${data.count} 条`, 'l-dim');
+    } catch (err) {
+      // 失败就说清楚为什么（缺 .gbw / 没装 Multiwfn / 格式不认识），
+      // 不要留一个"点了没反应"的按钮
+      out.innerHTML = `<div class="bo-error">分析失败：${esc(err.message)}</div>`;
+      logLine('✖ 键级分析失败：' + err.message, 'l-err');
+    } finally {
+      runBtn.disabled = false;
+    }
+  };
+  runBtn.addEventListener('click', run);
+  kindSel.addEventListener('change', () => {
+    if (out.querySelector('.bo-table, .bo-error')) run();
+  });
+  return node;
 }
 
 async function loadScanSection(jobId) {

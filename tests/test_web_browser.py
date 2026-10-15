@@ -80,9 +80,11 @@ def _browser() -> str:
 # ------------------------------------------------------------------ 服务
 
 class Server:
-    def __init__(self) -> None:
+    def __init__(self, jobs_root: Path | None = None) -> None:
+        # jobs_root 给定时直接用那个任务库（键级测试需要**真的 .gbw**，
+        # 那玩意只能来自真跑过 ORCA 的任务，临时库里不可能有）
         self.root = Path(tempfile.mkdtemp(prefix="qcgui_browser_"))
-        self.manager = JobManager(self.root / "jobs")
+        self.manager = JobManager(jobs_root or (self.root / "jobs"))
         self.app = create_app(self.manager)
         from werkzeug.serving import make_server
 
@@ -98,6 +100,34 @@ class Server:
         with urllib.request.urlopen(self.base + "/api/examples", timeout=20) as res:
             data = json.loads(res.read().decode("utf-8"))
         return data["examples"][0]["path"]
+
+    @staticmethod
+    def real_jobs_root() -> Path | None:
+        """本机真实任务库（机器相关，找不到就跳过 —— CI 上正是这种情形）。"""
+        override = os.environ.get("QCGUI_JOBS_ROOT")
+        if override:
+            root = Path(override)
+            return root if root.is_dir() else None
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            return None
+        root = Path(local) / "qcgui" / "jobs"
+        return root if root.is_dir() else None
+
+    def finished_job_with_gbw(self) -> str | None:
+        """找一个既有 .gbw 又已完成的任务。找不到返回 None（调用方跳过）。"""
+        root = Path(self.manager.store.root)
+        if not root.is_dir():
+            return None
+        for job_dir in sorted(root.iterdir(), reverse=True):
+            if not job_dir.is_dir():
+                continue
+            if not any(job_dir.glob("*.gbw")):
+                continue
+            record = self.manager.store.get(job_dir.name)
+            if record is not None and record.status == "done":
+                return job_dir.name
+        return None
 
 
 def run_viewer_test(base: str, load_path: str, timeout: int = 120) -> str:
@@ -288,6 +318,59 @@ def test_interaction_fixes_in_real_browser():
     assert "class=unusable" in text, f"结论横幅的类名不对：{text}"
     assert "结果不可用" in text, text
     print("    三处修复在真页面里都生效")
+
+
+def test_bond_order_ui_in_real_browser():
+    """键级界面（Multiwfn 集成）必须在真页面里能用、能看见。
+
+    后端早有测试，但**界面是新写的** —— 本项目已经因为"DOM 里有但用户看不见"
+    吃过一次亏（结论横幅被扫描区挤到滚动区下面）。所以这里要点一遍真按钮，
+    并检查它排在结论横幅**之后**、确实在可见区内。
+
+    需要一个**有 .gbw 且装了 Multiwfn** 的任务；本机没有就跳过（CI 上正是这种情形）。
+    """
+    # 用**和应用同一套**探测逻辑，而不是 shutil.which ——
+    # 本机的 Multiwfn 装在 D:\multiwfn\... 靠自动探测找到，不在 PATH 上。
+    # 用 which 判断会让这个测试在本机也静默跳过，等于没有牙齿。
+    from qcgui.external import resolve_tool
+
+    exe, _ = resolve_tool("multiwfn")
+    if not exe:
+        print("    跳过：本机没有 Multiwfn")
+        return
+
+    server = Server(Server.real_jobs_root())
+    try:
+        job_id = server.finished_job_with_gbw()
+        if job_id is None:
+            print("    跳过：真实任务库里没有带 .gbw 的已完成任务")
+            return
+        chrome = _browser()
+        profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
+        url = f"{server.base}/?nosse=1&job={job_id}&botest={job_id}&bokind=mayer"
+        proc = subprocess.run(
+            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+             "--window-size=1500,1100", "--virtual-time-budget=120000",
+             f"--user-data-dir={profile}", "--dump-dom", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
+        )
+        dom = proc.stdout or ""
+    finally:
+        server.close()
+
+    match = re.search(r"__BOTEST__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到键级界面测试输出\nDOM 片段:\n{dom[:600]}"
+    text = match.group(1)
+    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+
+    assert "ERROR" not in text, text
+    for key in ("section=PASS", "visible=PASS", "table=PASS", "bar=PASS"):
+        assert key in text, f"{key} 没通过：{text}"
+    # 排在结论横幅之后 —— 结论横幅永远是最上面那条
+    assert "res-verdict" in text, text
+    assert text.index("res-verdict") < text.index("bondorder-section"), \
+        f"键级区不该排在结论横幅前面：{text}"
+    print("    键级界面在真页面里可用、可见、顺序正确")
 
 
 def test_page_loads_without_javascript_errors():
