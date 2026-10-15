@@ -51,6 +51,26 @@ def _skip(reason: str):
         raise _Skipped(reason)
 
 
+def _require_orca(reason: str = "本机没有 ORCA"):
+    """需要**真跑一次 ORCA** 的用例：没有引擎就跳过并说明原因。
+
+    .. important::
+       CI 上不装 ORCA（许可限制，不能随仓库分发），所以任何"提交任务然后
+       等产物落盘"的用例都必须先过这道闸门 —— 否则任务会秒失败、产物永远
+       不出现，用例以"等超时"的形式红掉，而且看不出是环境问题。
+       实测踩过：``test_viewer_atom_order_matches_orca_input_order``
+       在 CI 上报"里一直没出现 .inp"，查下来就是缺这道闸门。
+    """
+    import os
+    import shutil
+
+    if shutil.which("orca") or shutil.which("orca.exe"):
+        return
+    if os.environ.get("QCGUI_ORCA_EXE"):
+        return
+    _skip(reason)
+
+
 class Server:
     """真实 HTTP 服务。"""
 
@@ -484,6 +504,9 @@ def test_viewer_atom_order_matches_orca_input_order():
     确实按输入顺序解读下标 —— 用甲醇扫 H–C–O–H 二面角实测过，每个扫描点
     按输入顺序算回来的值都和扫描值相等。）
     """
+    # 这条要真提交一次任务、等 .inp 落盘 —— 没有 ORCA 时任务会秒失败，
+    # 产物永远不出现，只会以"等超时"的形式红掉（CI 上就红在这个原因上）
+    _require_orca()
     server = Server()
     try:
         from qcgui.model import Molecule
