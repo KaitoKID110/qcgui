@@ -112,8 +112,32 @@ class JobStore:
 
     # ---------- 写 ----------
 
+    def _unique_job_id(self, spec: JobSpec) -> str:
+        """自动生成一个**当前不存在**的 job_id。
+
+        ``make_job_id`` 只精确到秒，同一秒内提交相同参数会得到同一个 id。
+        实测后果很严重（审计 E1，高危）：
+
+        * 两个 worker 争同一个 ``.out``（引擎用 ``"w"`` 打开）互相截断
+        * ``INSERT OR REPLACE`` 只留一行索引
+        * ``_procs`` 字典键相同 → ``cancel()`` 只杀得掉一个，另一个变孤儿进程
+
+        这里在冲突时加后缀 —— 保住"可排序、同参数可复跑"的原意（首次仍是
+        时间戳+指纹），同时杜绝两个任务共享一个目录。
+
+        只对**自动生成**的 id 去重；调用方显式指定的 id 原样保留（那是他的责任，
+        测试也需要能钉住某个 id）。
+        """
+        base = make_job_id(spec)
+        for n in range(1, 1000):
+            candidate = base if n == 1 else f"{base}-{n}"
+            if self.get(candidate) is None and not self.job_dir(candidate).exists():
+                return candidate
+        # 极端情况（999 次都撞上）：加个纳秒尾巴兜底
+        return f"{base}-{time.time_ns()}"
+
     def create(self, spec: JobSpec, job_id: str | None = None) -> JobRecord:
-        job_id = job_id or make_job_id(spec)
+        job_id = job_id or self._unique_job_id(spec)
         job_dir = self.job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
 

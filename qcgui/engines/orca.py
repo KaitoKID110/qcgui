@@ -363,8 +363,9 @@ class OrcaEngine(Engine):
         normal = _TERMINATION_MARKER in text
 
         # --- 结构化输出（唯一的数据来源） ---
+        export_failures: list[str] = []
         if gbw_path.is_file():
-            self._export_json(job_dir, base)
+            export_failures = self._export_json(job_dir, base)
 
         main_json = _load_json(job_dir / f"{base}.json")
         prop_json = _load_json(job_dir / f"{base}.property.json")
@@ -372,6 +373,29 @@ class OrcaEngine(Engine):
             result.files["json"] = str(job_dir / f"{base}.property.json")
         elif main_json:
             result.files["json"] = str(job_dir / f"{base}.json")
+
+        # 导出失败 + 什么都没拿到 = 结果里不会有能量和几何。
+        # 以前这种情况状态仍是 done、零警告，用户以为算成功了（审计 E3）。
+        if export_failures and not (main_json or prop_json):
+            result.issues.append(Issue(
+                code="json_export_failed",
+                severity=SEVERITY_BLOCKING,
+                message=(
+                    "结构化输出导出失败（" + "；".join(export_failures) + "），"
+                    "而且没有任何可用的 JSON —— 本次结果**没有能量、也没有几何**。"
+                    "任务虽然正常结束，但这个结果拿不到数据，请检查 ORCA 安装是否完整"
+                    "（尤其 orca_2json 能否单独运行）。"
+                ),
+            ))
+        elif export_failures:
+            result.issues.append(Issue(
+                code="json_export_partial",
+                severity=SEVERITY_MAJOR,
+                message=(
+                    "结构化输出导出有失败（" + "；".join(export_failures) + "），"
+                    "但有部分数据可用。结果可能缺少某些字段，重要结论建议核对原始输出。"
+                ),
+            ))
 
         if main_json:
             header = main_json.get("ORCA Header") or {}
@@ -400,9 +424,12 @@ class OrcaEngine(Engine):
 
         # 任务成功也可能"少了东西"。分三档，严重度决定界面上的"结论"：
         #   minor    —— 某项附带分析被静默跳过（主结果可用）
-        #   major    —— 优化没到位（几何可能不能用）
-        #   blocking —— 算出来的分子已经变了（结果根本不能用）
-        result.issues = (
+        #   major    —— 优化没到位 / 导出不完整（几何可能不能用）
+        #   blocking —— 算出来的分子已经变了、或导出失败且没有数据
+        #
+        # 注意是 **+=** 不是 =：上面的结构化输出检查已经往 issues 里放过东西了，
+        # 用赋值会把它们整个覆盖掉。
+        result.issues += (
             _collect_issues(text, spec)
             + _check_connectivity(spec, result)
             + _check_convergence(spec, text)
@@ -473,23 +500,36 @@ class OrcaEngine(Engine):
 
         result.orbitals = entry
 
-    def _export_json(self, job_dir: Path, base: str) -> None:
-        """调用 orca_2json 生成结构化 JSON。失败不致命，只记录。"""
+    def _export_json(self, job_dir: Path, base: str) -> list[str]:
+        """调用 ``orca_2json`` 生成结构化 JSON，**返回失败说明**。
+
+        以前是彻底静默的：导出失败时结果里能量与几何全空、状态却是 ``done``、
+        零警告（审计 E3）。实测真实二进制在缺 ``.property.txt`` 时会以 exit=2
+        退出 —— 那种"绿点但没数据"比直接报错危险得多。
+
+        返回空列表有两种含义：没装这个配套工具（会走别的解析路径），或者全部成功。
+        调用方靠"有没有导出结果文件"来区分。
+        """
         tool = self.resolve_tool("orca_2json")
         if not tool:
-            return
+            return []
+        failures: list[str] = []
         gbw = job_dir / f"{base}.gbw"
         for args in ([str(gbw)], [base, "-property"]):
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     [tool, *args],
                     cwd=str(job_dir),
                     capture_output=True,
                     text=True,
                     timeout=600,
                 )
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"{' '.join(args)}：{type(exc).__name__}")
                 continue
+            if proc.returncode != 0:
+                failures.append(f"{' '.join(args)} 退出码 {proc.returncode}")
+        return failures
 
     def _fill_from_property(self, result: Result, prop: dict) -> None:
         info = prop.get("Calculation_Info") or {}
