@@ -1026,8 +1026,15 @@ function verdictBanner(result) {
     .slice()
     .sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9));
 
-  const detail = issues.length
-    ? `<ul class="res-verdict-list">${issues.map((i) =>
+  // 理由往往**就是**第一条严重问题的原文（verdict_reason 取的正是它），
+  // 两条都渲染就会出现一模一样的重复段落 —— 去重后再决定要不要列清单
+  const reason = String(result.verdict_reason || '');
+  const extra = issues.filter((i) => {
+    const text = String(i.message || '').replace(/\*\*/g, '');
+    return text.replace(/\s/g, '') !== reason.replace(/\*\*/g, '').replace(/\s/g, '');
+  });
+  const detail = extra.length
+    ? `<ul class="res-verdict-list">${extra.map((i) =>
       `<li><b>${esc(SEVERITY_LABEL[i.severity] || i.severity)}</b> ${plain(i.message)}</li>`
     ).join('')}</ul>`
     : '';
@@ -1662,12 +1669,15 @@ async function loadScanSection(jobId) {
 
   // 放在结果面板**最前面**：扫描任务里曲线就是头号结果，
   // 追加到末尾的话会被挤到滚动区下面，等于没显示。
-  // 有警告横幅时排在它后面（警告讲的是"数据缺了"，优先级更高）。
+  //
+  // 但要**避让结论横幅**：`.res-verdict` 是用户唯一一定会看的东西
+  // （这个结果到底能不能用），必须留在最上面。以前只避让 `.res-warning`，
+  // 结果扫描区把结论横幅压到了滚动区下面 —— 截图才发现。
   const holder = document.createElement('div');
   holder.innerHTML = scanSection(data, jobId);
   const node = holder.firstElementChild;
-  const warning = body.querySelector('.res-warning');
-  if (warning) warning.after(node);
+  const top = body.querySelector('.res-verdict, .res-warning');
+  if (top) top.after(node);
   else body.prepend(node);
 
   // 切模式只重画图，游标和拖动都要重新挂（innerHTML 换掉了 SVG）
