@@ -26,6 +26,10 @@ const state = {
   // 结构叠加（feat/overlay-rmsd）：最近一次叠合结果与被叠加的任务 id
   overlay: null,
   overlayOther: null,
+  // 红外谱图（feat/ir-spectrum）：线型与半高全宽是用户可调的，记住上次选择
+  spectrumKind: 'gaussian',
+  spectrumFwhm: 20,
+  spectrumData: null,
   // —— 几何参数表（feat/geom-table）：数据来自 /api/geometry/parameters（纯几何，不碰引擎）。
   // geomSource 记住"这张表是哪套几何算出来的" —— 点行高亮前要拿它跟 3D 里
   // 显示的几何比对，否则原子编号会指到别的原子上（本项目踩过很多次）——
@@ -406,6 +410,14 @@ async function applyUrlParams() {
   // ?overtest=<任务 id>：叠加界面自检；?overbad=<不一致的任务 id> 顺带验失败路径
   if (params.get('overtest')) {
     await runOverlayUiTest(params.get('overtest'), params.get('overbad'));
+  }
+  // ?sptest=<频率任务 id>：红外谱图区自检（真浏览器里验图不是空白）
+  if (params.get('sptest')) {
+    await runSpectrumUiTest(params.get('sptest'));
+  }
+  // ?sptestfail=<任务 id>：谱图加载失败时的可读原因（不能只留一个破图）
+  if (params.get('sptestfail')) {
+    await runSpectrumFailUiTest(params.get('sptestfail'));
   }
 }
 
@@ -1481,6 +1493,7 @@ function renderResult(job, result) {
   loadBondOrderSection(job.job_id); // 键级要手动点「开始分析」才跑
   loadOrbCompSection(job.job_id);   // 轨道成分同样要手动点（Multiwfn 读波函数）
   loadOverlaySection(job.job_id);   // 叠加要手动点「与当前结构叠加」才跑
+  loadSpectrumSection(job.job_id);  // 频率/谱图区，其它任务静默跳过
 }
 
 function renderBatch(payload) {
@@ -3289,5 +3302,329 @@ async function runOverlayUiTest(otherId, badId) {
     lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
   }
   out.textContent = '__OVERTEST__' + lines.join(' | ') + '__END__';
+}
+
+// ---------------------------------------------------------------- 红外光谱（IR）
+
+/**
+ * 红外谱图区的**空壳**（同步插进结果面板）。
+ *
+ * 为什么要先插空壳再异步填内容：真数据要从 /spectrum 取（峰表与图共用后端
+ * 算出来的同一份数据）。如果等拿到数据才插 DOM，用户点到频率任务时会先看到
+ * 面板"闪一下没有谱图"，而且截图/自动化脚本要跟不确定的时序赛跑。
+ */
+function spectrumSectionShell() {
+  return `<div class="res-section" id="spectrum-section">
+    <div class="res-section-head">红外谱图 <span class="muted">频率展宽</span></div>
+    <div id="spectrum-body"><p class="hint">谱图绘制中…</p></div>
+  </div>`;
+}
+
+function spectrumSection(data) {
+  const rows = (data.peaks || []).map((p) => {
+    // 虚频是判断过渡态对不对的头号指标：整行加底色 + 红色"虚频"标签。
+    // 缺强度时强度列显示"—"，**不把补出来的 1.0 摆成真实强度**。
+    const kindText = (p.imaginary ? '<b class="imag">虚频</b>' : '实频')
+      + (p.strongest ? ' · <b class="strong">最强峰</b>' : '');
+    return `<tr class="${p.imaginary ? 'imag-row' : ''}">
+      <td class="num">${p.wavenumber.toFixed(1)}</td>
+      <td class="num">${p.intensity_available ? Number(p.intensity).toFixed(2) : '—'}</td>
+      <td>${kindText}</td></tr>`;
+  }).join('');
+
+  const unit = data.intensity_unit ? esc(data.intensity_unit) : '—';
+  const note = data.note
+    ? `<p class="hint warn" id="spec-note">${esc(data.note)}</p>`
+    : '<p class="hint" id="spec-note"></p>';
+  const imagNote = data.imaginary_count
+    ? `<p class="hint warn">检测到 <b>${data.imaginary_count}</b> 个虚频（红色标出）：`
+      + '过渡态应当正好 1 个虚频，极小点应当 0 个。</p>'
+    : '<p class="hint">没有虚频 —— 这是极小点（过渡态的话应当正好 1 个虚频）。</p>';
+  const options = (data.kinds || []).map((k) => `<option value="${esc(k.value)}"`
+    + `${k.value === data.kind ? ' selected' : ''}>${esc(k.label)}</option>`).join('');
+  const dropped = data.dropped_zero_modes
+    ? `（已略去 ${data.dropped_zero_modes} 个平动/转动的 0 cm⁻¹ 模态）` : '';
+
+  return `<div class="spec-controls">
+      <label>线型 <select id="spec-kind">${options}</select></label>
+      <label>半高全宽 <input type="number" id="spec-fwhm" class="input" min="0.1"
+        max="1000" step="1" value="${data.fwhm}"> cm⁻¹</label>
+      <a class="link" href="${esc(data.png_url)}" target="_blank" rel="noopener">新窗口看大图</a>
+      <span class="muted" id="spectrum-hint">改线型或宽度会重画；展宽<b>不移动峰位</b></span>
+    </div>
+    <div id="spectrum-figure">
+      <a href="${esc(data.png_url)}" target="_blank" rel="noopener"
+        title="点开在新窗口看原始尺寸（结果栏较窄，图上的小字要放大才看得清）">
+        <img id="spectrum-img" class="spectrum-img" alt="红外谱图"
+          src="${esc(data.png_url)}">
+      </a>
+      <p class="hint warn" id="spectrum-img-error" hidden></p>
+    </div>
+    ${note}${imagNote}
+    <div class="table-scroll spec-table-scroll">
+      <table class="data" id="spectrum-table">
+        <thead><tr><th>波数 (cm⁻¹)</th>
+          <th style="text-align:right">强度 (${unit})</th><th>类型</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <p class="hint">共 ${data.n_peaks} 个振动峰${dropped}；波数窗口
+      ${data.x_min} ~ ${data.x_max} cm⁻¹，采样步长 ${data.step} cm⁻¹。</p>`;
+}
+
+/**
+ * 取红外谱图数据并画到面板上。
+ *
+ * 图由**后端 Pillow 渲染**（前端零依赖，也不引任何绘图库；matplotlib 在本机
+ * 是坏的）。非频率任务在 renderResult 里就不会插这个空壳，这里直接早退。
+ */
+async function loadSpectrumSection(jobId) {
+  const section = document.getElementById('spectrum-section');
+  if (!section) return;
+  const body = section.querySelector('#spectrum-body');
+  state.spectrumData = null;
+
+  const draw = async (kind, fwhm) => {
+    state.spectrumKind = kind || 'gaussian';
+    state.spectrumFwhm = fwhm;
+    body.innerHTML = '<p class="hint">谱图绘制中…</p>';
+    try {
+      const url = '/api/jobs/' + encodeURIComponent(jobId) + '/spectrum?kind='
+        + encodeURIComponent(state.spectrumKind) + '&fwhm=' + encodeURIComponent(fwhm);
+      const data = await api(url);
+      body.innerHTML = spectrumSection(data);
+      state.spectrumData = data;
+      const sel = body.querySelector('#spec-kind');
+      const inp = body.querySelector('#spec-fwhm');
+      // 换线型/宽度重画。峰位不变，只是"峰看起来多宽"，所以不用重新拉频率数据。
+      const redraw = () => draw(sel.value, inp.value);
+      sel.addEventListener('change', redraw);
+      inp.addEventListener('change', redraw);
+      // 图是后端画的：没装 Pillow → 503，参数越界 → 400。浏览器只会给一个破图
+      // 图标，用户根本不知道出了什么事（这正是硬规矩 3 要防的"坏了还像正常"）。
+      const img = body.querySelector('#spectrum-img');
+      if (img) img.addEventListener('error', () => spectrumImageFailed(body, img));
+    } catch (err) {
+      // 失败要说清楚为什么（不是频率任务 / 没装 Pillow / 参数不合法），
+      // 不要留一个空白区让人以为"谱图就是这样"
+      body.innerHTML = `<p class="hint warn">红外谱图不可用：${esc(err.message)}</p>`;
+    }
+  };
+
+  await draw(state.spectrumKind, state.spectrumFwhm);
+}
+
+/**
+ * 谱图 PNG 加载失败时的兜底：**把服务端的原因原话摆出来，别留一个破图**。
+ *
+ * 为什么必须要这一段：PNG 由后端 Pillow 画（Pillow 是**可选依赖**，见
+ * requirements.txt / doctor.py）。没装 Pillow 时 ``/spectrum.png`` 返回 503
+ * 加一句中文说明，参数越界返回 400 —— 但浏览器看不懂这些，它只会在 ``<img>``
+ * 上画一个破图图标。用户看到"一块坏掉的图"，既不知道是没装依赖、也不知道
+ * 频率数字其实完好。最坏的 bug 不是算错，是坏了还显示得像正常（硬规矩 3）。
+ *
+ * 所以这里把同一个 URL 的 JSON 错误取回来显示；取不到就退到一句通用说明。
+ * 保留 ``<img>`` 本身（只隐藏）：重画时它还要用。
+ */
+async function spectrumImageFailed(body, img) {
+  const box = body.querySelector('#spectrum-figure');
+  const err = body.querySelector('#spectrum-img-error');
+  if (!box || !err) return;
+  img.style.display = 'none';
+  let why = '谱图 PNG 画不出来（服务端没给出原因）';
+  try {
+    const res = await fetch(img.getAttribute('src'), {
+      headers: { Accept: 'application/json' },
+    });
+    const data = await res.json();           // 拿到的是 PNG 就会抛，落到 catch
+    if (data && data.error) why = data.error;
+  } catch (e) { /* 拿不到原因，就用上面那句通用的 */ }
+  err.textContent = `红外谱图不可用：${why}`;
+  err.hidden = false;
+}
+
+/**
+ * 真浏览器验证红外谱图区（功能 C）。
+ *
+ * 为什么非要真浏览器：本项目已经三次栽在"DOM 里有但屏幕上没有"。
+ * 谱图是**后端画的 PNG**，所以这里要验的东西比纯逻辑多一层：
+ * 1. 区块确实插进了结果面板、有实际尺寸（不是 0×0 或者被挤到滚动区外）；
+ * 2. `<img>` 真的**加载成功**（naturalWidth > 0）—— 这一步就证明
+ *    /spectrum.png 在真服务里能出图，而不只是单元测试里能出图；
+ * 3. 图**不是空白**：把图片画进离屏 canvas 数非白像素。只检查 src 非空
+ *    是不够的 —— 一张全白的 PNG 也有 src（这正是本项目反复踩的坑）；
+ * 4. 虚频行在表里有醒目标记、缺强度时有"无强度"说明。
+ *
+ * 需要配合 `?job=<频率任务id>&sptest=<同一个id>`，结果写进 DOM 供 --dump-dom 读。
+ */
+async function runSpectrumUiTest(jobId) {
+  const out = document.createElement('pre');
+  out.id = 'sptest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    await selectJob(jobId);
+    // 谱图区是异步填进去的：等表格出现（最多 20 秒）
+    let table = null;
+    for (let i = 0; i < 100 && !table; i++) {
+      await sleep(200);
+      table = document.querySelector('#spectrum-table tbody tr');
+    }
+    if (!table) {
+      const err = document.querySelector('#spectrum-body .warn');
+      lines.push('section=FAIL ' + (err ? 'body="' + err.textContent.trim() + '"' : '表格没出现'));
+      out.textContent = '__SPTEST__' + lines.join(' | ') + '__END__';
+      return;
+    }
+
+    const section = document.getElementById('spectrum-section');
+    const body = $('result-body');
+    lines.push('order=' + Array.from(body.children)
+      .map((n) => n.id || n.className).join('>'));
+    const rect = section.getBoundingClientRect();
+    lines.push(`visible=${rect.width > 200 && rect.height > 120 ? 'PASS' : 'FAIL'}`
+      + ` w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+
+    // 结论横幅必须仍在谱图区前面（那是"结果能不能用"的第一信息）
+    const banner = body.querySelector('.res-verdict, .res-warning');
+    lines.push(`after_verdict=${banner && (banner.compareDocumentPosition(section)
+      & Node.DOCUMENT_POSITION_FOLLOWING) ? 'PASS' : 'FAIL'}`);
+    // 结论本身也要抓下来：无强度谱**必须是"可用但有限制"**，不能是绿色可用
+    const why = banner ? banner.querySelector('.res-verdict-why') : null;
+    lines.push(`verdict_class=${banner ? banner.className.replace('res-verdict', '').trim() : '—'}`
+      + ` verdict_why="${why ? why.textContent.trim() : ''}"`);
+
+    // ---- 图：真的加载出来了吗 ----
+    const img = section.querySelector('#spectrum-img');
+    for (let i = 0; i < 100 && !(img && img.complete && img.naturalWidth > 0); i++) {
+      await sleep(200);
+    }
+    const loaded = !!(img && img.complete && img.naturalWidth > 0);
+    lines.push(`img_loaded=${loaded ? 'PASS' : 'FAIL'}`
+      + ` natural=${img ? img.naturalWidth + 'x' + img.naturalHeight : '—'}`
+      + ` src=${img ? img.getAttribute('src') : '—'}`);
+
+    // ---- 图不是空白：数非白像素（这一条才是"看得见"的证据）----
+    let ink = -1;
+    if (loaded) {
+      const cv = document.createElement('canvas');
+      cv.width = img.naturalWidth;
+      cv.height = img.naturalHeight;
+      const cx = cv.getContext('2d');
+      cx.drawImage(img, 0, 0);
+      const px = cx.getImageData(0, 0, cv.width, cv.height).data;
+      let colored = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i] < 245 || px[i + 1] < 245 || px[i + 2] < 245) colored++;
+      }
+      ink = colored / (cv.width * cv.height) * 100;
+      lines.push(`nonblank=${ink > 1 ? 'PASS' : 'FAIL'} ink=${ink.toFixed(2)}%`);
+      // 蓝色谱线必须真的画上去了：数一下接近 C_CURVE (47,111,208) 的像素
+      let blue = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (Math.abs(px[i] - 47) < 26 && Math.abs(px[i + 1] - 111) < 26
+            && Math.abs(px[i + 2] - 208) < 26) blue++;
+      }
+      lines.push(`curve_pixels=${blue > 200 ? 'PASS' : 'FAIL'} n=${blue}`);
+    } else {
+      lines.push('nonblank=FAIL ink=-1');
+    }
+
+    // ---- 峰值表：虚频醒目、缺强度要说明 ----
+    const rows = section.querySelectorAll('#spectrum-table tbody tr');
+    const imagRows = section.querySelectorAll('#spectrum-table tbody tr.imag-row');
+    lines.push(`table=PASS rows=${rows.length} imag_rows=${imagRows.length}`);
+    lines.push(`imag_marked=${imagRows.length > 0
+      && imagRows[0].querySelector('.imag') ? 'PASS' : 'FAIL'}`);
+    const note = section.querySelector('#spec-note');
+    lines.push(`note="${note ? note.textContent.trim() : ''}"`);
+    lines.push(`strongest_marked=${
+      section.querySelector('#spectrum-table tbody tr .strong') ? 'PASS' : 'NONE'}`
+      + ` strongest_row=${Array.from(rows).findIndex(
+        (r) => r.querySelector('.strong'))}`);
+
+    // ---- 控制条：改 FWHM 要能触发重画（换一张图，且峰位不移动）----
+    const fwhmInput = section.querySelector('#spec-fwhm');
+    const before = img.getAttribute('src');
+    const beforePeaks = (state.spectrumData.peaks || [])
+      .map((p) => p.wavenumber.toFixed(1)).join(',');
+    fwhmInput.value = String(Number(fwhmInput.value) * 3);
+    fwhmInput.dispatchEvent(new Event('change', { bubbles: true }));
+    let after = before;
+    for (let i = 0; i < 100 && after === before; i++) {
+      await sleep(200);
+      const cur = section.querySelector('#spectrum-img');
+      after = cur ? cur.getAttribute('src') : before;
+    }
+    lines.push(`fwhm_control=${after !== before ? 'PASS' : 'FAIL'}`
+      + ` new_src=${after}`);
+    const afterPeaks = (state.spectrumData.peaks || [])
+      .map((p) => p.wavenumber.toFixed(1)).join(',');
+    lines.push(`peak_positions_kept=${afterPeaks === beforePeaks ? 'PASS' : 'FAIL'}`);
+    lines.push(`after_fwhm=${state.spectrumData.fwhm}`);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__SPTEST__' + lines.join(' | ') + '__END__';
+}
+
+/**
+ * 真浏览器验证**谱图加载失败的兜底**（硬规矩 3：它失败的时候，用户看到的是什么）。
+ *
+ * 做法刻意不依赖"本机有没有装 Pillow"：把 ``#spectrum-img`` 的 src 换成一条
+ * **注定失败**的谱图 URL（``fwhm=99999`` → 服务端 400 + 中文原因），然后看
+ * 界面上出现的是不是那句能读懂的原因，而不是一个破图图标。
+ *
+ * 配合 `?job=<频率任务id>&sptestfail=<同一个id>`。
+ */
+async function runSpectrumFailUiTest(jobId) {
+  const out = document.createElement('pre');
+  out.id = 'sptestfail-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const note = () => {
+    const el = document.querySelector('#spectrum-img-error');
+    return el && !el.hidden ? el.textContent.trim() : '';
+  };
+  try {
+    await selectJob(jobId);
+    let img = null;
+    for (let i = 0; i < 100 && !img; i++) {
+      await sleep(200);
+      img = document.querySelector('#spectrum-img');
+    }
+    if (!img) {
+      lines.push('img=FAIL 谱图区的 <img> 都没出现');
+      out.textContent = '__SPTF__' + lines.join(' | ') + '__END__';
+      return;
+    }
+    lines.push('img=PASS');
+
+    // 故意指到一条越界的半高全宽上：服务端必然 400，并给出一句中文原因。
+    // 加个时间戳避免浏览器复用失败的缓存条目。
+    img.style.display = '';
+    img.setAttribute('src', '/api/jobs/' + encodeURIComponent(jobId)
+      + '/spectrum.png?kind=gaussian&fwhm=99999&t=' + Date.now());
+    let msg = '';
+    for (let i = 0; i < 60 && !msg; i++) {
+      await sleep(200);
+      msg = note();
+    }
+    lines.push(`fail_msg="${msg}"`);
+    lines.push(`explained=${msg.indexOf('半高全宽') >= 0 ? 'PASS' : 'FAIL'}`);
+    lines.push(`img_hidden=${img.style.display === 'none' ? 'PASS' : 'FAIL'}`);
+    // 峰值表不该因为图画不出来就消失 —— 频率数字仍然是有用的结果
+    const rows = document.querySelectorAll('#spectrum-table tbody tr');
+    lines.push(`table_kept=${rows.length > 0 ? 'PASS' : 'FAIL'} rows=${rows.length}`);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__SPTF__' + lines.join(' | ') + '__END__';
 }
 

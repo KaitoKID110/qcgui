@@ -617,4 +617,42 @@ table.data tr.min td { color: #9ecbff; }
 .ov-grid { margin: 4px 0 6px; }
 .ov-grid dd.ov-before { color: var(--text-dim); }
 .ov-grid dd.ov-after { font-size: 13px; font-weight: 600; }
+/* ------------------------------------------------------------ 红外谱图 */
+/* 谱线图是**后端 Pillow 画的 PNG**（前端零依赖，matplotlib 在本机是坏的）。
+   所以这里只管排版：图片撑满面板宽度、按原始比例缩放，别被裁掉。 */
+
+.spectrum-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 2px 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: #fff;   /* 图本身是白底，深色主题下要给它一个白框，否则边界看不出来 */
+}
+
+.spec-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 6px 0 4px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.spec-controls select { max-width: 180px; }
+.spec-controls input { width: 74px; }
+.spec-controls .muted { font-size: 11px; }
+
+.spec-table-scroll { max-height: 240px; }
+
+/* 虚频行：整行加底色 + 红字。过渡态正好 1 个虚频，多一个少一个都是错的，
+   所以这一行必须一眼能扫到（只把数字标红不够显眼）。 */
+table.data tr.imag-row td {
+  color: #ff9a9a;
+  background: rgba(224, 90, 90, 0.08);
+}
+table.data tr.imag-row td .imag { color: #ff7b7b; }
+table.data td .imag { color: #ff9a9a; }
+table.data td .strong { color: #e8b23a; }
 
