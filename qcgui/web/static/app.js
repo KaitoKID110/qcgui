@@ -1447,6 +1447,11 @@ function renderResult(job, result) {
     const real = result.frequencies.filter((f) => Math.abs(f) > 1e-6);
     parts.push(`<div class="res-section"><h4>振动频率 (cm⁻¹) · 虚频 ${result.n_imaginary_frequencies ?? 0}</h4>
       <div class="freq-list">${real.map((f) => `<span class="${f < 0 ? 'imag' : ''}">${f.toFixed(1)}</span>`).join('')}</div></div>`);
+
+    // 红外谱图区：仅当任务有频率时才出现（没有频率的任务不占位置）。
+    // 只有一列数字看不出谱形，而"算完频率直接看谱图"正是 GaussView 最常见的用法。
+    // 真实数据由 /spectrum 异步取（图由后端 Pillow 画，前端不引任何绘图库）。
+    parts.push(spectrumSectionShell());
   }
 
   const irc = result.irc || {};
