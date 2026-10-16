@@ -34,6 +34,11 @@ DEFAULT_OUT = REPO / "figures" / "geometry_table.png"
 def main(argv: list[str]) -> int:
     out = Path(argv[1]) if len(argv) > 1 else DEFAULT_OUT
     out.parent.mkdir(parents=True, exist_ok=True)
+    # 诊断行里有 Å/°，Windows 控制台默认 GBK 会直接抛 UnicodeEncodeError ——
+    # 截图成功了却因为"打印不出来"而报错，最误导人。用项目自己的兜底。
+    from qcgui import configure_stdio
+
+    configure_stdio()
     browser = find_browser()
     if not browser:
         print("找不到 Chrome/Edge，无法截图")

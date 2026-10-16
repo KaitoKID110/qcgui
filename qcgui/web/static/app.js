@@ -574,9 +574,28 @@ async function runGeometryTableTest() {
       lines.push(`toggle_off=${on > 0 && state.viewer.highlightedAtoms.length === 0 ? 'PASS' : 'FAIL'}`);
     }
 
-    // 最后留在"高亮着"的状态：同一条 URL 用 --screenshot 拍到的就是用户看到的样子
-    const final = clickRow(0);
-    lines.push(`final_pick=${final ? final.dataset.label : 'none'}`
+    // --- 表与 3D 不是同一套几何时，必须先把查看器切过去（否则高亮会指错原子）---
+    // 这是真实会发生的状态：拖过扫描曲线、或停在轨迹某一帧时，查看器里显示的
+    // 并不是 result.geometry。这里把查看器换成一个完全不相干的分子来制造错位，
+    // 点一行后应当看到查看器被切回表的那套几何、且高亮画在**正确的**原子上。
+    state.viewer.setMolecule({ symbols: ['Ar'], coords: [[0, 0, 0]] });
+    if (clickTab('bonds') && readRows().length) {
+      const want = readRows()[0].atoms;
+      clickRow(0);
+      const switched = state.viewer.symbols.length === state.geomSource.symbols.length;
+      const got = state.viewer.highlightedAtoms.join(',');
+      lines.push(`mismatch_switch=${switched ? 'PASS' : 'FAIL'}`
+        + ` highlight=${got} want=${want}`
+        + ` drawn=${state.viewer.highlightDrawCount}`
+        + ` ok=${switched && got === want && state.viewer.highlightDrawCount > 0 ? 'PASS' : 'FAIL'}`);
+    }
+
+    // 最后留在"高亮着"的状态：同一条 URL 用 --screenshot 拍到的就是用户看到的样子。
+    // 上面的错位检查点过一次行，可能刚好把高亮又切回"已取消"，所以按状态补一次
+    // ——不能无条件再点一次，那样反而会把已经亮着的行点灭（截图证据就没了）。
+    if (!state.viewer.highlightedAtoms.length) clickRow(0);
+    const finalRow = section().querySelector('tbody tr.geom-row.active');
+    lines.push(`final_pick=${finalRow ? finalRow.dataset.label : 'none'}`
       + ` n=${state.viewer.highlightedAtoms.length} drawn=${state.viewer.highlightDrawCount}`);
     lines.push('GEOMTEST RESULT: '
       + (lines.some((l) => l.includes('FAIL')) ? 'FAIL' : 'PASS'));

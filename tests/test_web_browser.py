@@ -448,6 +448,22 @@ def _dump_geomtest(url: str, timeout: int = 180) -> str:
     return match.group(1)
 
 
+def _print_diagnostics(text: str) -> None:
+    """打印几何参数测试的诊断行（``a | b | c`` 转成多行）。
+
+    为什么不能直接 ``print``：这些行里有 ``Å``/``°``，而 Windows 控制台默认是
+    GBK —— 直接打印会抛 ``UnicodeEncodeError``。实测：那会让**一条本该通过的
+    测试在断言之前就 ERROR 掉**（``pytest -s`` 时必然发生），看起来像功能坏了。
+    诊断输出降级成替代字符就行，**断言才是测试的正文**。
+    """
+    block = "    " + "\n    ".join(p.strip() for p in text.split(" | "))
+    try:
+        print(block)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(block.encode(encoding, "replace").decode(encoding, "replace"))
+
+
 def test_geometry_table_in_real_browser():
     """「几何参数」表必须在真页面里渲染出来、能点、能高亮 —— 而且看得见。
 
@@ -468,7 +484,7 @@ def test_geometry_table_in_real_browser():
     finally:
         server.close()
 
-    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+    _print_diagnostics(text)
 
     # 期望值直接来自纯几何层 —— 浏览器里看到的必须和后端算的一致
     expected = geometry_parameters(GEOM_FIXTURE["symbols"], GEOM_FIXTURE["coords"])
@@ -503,6 +519,11 @@ def test_geometry_table_in_real_browser():
     assert "angle_pick=" in text and "n=3 drawn=3" in text, text
     assert "dihedral_pick=H2–O0–O1–H3 value=90.00 n=4 drawn=4" in text, text
     assert "toggle_off=PASS" in text, text
+    # 表与 3D 错位时（拖过扫描曲线 / 停在轨迹某帧）点一行：必须先把查看器切到
+    # 表的那套几何，高亮才落在正确的原子上 —— 否则就是"高亮指错原子"那类错误
+    mismatch = next(p.strip() for p in text.split(" | ")
+                    if p.strip().startswith("mismatch_switch="))
+    assert "mismatch_switch=PASS" in mismatch and "ok=PASS" in mismatch, mismatch
     print("    几何参数表在真页面里可用、可见、点击高亮正确")
 
 
@@ -525,7 +546,7 @@ def test_geometry_table_falls_back_to_the_loaded_structure():
     finally:
         server.close()
 
-    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+    _print_diagnostics(text)
 
     symbols, coords = [], []
     lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -550,6 +571,9 @@ def test_geometry_table_falls_back_to_the_loaded_structure():
     assert f"bonds_rows={len(expected['bonds'])} sorted=PASS" in text, text
     # 点一行同样要高亮并画出来
     assert "draws_forced=" in text and "draws_forced=0" not in text, text
+    mismatch = next(p.strip() for p in text.split(" | ")
+                    if p.strip().startswith("mismatch_switch="))
+    assert "ok=PASS" in mismatch, mismatch
     print(f"    {Path(path).name}: 表由当前载入的结构生成，条数与后端一致")
 
 
