@@ -19,6 +19,9 @@ const state = {
   recipe: null,          // 当前选中的配方
   moleculePath: null,    // 当前结构的来源文件（工具栏外部工具要用）
   busy: false,
+  orbComp: null,         // 最近一次轨道成分分析结果（切任务时要清掉）
+  orbCompPartition: 'mulliken',
+  orbCompOrbital: 'homo',
 };
 
 // ------------------------------------------------------------------ 小工具
@@ -375,6 +378,9 @@ async function applyUrlParams() {
   }
   if (params.get('botest')) {
     await runBondOrderUiTest(params.get('botest'), params.get('bokind') || 'mayer');
+  }
+  if (params.get('octest')) {
+    await runOrbCompUiTest(params.get('octest'));
   }
 }
 
@@ -1295,6 +1301,7 @@ function renderResult(job, result) {
   bindOrbitalButtons();
   loadScanSection(job.job_id);      // 扫描任务才有数据，其它任务静默跳过
   loadBondOrderSection(job.job_id); // 键级要手动点「开始分析」才跑
+  loadOrbCompSection(job.job_id);   // 轨道成分同样要手动点（Multiwfn 读波函数）
 }
 
 function renderBatch(payload) {
@@ -1921,6 +1928,206 @@ function loadBondOrderSection(jobId) {
     if (out.querySelector('.bo-table, .bo-error')) run();
   });
   return node;
+}
+
+// ------------------------------------------------------- 轨道成分（Multiwfn 菜单 8）
+
+/**
+ * 轨道编号翻译 —— **本功能最容易出错的一处**。
+ *
+ * Multiwfn 的轨道编号是 **1 起**，ORCA 的 `orca_2json` 是 **0 起**：
+ * 咖啡因（80 MO / 102 电子 / 51 个双占据）的 HOMO，Multiwfn 报 `51`、
+ * ORCA 报 `homo=50`；LUMO 报 `52` 对 `51`。
+ *
+ * 直接把 `orbital_index: 51` 当 ORCA 轨道号显示，同一轨道就会在「分子轨道」
+ * 表和「轨道成分」表里出现两个号 —— 本项目反复踩过这类"编号对不上"的问题。
+ * 所以这里既给出 ORCA 口径的编号，也把 Multiwfn 自己的编号写出来。
+ */
+function orbitalIndexLabel(orbComp, orb) {
+  const mw = orbComp && orbComp.orbital_index;
+  if (mw === null || mw === undefined) return '—';
+  const orca = mw - 1;
+  const tag = orb
+    ? (orca === orb.homo ? '（HOMO）' : orca === orb.lumo ? '（LUMO）' : '')
+    : '';
+  return `#${orca}${tag} <span class="muted">Multiwfn 编号 ${mw}</span>`;
+}
+
+function orbCompSection() {
+  const partitions = [
+    ['mulliken', 'Mulliken 布居'],
+    ['stout', 'Stout-Politzer 布居'],
+    ['scpa', 'Ros-Schuit (SCPA) 布居'],
+  ];
+  const orbitals = [['homo', 'HOMO'], ['lumo', 'LUMO'],
+                    ['homo-1', 'HOMO−1'], ['lumo+1', 'LUMO+1']];
+  return `<div class="res-section" id="orbcomp-section">
+    <div class="res-section-head">轨道成分 <span class="muted">Multiwfn</span></div>
+    <div class="bo-controls">
+      <select id="oc-partition">${partitions.map(([v, t]) =>
+        `<option value="${v}">${esc(t)}</option>`).join('')}</select>
+      <select id="oc-orbital">${orbitals.map(([v, t]) =>
+        `<option value="${v}">${esc(t)}</option>`).join('')}</select>
+      <button class="btn small" id="oc-run">分析轨道成分</button>
+      <span class="muted" id="oc-hint">看的是这个轨道主要在哪几个原子上，不需要 NBO</span>
+    </div>
+    <div id="oc-body" class="muted">尚未分析</div>
+  </div>`;
+}
+
+/**
+ * 把轨道成分画出来。
+ *
+ * 两条必须写清楚的话：
+ *  1. Multiwfn 只打印贡献大于阈值的原子，所以百分比**合计不是 100%** ——
+ *     不说明的话用户会以为数据缺了一块；
+ *  2. `problems` 非空时必须显示出来（例如原始输出没落盘），那是留痕失败的提示，不能藏。
+ */
+function renderOrbComp(data, orb) {
+  const atoms = data.atoms || [];
+  const warn = data.problems && data.problems.length
+    ? `<div class="bo-note">${data.problems.map((p) => esc(p)).join('；')}</div>` : '';
+  if (!atoms.length) {
+    // 宁可交白卷也不给半份数据；但 problems 必须一起显示 ——
+    // 它是"原始输出没落盘"这类留痕失败的唯一线索，藏起来用户就只剩一句"没结果"。
+    return `<div class="bo-error">没有解析出任何原子贡献 —— 宁可交白卷也不给半份数据</div>${warn}`;
+  }
+  const top = atoms[0];
+  const total = atoms.reduce((s, a) => s + (a.percent || 0), 0);
+  const rows = atoms.map((a) => {
+    // 相对最强原子的比例条：扫一眼就知道第二个是谁
+    const pct = Math.max(2, Math.round((a.percent / Math.max(0.001, top.percent)) * 100));
+    const shells = (a.shells || []).map((s) => `${esc(s.type)}${s.shell} ${s.percent.toFixed(1)}%`).join('、');
+    return `<tr><td class="bo-label">${esc(a.label)}</td>`
+      + `<td class="bo-num">${a.percent.toFixed(2)}%</td>`
+      + `<td class="bo-bar"><i style="width:${pct}%"></i></td>`
+      + `<td class="muted">${shells || '—'}</td></tr>`;
+  }).join('');
+  const approx = total < 99.99
+    ? `，因此合计 ${total.toFixed(2)}%，不是 100%` : '';
+  return `<div class="bo-summary">`
+    + `${esc(data.request_label)} · 轨道 ${orbitalIndexLabel(data, orb)}`
+    + `${data.energy_ev === null || data.energy_ev === undefined ? '' : ` · ${data.energy_ev.toFixed(2)} eV`}`
+    + `<br>主要在这几个原子上：<b>${esc(data.top_label)}</b></div>`
+    + `<table class="bo-table"><thead><tr><th>原子</th><th>贡献</th><th>相对最强</th><th>shell 明细</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`
+    + `<p class="hint">只列出贡献 &gt; 阈值 ${data.threshold ?? '—'}% 的原子${approx}。</p>`
+    + `${warn}`;
+}
+
+/**
+ * 把轨道成分区挂到结果面板上。
+ *
+ * 与键级区一样**刻意不自动跑**：Multiwfn 要读波函数、建积分；本次实测咖啡因
+ * 只要 0.12 s，但大分子与 `orbital=all` 会明显变慢，不替用户做这个决定。
+ */
+function loadOrbCompSection(jobId) {
+  const body = $('result-body');
+  const old = document.getElementById('orbcomp-section');
+  if (old) old.remove();
+  state.orbComp = null;
+
+  const holder = document.createElement('div');
+  holder.innerHTML = orbCompSection();
+  const node = holder.firstElementChild;
+  // 结论横幅永远最上面；其次扫描曲线、键级，轨道成分排在它们之后
+  const anchor = document.getElementById('bondorder-section')
+    || document.getElementById('scan-section')
+    || body.querySelector('.res-verdict, .res-warning');
+  if (anchor) anchor.after(node);
+  else body.prepend(node);
+
+  const runBtn = node.querySelector('#oc-run');
+  const partSel = node.querySelector('#oc-partition');
+  const orbSel = node.querySelector('#oc-orbital');
+  const out = node.querySelector('#oc-body');
+  partSel.value = state.orbCompPartition;
+  orbSel.value = state.orbCompOrbital;
+
+  const run = async () => {
+    const partition = partSel.value;
+    const orbital = orbSel.value;
+    state.orbCompPartition = partition;
+    state.orbCompOrbital = orbital;
+    runBtn.disabled = true;
+    out.innerHTML = '<div class="bo-loading">Multiwfn 分析中…（要读波函数、建积分，'
+      + '大分子可能要几十秒）</div>';
+    try {
+      const data = await api('/api/jobs/' + encodeURIComponent(jobId)
+        + '/orbital-composition?partition=' + encodeURIComponent(partition)
+        + '&orbital=' + encodeURIComponent(orbital));
+      const orb = (state.result && state.result.orbitals) || null;
+      out.innerHTML = renderOrbComp(data, orb);
+      state.orbComp = data;
+      logLine(`轨道成分：${data.partition_label} ${data.request_label} `
+        + `${data.count} 个原子（${data.top_label}）`, 'l-dim');
+    } catch (err) {
+      // 缺 .gbw / 没装 Multiwfn / 格式不认识 —— 说清原因，别留一个"点了没反应"的按钮
+      out.innerHTML = `<div class="bo-error">分析失败：${esc(err.message)}</div>`;
+      logLine('✖ 轨道成分分析失败：' + err.message, 'l-err');
+    } finally {
+      runBtn.disabled = false;
+    }
+  };
+  runBtn.addEventListener('click', run);
+  [partSel, orbSel].forEach((sel) => sel.addEventListener('change', () => {
+    if (out.querySelector('.bo-table, .bo-error')) run();
+  }));
+  return node;
+}
+
+/** `?octest=<job>`：真浏览器里的自检钩子，比照 `runBondOrderUiTest`。 */
+async function runOrbCompUiTest(jobId) {
+  const out = document.createElement('pre');
+  out.id = 'octest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  try {
+    const node = loadOrbCompSection(jobId);
+    lines.push(`section=${node ? 'PASS' : 'FAIL'}`);
+    if (node) {
+      // 位置：结论横幅必须在轨道成分**之前**（本项目为这件事吃过一次亏）
+      const verdict = document.querySelector('.res-verdict, .res-warning');
+      lines.push(`verdict_before_orbcomp=${
+        verdict && (verdict.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)
+          ? 'PASS' : 'FAIL'}`);
+      const body = $('result-body');
+      lines.push(`order=${Array.from(body.children).map((n) => n.id || n.className).join('>')}`);
+      const rect = node.getBoundingClientRect();
+      lines.push(`visible=${rect.width > 40 && rect.height > 10 ? 'PASS' : 'FAIL'}`
+        + ` w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+
+      $('oc-run').click();
+      const table = await new Promise((resolve) => {
+        const deadline = setTimeout(() => resolve(null), 180000);
+        const poll = setInterval(() => {
+          const t = node.querySelector('.bo-table');
+          const e = node.querySelector('.bo-error');
+          if (t || e) { clearInterval(poll); clearTimeout(deadline); resolve(t || e); }
+        }, 150);
+      });
+      if (!table) {
+        lines.push('table=TIMEOUT');
+      } else if (table.classList.contains('bo-error')) {
+        lines.push(`table=ERROR ${table.textContent.slice(0, 160)}`);
+      } else {
+        const rows = table.querySelectorAll('tbody tr');
+        lines.push(`table=PASS rows=${rows.length}`);
+        lines.push(`summary="${(node.querySelector('.bo-summary') || {}).textContent || ''}"`
+          .replace(/\s+/g, ' '));
+        const hint = node.querySelector('.hint');
+        lines.push(`hint="${hint ? hint.textContent.replace(/\s+/g, ' ').slice(0, 140) : ''}"`);
+        const bar = table.querySelector('.bo-bar i');
+        lines.push(`bar=${bar && parseFloat(bar.style.width) > 0 ? 'PASS' : 'FAIL'}`);
+      }
+      lines.push(`button_reenabled=${$('oc-run').disabled ? 'FAIL' : 'PASS'}`);
+    }
+  } catch (err) {
+    lines.push(`ERROR ${err && err.message}`);
+  }
+  out.textContent = '__OCTEST__' + lines.join(' | ') + '__END__';
 }
 
 /**
