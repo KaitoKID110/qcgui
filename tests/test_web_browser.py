@@ -373,6 +373,57 @@ def test_bond_order_ui_in_real_browser():
     print("    键级界面在真页面里可用、可见、顺序正确")
 
 
+def test_orbital_composition_ui_in_real_browser():
+    """轨道成分界面必须在真页面里能用、能看见。
+
+    为什么必须有这条：`OrbitalComposition` 的后端、接口、严格解析与黄金文件测试
+    早就在 `902b53a` 里了，**缺的只有界面**。而本项目已经因为"DOM 里有但用户看不见"
+    吃过一次亏（结论横幅被扫描区挤到滚动区下面）—— 所以这里要点一遍真按钮。
+
+    需要一个**有 .gbw / molden 且装了 Multiwfn** 的任务；没有就跳过（CI 上正是这种情形）。
+    """
+    from qcgui.external import resolve_tool
+
+    exe, _ = resolve_tool("multiwfn")
+    if not exe:
+        print("    跳过：本机没有 Multiwfn")
+        return
+
+    server = Server(Server.real_jobs_root())
+    try:
+        job_id = server.finished_job_with_gbw()
+        if job_id is None:
+            print("    跳过：真实任务库里没有带 .gbw 的已完成任务")
+            return
+        chrome = _browser()
+        profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
+        url = f"{server.base}/?nosse=1&job={job_id}&octest={job_id}"
+        proc = subprocess.run(
+            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+             "--window-size=1500,1100", "--virtual-time-budget=180000",
+             f"--user-data-dir={profile}", "--dump-dom", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
+        )
+        dom = proc.stdout or ""
+    finally:
+        server.close()
+
+    match = re.search(r"__OCTEST__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到轨道成分界面测试输出\nDOM 片段:\n{dom[:600]}"
+    text = match.group(1)
+    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+
+    assert "ERROR" not in text, text
+    for key in ("section=PASS", "visible=PASS", "table=PASS", "bar=PASS",
+                "button_reenabled=PASS"):
+        assert key in text, f"{key} 没通过：{text}"
+    # 结论横幅必须在轨道成分**之前** —— 那是"这次结果能不能用"，永远最上面
+    assert "verdict_before_orbcomp=PASS" in text, text
+    # 编号翻译必须两套号都给出（Multiwfn 1 起 vs ORCA 0 起）
+    assert "Multiwfn 编号" in text, f"编号翻译没生效：{text}"
+    print("    轨道成分界面在真页面里可用、可见、顺序正确、编号已翻译")
+
+
 def test_page_loads_without_javascript_errors():
     """页面首屏不得抛 JS 异常：用一个会渲染失败的探针检测。"""
     server = Server()
