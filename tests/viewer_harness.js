@@ -275,6 +275,45 @@ const CASES = {
       bad,
     };
   },
+  /**
+   * 高亮一组原子（几何参数表点一行时用）。
+   *
+   * 要验三件事：
+   *  * 设/清高亮后 ``highlightedAtoms`` 与 ``highlightDrawCount`` 一致
+   *    —— **数据到位 ≠ 真的画出来**（本项目栽过三次）
+   *  * 越界/非法下标被丢掉（宁可少画，不要画到别的原子上）
+   *  * 换了分子之后旧下标作废（否则会高亮不存在的原子）
+   */
+  highlight() {
+    const V = loadViewer();
+    const canvas = makeCanvas();
+    const v = new V(canvas, {});
+    v.setMolecule(WATER);
+
+    const on = v.highlightAtoms([0, 2]);
+    const setAfter = v.highlightedAtoms;
+    const strokesBefore = canvas._calls.stroke || 0;
+    v.render();
+    const drawn = v.highlightDrawCount;
+    const strokesAfter = canvas._calls.stroke || 0;
+
+    const cleared = v.highlightAtoms([]);
+    v.render();
+    const drawnAfterClear = v.highlightDrawCount;
+
+    v.highlightAtoms([0, 1]);
+    v.setMolecule({ symbols: ['C', 'C'], coords: [[0, 0, 0], [1.54, 0, 0]] });
+    const afterSwap = v.highlightedAtoms.length;
+
+    const filtered = v.highlightAtoms([0, 99, -3, 'x']);
+    v.render();
+    return {
+      on, setAfter, drawn, drawnAfterClear, cleared, afterSwap, filtered,
+      drawnFiltered: v.highlightDrawCount,
+      strokes_added: strokesAfter - strokesBefore,
+    };
+  },
+
 };
 
 const name = process.argv[2];

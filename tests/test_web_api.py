@@ -190,6 +190,45 @@ def test_structure_endpoints_and_examples():
     print("    示例列表与按路径载入正常")
 
 
+def test_geometry_parameters_endpoint():
+    """几何参数表的数据接口：前端把哪套几何发过来，这边就返回哪套的参数。
+
+    界面上的「几何参数」区（键长/键角/二面角）就是打这个接口 ——
+    它必须只做纯几何计算（不碰引擎、不读任务目录）。
+    """
+    server = Server()
+    try:
+        code, data = server.post("/api/geometry/parameters", {
+            "symbols": ["O", "H", "H"],
+            "coords": [[0.0, 0.0, 0.1173], [0.0, 0.7572, -0.4692], [0.0, -0.7572, -0.4692]],
+        })
+        assert code == 200, data
+        assert len(data["bonds"]) == 2, data
+        assert len(data["angles"]) == 1, data
+        assert data["dihedrals"] == [], data
+        assert abs(data["angles"][0]["value"] - 104.5) < 1.0, data["angles"]
+        assert data["bonds"][0]["unit"] == "Å" and data["angles"][0]["unit"] == "°"
+        assert data["bonds"][0]["atoms"] == [0, 1], data["bonds"]
+
+        # 原子数对不上 / 字段类型不对 / 坐标不是三个数：一律 400，绝不 500
+        code, data = server.post("/api/geometry/parameters",
+                                 {"symbols": ["O", "H"], "coords": [[0, 0, 0]]})
+        assert code == 400, (code, data)
+        assert "不一致" in data["error"], data
+        code, data = server.post("/api/geometry/parameters", {"symbols": "O", "coords": []})
+        assert code == 400, (code, data)
+        code, data = server.post("/api/geometry/parameters",
+                                 {"symbols": ["C"], "coords": [["x", "y", "z"]]})
+        assert code == 400, (code, data)
+
+        # 空输入不算错误：界面"还没载入结构"时不该报错
+        code, data = server.post("/api/geometry/parameters", {"symbols": [], "coords": []})
+        assert code == 200 and data["bonds"] == [], (code, data)
+    finally:
+        server.close()
+    print("    几何参数接口正常（水 2 键长 + 1 键角；坏输入 400）")
+
+
 # ------------------------------------------------------------------ 任务流程
 
 def test_submit_job_and_fetch_result():

@@ -19,9 +19,18 @@ const state = {
   recipe: null,          // 当前选中的配方
   moleculePath: null,    // 当前结构的来源文件（工具栏外部工具要用）
   busy: false,
-  orbComp: null,         // 最近一次轨道成分分析结果（切任务时要清掉）
+  // —— 轨道成分（feat/orbcomp-ui）：最近一次分析结果，切任务时要清掉 ——
+  orbComp: null,
   orbCompPartition: 'mulliken',
   orbCompOrbital: 'homo',
+  // —— 几何参数表（feat/geom-table）：数据来自 /api/geometry/parameters（纯几何，不碰引擎）。
+  // geomSource 记住"这张表是哪套几何算出来的" —— 点行高亮前要拿它跟 3D 里
+  // 显示的几何比对，否则原子编号会指到别的原子上（本项目踩过很多次）——
+  geometry: null,
+  geomSource: null,
+  geomKind: 'bonds',
+  geomSig: null,
+  geomToken: 0,
 };
 
 // ------------------------------------------------------------------ 小工具
@@ -379,8 +388,12 @@ async function applyUrlParams() {
   if (params.get('botest')) {
     await runBondOrderUiTest(params.get('botest'), params.get('bokind') || 'mayer');
   }
+  // 两个自检钩子都要保留（feat/orbcomp-ui 与 feat/geom-table 各加了一个）
   if (params.get('octest')) {
     await runOrbCompUiTest(params.get('octest'));
+  }
+  if (params.get('geomtest') === '1') {
+    await runGeometryTableTest();
   }
 }
 
@@ -448,6 +461,156 @@ async function runBondOrderUiTest(jobId, kind) {
     lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
   }
   out.textContent = '__BOTEST__' + lines.join(' | ') + '__END__';
+}
+
+/**
+ * 真浏览器验证「几何参数」表（键长/键角/二面角）。
+ *
+ * 本项目已经栽过三次"DOM 里有但屏幕上没有"，所以这里不只看数据对不对：
+ *  * 表格真的渲染出行、行的值与排序对不对
+ *  * 区块真的在**可见区**内（getBoundingClientRect），且排在结论横幅之后
+ *  * 点一行之后，查看器里被高亮的原子数与行里的原子一致，
+ *    并且**真的画出来了**（highlightDrawCount = 画了几个高亮环）
+ *  * 切换标签会清掉旧高亮；再点同一行能取消高亮
+ *
+ * 配合 `?geomtest=1`：有 `?job=` 时用任务结果几何，否则用 `?load=` 载入的结构 ——
+ * 正好覆盖"结果几何优先、其次当前结构"这两条来源。
+ */
+async function runGeometryTableTest() {
+  const out = document.createElement('pre');
+  out.id = 'geomtest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  // 注意：这里**不用 requestAnimationFrame 等重绘**。无头 Chrome 的虚拟时间
+  // 与 rAF 对不上（本项目踩过：钩子永远写不出结果），所以每次点完直接调
+  // render() 同步重绘 —— 高亮环画没画出来，照样能数清楚。
+  const section = () => document.getElementById('geometry-section');
+  const readRows = () => Array.from(section().querySelectorAll('tbody tr.geom-row')).map((tr) => ({
+    atoms: tr.dataset.atoms,
+    label: tr.dataset.label,
+    value: Number(tr.dataset.value),
+    unit: tr.dataset.unit,
+  }));
+  const isSorted = (rows) => rows.every((r, i) => i === 0 || rows[i - 1].value <= r.value);
+  const clickRow = (index) => {
+    const rows = section().querySelectorAll('tbody tr.geom-row');
+    if (!rows[index]) return null;
+    rows[index].dispatchEvent(new MouseEvent('click', {
+      bubbles: true, cancelable: true, view: window,
+    }));
+    state.viewer.render();
+    return rows[index];
+  };
+  const clickTab = (name) => {
+    const btn = section().querySelector(`[data-geom="${name}"]`);
+    if (btn) btn.click();
+    return btn;
+  };
+  try {
+    // 表是异步请求回来后填的 —— 等 state.geometry 到位（那之后 DOM 已同步填好）
+    for (let i = 0; i < 100 && !state.geometry; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (!section() || !state.geometry) throw new Error('没有渲染出几何参数表');
+
+    lines.push(`source=${state.geomSource ? state.geomSource.source : 'none'}`);
+    lines.push(`atoms=${state.geomSource ? state.geomSource.symbols.length : 0}`);
+    lines.push(`counts=bonds:${(state.geometry.bonds || []).length}`
+      + `,angles:${(state.geometry.angles || []).length}`
+      + `,dihedrals:${(state.geometry.dihedrals || []).length}`);
+
+    const rect = section().getBoundingClientRect();
+    const visible = rect.width > 60 && rect.height > 30 && rect.bottom > 0 && rect.top < innerHeight;
+    lines.push(`visible=${visible ? 'PASS' : 'FAIL'}`
+      + ` rect=${Math.round(rect.left)},${Math.round(rect.top)},${Math.round(rect.width)}x${Math.round(rect.height)}`);
+    const body = $('result-body');
+    // 用逗号连接：dump-dom 会把文本里的 ">" 转义成 "&gt;"，断言会很难写
+    lines.push(`order=${Array.from(body.children).map((n) => n.id || n.className).join(',')}`);
+    const verdict = body.querySelector('.res-verdict');
+    if (verdict) {
+      lines.push('after_verdict='
+        + ((verdict.compareDocumentPosition(section()) & Node.DOCUMENT_POSITION_FOLLOWING) ? 'PASS' : 'FAIL'));
+    }
+
+    // --- 键长页：行数 + 按值升序 + 数值与单位 ---
+    let rows = readRows();
+    lines.push(`bonds_rows=${rows.length} sorted=${isSorted(rows) ? 'PASS' : 'FAIL'}`);
+    lines.push(`bonds_first=${rows.length ? `${rows[0].label}=${rows[0].value.toFixed(3)}${rows[0].unit}` : 'none'}`);
+    lines.push(`bonds_last=${rows.length ? `${rows[rows.length - 1].label}=${rows[rows.length - 1].value.toFixed(3)}${rows[rows.length - 1].unit}` : 'none'}`);
+    const counts = {};
+    section().querySelectorAll('[data-count]').forEach((c) => { counts[c.dataset.count] = c.textContent; });
+    lines.push(`tab_counts=${GEOM_KINDS.map(([key]) => `${key}:${counts[key]}`).join(' ')}`);
+
+    // --- 点第一行：高亮原子数与行一致，而且要真画出来 ---
+    let picked = clickRow(0);
+    lines.push(`pick=${picked ? picked.dataset.label : 'none'}`
+      + ` highlight=${state.viewer.highlightedAtoms.join(',')}`
+      + ` n=${state.viewer.highlightedAtoms.length}`);
+    lines.push(`draws_forced=${state.viewer.highlightDrawCount}`);
+
+    // --- 切标签：计数要对，旧高亮必须清掉 ---
+    if (clickTab('angles')) {
+      const arows = readRows();
+      lines.push(`angles_rows=${arows.length} sorted=${isSorted(arows) ? 'PASS' : 'FAIL'}`
+        + ` cleared=${state.viewer.highlightedAtoms.length === 0 ? 'PASS' : 'FAIL'}`);
+      if (arows.length) {
+        picked = clickRow(0);
+        lines.push(`angle_pick=${picked.dataset.label}`
+          + ` n=${state.viewer.highlightedAtoms.length} drawn=${state.viewer.highlightDrawCount}`);
+      }
+    }
+    if (clickTab('dihedrals')) {
+      const drows = readRows();
+      lines.push(`dihedrals_rows=${drows.length}`);
+      if (drows.length) {
+        picked = clickRow(0);
+        lines.push(`dihedral_pick=${picked.dataset.label}`
+          + ` value=${drows[0].value.toFixed(2)}`
+          + ` n=${state.viewer.highlightedAtoms.length} drawn=${state.viewer.highlightDrawCount}`);
+      } else {
+        lines.push('dihedrals_none=PASS');
+      }
+    }
+
+    // --- 再点同一行 = 取消高亮 ---
+    if (clickTab('bonds') && readRows().length) {
+      clickRow(0);
+      const on = state.viewer.highlightedAtoms.length;
+      clickRow(0);
+      lines.push(`toggle_off=${on > 0 && state.viewer.highlightedAtoms.length === 0 ? 'PASS' : 'FAIL'}`);
+    }
+
+    // --- 表与 3D 不是同一套几何时，必须先把查看器切过去（否则高亮会指错原子）---
+    // 这是真实会发生的状态：拖过扫描曲线、或停在轨迹某一帧时，查看器里显示的
+    // 并不是 result.geometry。这里把查看器换成一个完全不相干的分子来制造错位，
+    // 点一行后应当看到查看器被切回表的那套几何、且高亮画在**正确的**原子上。
+    state.viewer.setMolecule({ symbols: ['Ar'], coords: [[0, 0, 0]] });
+    if (clickTab('bonds') && readRows().length) {
+      const want = readRows()[0].atoms;
+      clickRow(0);
+      const switched = state.viewer.symbols.length === state.geomSource.symbols.length;
+      const got = state.viewer.highlightedAtoms.join(',');
+      lines.push(`mismatch_switch=${switched ? 'PASS' : 'FAIL'}`
+        + ` highlight=${got} want=${want}`
+        + ` drawn=${state.viewer.highlightDrawCount}`
+        + ` ok=${switched && got === want && state.viewer.highlightDrawCount > 0 ? 'PASS' : 'FAIL'}`);
+    }
+
+    // 最后留在"高亮着"的状态：同一条 URL 用 --screenshot 拍到的就是用户看到的样子。
+    // 上面的错位检查点过一次行，可能刚好把高亮又切回"已取消"，所以按状态补一次
+    // ——不能无条件再点一次，那样反而会把已经亮着的行点灭（截图证据就没了）。
+    if (!state.viewer.highlightedAtoms.length) clickRow(0);
+    const finalRow = section().querySelector('tbody tr.geom-row.active');
+    lines.push(`final_pick=${finalRow ? finalRow.dataset.label : 'none'}`
+      + ` n=${state.viewer.highlightedAtoms.length} drawn=${state.viewer.highlightDrawCount}`);
+    lines.push('GEOMTEST RESULT: '
+      + (lines.some((l) => l.includes('FAIL')) ? 'FAIL' : 'PASS'));
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__GEOMTEST__' + lines.join(' | ') + '__END__';
 }
 
 /**
@@ -811,6 +974,8 @@ function setMolecule(molecule) {
     `${molecule.name || '结构'} · ${molecule.formula || ''} · ${(molecule.symbols || []).length} 原子`;
   $('trajectory').hidden = true;
   logLine(`载入结构: ${molecule.name || ''} ${molecule.formula || ''} (${(molecule.symbols || []).length} 原子)`, 'l-dim');
+  // 没有任务结果时，几何参数表就用这个刚载入的结构（"退而用当前载入的结构"）
+  loadGeometrySection();
 }
 
 async function loadStructureFromPath(path) {
@@ -1300,6 +1465,7 @@ function renderResult(job, result) {
   body.innerHTML = parts.join('');
   bindOrbitalButtons();
   loadScanSection(job.job_id);      // 扫描任务才有数据，其它任务静默跳过
+  loadGeometrySection();            // 几何参数表（结果几何优先，其次载入的结构）
   loadBondOrderSection(job.job_id); // 键级要手动点「开始分析」才跑
   loadOrbCompSection(job.job_id);   // 轨道成分同样要手动点（Multiwfn 读波函数）
 }
@@ -1833,6 +1999,240 @@ function attachScanDrag(section, profile) {
   svg.addEventListener('pointerleave', stop);
 }
 
+// ------------------------------------------------------------------ 几何参数表
+
+/** 三张表的定义。顺序就是界面上的切换顺序。 */
+const GEOM_KINDS = [
+  ['bonds', '键长', 'Å'],
+  ['angles', '键角', '°'],
+  ['dihedrals', '二面角', '°'],
+];
+
+/**
+ * 该拿哪套几何来列表：**优先当前任务的结果几何**，其次当前载入的结构。
+ *
+ * 为什么是这个优先级：用户点开一个任务，想看的就是**这次算出来的**键长键角
+ * （优化前后差多少正是要比较的东西）；没有任务结果时才退回左栏载入的结构。
+ * 表头会把来源写出来，免得用户以为看的是另一套。
+ */
+function geometryForTable() {
+  const geom = state.result && state.result.geometry;
+  if (geom && geom.symbols && geom.symbols.length && geom.coords) {
+    return { symbols: geom.symbols, coords: geom.coords, source: 'result' };
+  }
+  const mol = state.molecule;
+  if (mol && mol.symbols && mol.symbols.length && mol.coords) {
+    return { symbols: mol.symbols, coords: mol.coords, source: 'structure' };
+  }
+  return null;
+}
+
+/** 一套几何的指纹：避免同一套几何被重复算两遍、插出两块表。 */
+function geometrySignature(source) {
+  let hash = 2166136261;
+  const push = (text) => {
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+  };
+  push(source.source + '|' + source.symbols.join(','));
+  for (const c of source.coords) {
+    push(`${Number(c[0]).toFixed(4)},${Number(c[1]).toFixed(4)},${Number(c[2]).toFixed(4)}`);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function geometryShell(source) {
+  const tabs = GEOM_KINDS.map(([key, label]) =>
+    `<button data-geom="${key}" class="${key === state.geomKind ? 'active' : ''}">${label}`
+    + `<i class="geom-count" data-count="${key}">…</i></button>`).join('');
+  const from = source.source === 'result' ? '任务结果' : '当前载入的结构';
+  return `<div class="res-section" id="geometry-section">
+    <h4>几何参数 <span class="muted" id="geom-source">来源：${esc(from)}</span></h4>
+    <div class="segmented geom-tabs" id="geom-tabs">${tabs}</div>
+    <div class="table-scroll geom-scroll"><table class="data geom-table">
+      <thead><tr><th>#</th><th>原子</th><th class="geom-value-head">值</th></tr></thead>
+      <tbody id="geom-rows"><tr class="geom-none"><td colspan="3">计算中…</td></tr></tbody>
+    </table></div>
+    <p class="hint" id="geom-pick">点一行 → 在 3D 里高亮这几个原子</p>
+  </div>`;
+}
+
+/** 把（已经拿到或刚拿到的）参数画进表里。切换标签、排序都走这里。 */
+function renderGeometryTable() {
+  const section = document.getElementById('geometry-section');
+  const data = state.geometry;
+  if (!section || !data) return;
+
+  GEOM_KINDS.forEach(([key]) => {
+    const counter = section.querySelector(`[data-count="${key}"]`);
+    if (counter) counter.textContent = String((data[key] || []).length);
+  });
+  section.querySelectorAll('[data-geom]').forEach((btn) =>
+    btn.classList.toggle('active', btn.dataset.geom === state.geomKind));
+
+  const kind = GEOM_KINDS.find(([key]) => key === state.geomKind) || GEOM_KINDS[0];
+  const rows = (data[kind[0]] || []).slice().sort((a, b) => a.value - b.value);
+  const tbody = section.querySelector('#geom-rows');
+  const pick = section.querySelector('#geom-pick');
+
+  if (!rows.length) {
+    tbody.innerHTML = `<tr class="geom-none"><td colspan="3">这套几何里没有${kind[1]}</td></tr>`;
+    if (pick) pick.textContent = `共 0 条${kind[1]}`;
+  } else {
+    // 按值排序（后端已经排好，这里再排一次是按值显示这件事的直接保证：
+    // 用户看到的第一行必须是最小的那个值）
+    tbody.innerHTML = rows.map((row, index) => {
+      const digits = row.unit === 'Å' ? 3 : 2;
+      return `<tr class="geom-row" tabindex="0" data-atoms="${row.atoms.join(',')}"`
+        + ` data-label="${esc(row.label)}" data-value="${row.value}" data-unit="${esc(row.unit)}">`
+        + `<td class="geom-idx">${index + 1}</td>`
+        + `<td class="geom-atoms">${esc(row.label)}</td>`
+        + `<td class="geom-value">${row.value.toFixed(digits)}`
+        + `<span class="geom-unit">${esc(row.unit)}</span></td></tr>`;
+    }).join('');
+    if (pick) {
+      pick.textContent = `共 ${rows.length} 条，按值从小到大 · 点一行在 3D 里高亮涉及的原子`;
+    }
+  }
+  // 表换了内容，上一行的高亮就不再有对应关系了
+  state.viewer.highlightAtoms([]);
+}
+
+/** 表里的这套几何，3D 里现在显示的**就是**它吗？（编号对不对得上的前提） */
+function viewerShowsGeometry(source) {
+  const v = state.viewer;
+  if (!v || v.symbols.length !== source.symbols.length) return false;
+  for (let i = 0; i < source.coords.length; i++) {
+    const a = v.coords[i];
+    const b = source.coords[i];
+    if (!a || !b) return false;
+    if (Math.abs(a[0] - b[0]) > 1e-6
+      || Math.abs(a[1] - b[1]) > 1e-6
+      || Math.abs(a[2] - b[2]) > 1e-6) return false;
+  }
+  return true;
+}
+
+/**
+ * 点一行：在 3D 查看器里高亮这几个原子。
+ *
+ * 两个必须处理的细节：
+ *  * 表里的原子编号只有在**表与 3D 是同一套几何**时才成立。不是同一套
+ *    （例如表用的是任务结果、查看器还停在载入的结构）就先把查看器切过去 ——
+ *    否则高亮会指到别的原子上，而那正是本项目反复栽的一类错误。
+ *  * 再点一次同一行 = 取消高亮，不用再去别处找"清除"按钮。
+ */
+function selectGeometryRow(row) {
+  const source = state.geomSource;
+  if (!source || !row) return;
+  if (!viewerShowsGeometry(source)) {
+    state.viewer.setMolecule({ symbols: source.symbols, coords: source.coords });
+    $('viewer-empty').classList.add('hide');
+    $('viewer-caption').textContent =
+      `${source.source === 'result' ? '任务结果几何' : (state.molecule && state.molecule.name) || '结构'}`
+      + ` · ${source.symbols.length} 原子`;
+  }
+  const active = row.classList.contains('active');
+  const label = row.dataset.label || '';
+  const digits = row.dataset.unit === 'Å' ? 3 : 2;
+  const value = `${Number(row.dataset.value).toFixed(digits)} ${row.dataset.unit}`;
+  if (active) {
+    state.viewer.highlightAtoms([]);
+    row.classList.remove('active');
+    $('geom-pick').textContent = `已取消高亮（${label} = ${value}）· 点一行重新高亮`;
+    return;
+  }
+  const atoms = (row.dataset.atoms || '').split(',').filter((s) => s !== '').map(Number);
+  const drawn = state.viewer.highlightAtoms(atoms);
+  row.parentNode.querySelectorAll('tr.geom-row.active')
+    .forEach((other) => other.classList.remove('active'));
+  row.classList.add('active');
+  $('geom-pick').textContent =
+    `已高亮 ${label} = ${value}（${drawn} 个原子，青色圈）· 再点一次取消`;
+  logLine(`几何参数：高亮 ${label} = ${value}`, 'l-dim');
+}
+
+function bindGeometryTable(node) {
+  node.querySelectorAll('[data-geom]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.geomKind = btn.dataset.geom;
+      renderGeometryTable();
+    });
+  });
+  // 绑在 tbody 上：行是整批 innerHTML 换掉的，绑行本身会在切换标签后失效
+  const tbody = node.querySelector('#geom-rows');
+  tbody.addEventListener('click', (ev) => {
+    const row = ev.target.closest('tr.geom-row');
+    if (row) selectGeometryRow(row);
+  });
+  tbody.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    const row = ev.target.closest('tr.geom-row');
+    if (!row) return;
+    ev.preventDefault();
+    selectGeometryRow(row);
+  });
+}
+
+/**
+ * 把「几何参数」区挂到结果面板上。
+ *
+ * 位置：结论横幅（和扫描曲线）之后、其它概要信息之前 —— 这是用户最常看的
+ * 一张表，不能像结论横幅那次一样被推到滚动区下面（"DOM 里有但看不见"）。
+ *
+ * 数据是**后端算的**：键长/键角/二面角用的是与引擎同一套、已经校准过的几何
+ * 实现（`qcgui/model/geometry.py`），前端不另写一份数学 —— 两边各算一遍
+ * 迟早会不一致。这里只负责把哪套几何发过去、把结果画出来。
+ */
+async function loadGeometrySection() {
+  const body = $('result-body');
+  const old = document.getElementById('geometry-section');
+  const source = geometryForTable();
+  if (!source) {
+    if (old) old.remove();
+    return;
+  }
+  const signature = geometrySignature(source);
+  // 同一套几何已经算过、表还在 → 不重复请求（selectJob 里结果几何会被设两次）
+  if (old && state.geomSig === signature && old.querySelector('tr.geom-row')) return;
+
+  const token = ++state.geomToken;
+  if (old) old.remove();
+  const holder = document.createElement('div');
+  holder.innerHTML = geometryShell(source);
+  const node = holder.firstElementChild;
+  // 有结果时紧跟结论横幅；只有载入的结构时，让"选中一个任务查看结果"那句
+  // 留在上面（先说明面板是干什么的，再给表），不要抢到它前面去
+  const anchor = body.querySelector('.res-verdict, .res-warning')
+    || body.querySelector('p.empty');
+  if (anchor) anchor.after(node);
+  else body.prepend(node);
+  bindGeometryTable(node);
+
+  let data;
+  try {
+    data = await api('/api/geometry/parameters', {
+      method: 'POST',
+      body: JSON.stringify({ symbols: source.symbols, coords: source.coords }),
+    });
+  } catch (err) {
+    // 明确报出来，而不是留一块空表 —— "点了没反应"是本项目最不想要的
+    node.querySelector('#geom-rows').innerHTML =
+      `<tr class="geom-none"><td colspan="3">几何参数计算失败：${esc(err.message)}</td></tr>`;
+    logLine('✖ 几何参数计算失败：' + err.message, 'l-err');
+    return;
+  }
+  // 期间用户可能已经切到别的任务（同 F2：过期的响应必须丢掉，
+  // 否则面板里会出现另一个任务的键长）
+  if (token !== state.geomToken) return;
+  state.geometry = data;
+  state.geomSource = source;
+  state.geomSig = signature;
+  renderGeometryTable();
+}
+
 /**
  * 键级分析（Multiwfn）—— 补上"化学解释"这块能力。
  *
@@ -1880,9 +2280,10 @@ function renderBondOrders(data) {
 /**
  * 把键级区挂到结果面板上。
  *
- * 插入顺序必须是 **结论横幅 → 扫描曲线 → 键级**：
- * 结论横幅永远最上面（那是"这个结果能不能用"），扫描曲线是扫描任务的头号结果。
- * 这两个顺序都踩过坑（结论横幅被扫描区挤到滚动区下面），所以这里显式避让。
+ * 插入顺序必须是 **结论横幅 → 扫描曲线 → 几何参数 → 键级**：
+ * 结论横幅永远最上面（那是"这个结果能不能用"），扫描曲线是扫描任务的头号结果，
+ * 几何参数表是最常看的通用信息。
+ * 这几个顺序都踩过坑（结论横幅被扫描区挤到滚动区下面），所以这里显式避让。
  */
 function loadBondOrderSection(jobId) {
   const body = $('result-body');
@@ -1892,7 +2293,8 @@ function loadBondOrderSection(jobId) {
   const holder = document.createElement('div');
   holder.innerHTML = bondOrderSection();
   const node = holder.firstElementChild;
-  const anchor = document.getElementById('scan-section')
+  const anchor = document.getElementById('geometry-section')
+    || document.getElementById('scan-section')
     || body.querySelector('.res-verdict, .res-warning');
   if (anchor) anchor.after(node);
   else body.prepend(node);

@@ -126,6 +126,12 @@
       this.atomValues = null;
       this.bondValues = null;
 
+      // 高亮（几何参数表点一行时用）：0 起下标集合。null 表示没有高亮。
+      this.highlight = null;
+      // 上一次 render 真正画出了几个高亮环。给测试/排查用 ——
+      // "数据到位"和"屏幕上真画出来"是两回事（本项目栽过三次）。
+      this.highlightDrawCount = 0;
+
       this.rotX = -0.35;
       this.rotY = 0.6;
       this.zoom = 1;
@@ -153,6 +159,8 @@
       this.charges = data.charges ? data.charges.slice() : null;
       this.frames = [];
       this.framePos = 0;
+      // 换了分子，旧的高亮下标就没有意义了（可能指向不存在的原子）
+      this.highlight = null;
       this._prepare();
       this._schedule();
     }
@@ -168,6 +176,7 @@
       this.symbols = this.frames[0].symbols.slice();
       this.coords = this.frames[0].coords.map((c) => c.slice());
       this.framePos = 0;
+      this.highlight = null;      // 同上：换分子就作废旧下标
       this._prepare();
       if (this.onFrame) this.onFrame(0, this.frames[0]);
       this._schedule();
@@ -217,6 +226,29 @@
     setLabels(on) {
       this.showLabels = !!on;
       this._schedule();
+    }
+
+    /**
+     * 高亮一组原子（下标 **0 起**，与 ORCA 输入、几何参数表一致）。
+     *
+     * 用途：几何参数表里点一行 → 在 3D 里指出"就是这几个原子"。
+     *
+     * 只加亮、**不把别的原子画淡** —— 用户要看的恰恰是这几个原子在分子的
+     * 什么位置，把其余部分变暗等于把参照系也拿掉了。
+     * 传空数组/非法值即清除；越界的下标直接丢掉（宁可少画，也不要画错原子）。
+     */
+    highlightAtoms(atoms) {
+      const list = (atoms || [])
+        .map((i) => Number(i))
+        .filter((i) => Number.isInteger(i) && i >= 0 && i < this.symbols.length);
+      this.highlight = list.length ? new Set(list) : null;
+      this._schedule();
+      return list.length;
+    }
+
+    /** 当前被高亮的原子（升序）。测试和"点了没反应"的排查都要用到。 */
+    get highlightedAtoms() {
+      return this.highlight ? Array.from(this.highlight).sort((a, b) => a - b) : [];
     }
 
     setAutoRotate(on) {
@@ -454,6 +486,7 @@
           label: this.symbols[i] + i,
           // 数值标注要用它把电荷/键级对到原子上（0 起）
           index: i,
+          highlight: !!(this.highlight && this.highlight.has(i)),
         });
       }
       const bondW = this.style === 'wireframe' ? 0.045
@@ -489,6 +522,35 @@
       // 画面上却一个数字都没有 —— **数据对 ≠ 用户看得见**（截图才发现）。
       if (this.showLabels || this.valueMode) this._drawLabels(ctx, prims);
       if (this.showAxes) this._drawAxes(ctx, pr);
+
+      // 高亮环**最后画**：环要在所有球/棍之上，否则"被前面的原子挡住"
+      // 看起来就跟"点了没反应"一样（本项目正是这类"DOM 里有、屏幕上没有"）。
+      this.highlightDrawCount = 0;
+      if (this.highlight && this.highlight.size) {
+        const rings = prims.filter((p) => p.kind === 'atom' && p.highlight);
+        rings.sort((p, q) => p.z - q.z);
+        for (const p of rings) this._drawHighlight(ctx, p);
+        this.highlightDrawCount = rings.length;
+      }
+    }
+
+    /** 画一个高亮环（青色的发光圈）。画法要够显眼：深色背景 + 彩色球面上，
+        一条细线根本看不出来（截图确认过），所以外面再套一圈半透明的宽光晕。 */
+    _drawHighlight(ctx, p) {
+      const [x, y] = p.screen;
+      const r = Math.max(7, p.radius + 4 * p.screen[3]);
+      ctx.save();
+      ctx.strokeStyle = 'rgba(34, 211, 238, 0.30)';
+      ctx.lineWidth = Math.max(7, r * 0.24);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = Math.max(2, r * 0.10);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
     }
 
     _drawBond(ctx, p) {

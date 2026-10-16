@@ -4,6 +4,7 @@ from .geometry import (
     ScanSpec,
     connectivity_change,
     dihedral,
+    geometry_parameters,
     measure,
     parse_scan_blocks,
     scan_warnings,
@@ -26,6 +27,6 @@ __all__ = [
     "MIN_ATOM_GAP", "MAX_COORD_ANGSTROM",
     "SEVERITY_BLOCKING", "SEVERITY_MAJOR", "SEVERITY_MINOR",
     "VERDICT_OK", "VERDICT_LIMITED", "VERDICT_UNUSABLE",
-    "ScanSpec", "connectivity_change", "dihedral", "measure",
+    "ScanSpec", "connectivity_change", "dihedral", "geometry_parameters", "measure",
     "parse_scan_blocks", "scan_warnings",
 ]

@@ -452,6 +452,182 @@ def test_page_loads_without_javascript_errors():
     print("    首屏渲染完整，下拉已由 JS 填充")
 
 
+#: 过氧化氢构型：3 根键、2 个键角、**1 个二面角**（H–O–O–H = 90°）。
+#: 特意选它，因为二面角最容易写反（差 180°），而 90° 一眼能看出对错。
+GEOM_FIXTURE = {
+    "symbols": ["O", "O", "H", "H"],
+    "coords": [[0.0, 0.0, 0.0], [0.0, 0.0, 1.45], [0.97, 0.0, 0.0], [0.0, 0.97, 1.45]],
+}
+
+
+def create_geometry_fixture_job(server: Server, job_id: str = "20200101-000000-geomtest") -> str:
+    """造一个"已完成、带结果几何"的任务（不跑 ORCA），供几何参数表测试用。
+
+    结果几何是 :data:`GEOM_FIXTURE`。返回任务 id。
+    """
+    from qcgui.model import JobSpec, JobType, Molecule, Result
+
+    body = "\n".join(f"{s} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}"
+                     for s, c in zip(GEOM_FIXTURE["symbols"], GEOM_FIXTURE["coords"]))
+    molecule = Molecule.from_xyz(
+        f"{len(GEOM_FIXTURE['symbols'])}\nh2o2\n{body}\n", name="h2o2")
+    spec = JobSpec(molecule=molecule, job_type=JobType.OPT, method="HF", basis="STO-3G")
+    server.manager.store.create(spec, job_id=job_id)
+    job_dir = server.manager.store.job_dir(job_id)
+    (job_dir / "jobspec.json").write_text(spec.canonical_json(), encoding="utf-8")
+    Result(status="done", job_type="opt", method="HF",
+           geometry=dict(GEOM_FIXTURE, units="angstrom"),
+           job_dir=str(job_dir)).save(job_dir / "result.json")
+    # 索引状态也要改成 done（结果面板与"运行"按钮看的是索引状态）
+    server.manager.store.update(job_id, status="done", final_energy=-1.0)
+    return job_id
+
+
+def _dump_geomtest(url: str, timeout: int = 180) -> str:
+    """跑无头浏览器，取回 __GEOMTEST__ 那段文本。"""
+    chrome = _browser()
+    profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
+    proc = subprocess.run(
+        [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+         "--window-size=1600,1000", "--virtual-time-budget=30000",
+         f"--user-data-dir={profile}", "--dump-dom", url],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+    )
+    dom = proc.stdout or ""
+    match = re.search(r"__GEOMTEST__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到几何参数表测试输出\nDOM 片段:\n{dom[:800]}"
+    return match.group(1)
+
+
+def _print_diagnostics(text: str) -> None:
+    """打印几何参数测试的诊断行（``a | b | c`` 转成多行）。
+
+    为什么不能直接 ``print``：这些行里有 ``Å``/``°``，而 Windows 控制台默认是
+    GBK —— 直接打印会抛 ``UnicodeEncodeError``。实测：那会让**一条本该通过的
+    测试在断言之前就 ERROR 掉**（``pytest -s`` 时必然发生），看起来像功能坏了。
+    诊断输出降级成替代字符就行，**断言才是测试的正文**。
+    """
+    block = "    " + "\n    ".join(p.strip() for p in text.split(" | "))
+    try:
+        print(block)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(block.encode(encoding, "replace").decode(encoding, "replace"))
+
+
+def test_geometry_table_in_real_browser():
+    """「几何参数」表必须在真页面里渲染出来、能点、能高亮 —— 而且看得见。
+
+    本项目已经三次栽在"DOM 里有但屏幕上没有"（结论横幅被挤到滚动区下面、
+    3D 数值没画出来）。所以这里同时断言：
+    * 行数与值真的对（3 键长 / 2 键角 / 1 个 90° 二面角，按值升序）
+    * 区块在**可见区**内（getBoundingClientRect），且排在结论横幅之后
+    * 点一行之后查看器里高亮的原子数与行里的原子一致，
+      并且 ``highlightDrawCount`` 证明高亮环**真的画出来了**
+    * 切标签会清掉旧高亮；再点同一行能取消
+    """
+    from qcgui.model.geometry import geometry_parameters
+
+    server = Server()
+    try:
+        job_id = create_geometry_fixture_job(server)
+        text = _dump_geomtest(f"{server.base}/?nosse=1&job={job_id}&geomtest=1")
+    finally:
+        server.close()
+
+    _print_diagnostics(text)
+
+    # 期望值直接来自纯几何层 —— 浏览器里看到的必须和后端算的一致
+    expected = geometry_parameters(GEOM_FIXTURE["symbols"], GEOM_FIXTURE["coords"])
+    assert len(expected["bonds"]) == 3 and len(expected["angles"]) == 2
+    assert len(expected["dihedrals"]) == 1
+
+    assert "ERROR" not in text, text
+    assert "FAIL" not in text, text
+    assert "GEOMTEST RESULT: PASS" in text, text
+    assert "source=result" in text, "用了任务结果的几何（优先来源）"
+    assert "counts=bonds:3,angles:2,dihedrals:1" in text, text
+    # 可见 + 位置：结论横幅永远在最上面，几何参数紧跟其后（不能被推到滚动区下面）
+    assert "visible=PASS" in text, text
+    assert "after_verdict=PASS" in text, text
+    # 面板里的顺序：结论横幅第一、几何参数紧跟其后（不能被推到滚动区下面）
+    order_line = next(p.strip() for p in text.split(" | ") if p.strip().startswith("order="))
+    order = order_line.split("=", 1)[1].split(",")
+    assert order[0].startswith("res-verdict"), order
+    assert order[1] == "geometry-section", order
+    # 三张表：行数与标题上的计数都要对
+    assert "bonds_rows=3 sorted=PASS" in text, text
+    assert "angles_rows=2 sorted=PASS cleared=PASS" in text, text
+    assert "dihedrals_rows=1" in text, text
+    assert "tab_counts=bonds:3 angles:2 dihedrals:1" in text, text
+    # 按值排序：第一行必须是最小的键长、最后一行是最大的
+    assert "bonds_first=O0–H2=0.970Å" in text, text
+    assert "bonds_last=O0–O1=1.450Å" in text, text
+    # 点一行 → 高亮涉及的原子（2 个），并且真的画了 2 个高亮环
+    assert "pick=O0–H2 highlight=0,2 n=2" in text, text
+    assert "draws_forced=2" in text, text
+    # 键角 3 个原子、二面角 4 个原子：数值也必须是算出来的那个
+    assert "angle_pick=" in text and "n=3 drawn=3" in text, text
+    assert "dihedral_pick=H2–O0–O1–H3 value=90.00 n=4 drawn=4" in text, text
+    assert "toggle_off=PASS" in text, text
+    # 表与 3D 错位时（拖过扫描曲线 / 停在轨迹某帧）点一行：必须先把查看器切到
+    # 表的那套几何，高亮才落在正确的原子上 —— 否则就是"高亮指错原子"那类错误
+    mismatch = next(p.strip() for p in text.split(" | ")
+                    if p.strip().startswith("mismatch_switch="))
+    assert "mismatch_switch=PASS" in mismatch and "ok=PASS" in mismatch, mismatch
+    print("    几何参数表在真页面里可用、可见、点击高亮正确")
+
+
+def test_geometry_table_falls_back_to_the_loaded_structure():
+    """没有任务结果时，几何参数表用**当前载入的结构**，并标明来源。
+
+    这条覆盖"数据来源"的第二档。行数/条数不写死 —— 直接和纯几何层
+    对同一个文件算出来的结果比：浏览器 → 接口 → geometry_parameters
+    整条链必须一致。
+    """
+    import urllib.parse
+
+    from qcgui.model.geometry import geometry_parameters
+
+    server = Server()
+    try:
+        path = server.example_path()
+        text = _dump_geomtest(
+            f"{server.base}/?nosse=1&geomtest=1&load={urllib.parse.quote(path, safe='')}")
+    finally:
+        server.close()
+
+    _print_diagnostics(text)
+
+    symbols, coords = [], []
+    lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    count = int(lines[0].split()[0])
+    for line in lines[2:2 + count]:
+        parts = line.split()
+        symbols.append(parts[0])
+        coords.append([float(x) for x in parts[1:4]])
+    expected = geometry_parameters(symbols, coords)
+
+    assert "ERROR" not in text, text
+    assert "FAIL" not in text, text
+    assert "GEOMTEST RESULT: PASS" in text, text
+    assert "source=structure" in text, "没有任务结果时应当退回当前载入的结构"
+    assert f"atoms={len(symbols)}" in text, text
+    assert (f"counts=bonds:{len(expected['bonds'])}"
+            f",angles:{len(expected['angles'])}"
+            f",dihedrals:{len(expected['dihedrals'])}") in text, text
+    order_line = next(p.strip() for p in text.split(" | ") if p.strip().startswith("order="))
+    assert "geometry-section" in order_line, order_line
+    assert "visible=PASS" in text, text
+    assert f"bonds_rows={len(expected['bonds'])} sorted=PASS" in text, text
+    # 点一行同样要高亮并画出来
+    assert "draws_forced=" in text and "draws_forced=0" not in text, text
+    mismatch = next(p.strip() for p in text.split(" | ")
+                    if p.strip().startswith("mismatch_switch="))
+    assert "ok=PASS" in mismatch, mismatch
+    print(f"    {Path(path).name}: 表由当前载入的结构生成，条数与后端一致")
+
+
 # ------------------------------------------------------------------ 脚本模式
 
 def _main() -> int:
