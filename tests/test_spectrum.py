@@ -67,6 +67,24 @@ FREQS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 INTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         12.4, 5.1, 31.7, 14.9, 120.3, 42.8, 88.6, 25.3, 79.1]
 
+# ------------------------------------------------------------------ 真实 ORCA 实测值
+#
+# 2026-10-16 本机实跑（HF/STO-3G 水，``%pal nprocs 1``，D:\orca1\orca.exe，exit=0），
+# 用来给"频率从哪来、数值对不对"留一份真凭据，而不是只信自己造的夹具：
+#
+# * ``THERMOCHEMISTRY_Energies[0].FREQ``（``orca_2json probe.gbw -property``
+#   产出的 ``probe.property.json``，即引擎层真正读的那份结构化输出）
+#   = 6 个 0.00 + 2043.234 / 4488.351 / 4790.412 cm⁻¹ —— 与 ``probe.out`` 里
+#   ``VIBRATIONAL FREQUENCIES`` 表逐行一致（数值未做任何换算或缩放）；
+# * 同一份 ``.out`` 的 ``IR SPECTRUM`` 表给出强度 11.42 / 37.32 / 19.93 km/mol。
+#   **这三个数只存在于人读文本里**：结构化输出里既没有 ``ntens`` 也没有 ``IR``
+#   键（实测 ``probe.property.json`` 顶层只有 Calculation_Info / Calculation_Status
+#   / Calculation_Timings / Geometries）。所以引擎层**不能**在不违反"结果只从
+#   结构化输出取"的前提下补上强度 —— 详见报告。
+ORCA_WATER_FREQS = [0.0] * 6 + [2043.2341884, 4488.3510718, 4790.4118223]
+#: 只在 .out 文本里出现过的那三个强度，用来验"有强度"时的口径（夹具用）。
+ORCA_WATER_INTS = [11.42, 37.32, 19.93]
+
 
 class _Skipped(Exception):
     pass
@@ -472,6 +490,72 @@ def _json_get(base: str, path: str):
         return json.loads(res.read().decode("utf-8"))
 
 
+def test_real_orca_water_frequencies_flow_through():
+    """**真实 ORCA 输出**（HF/STO-3G 水）走完"频率 → 峰 → 波数窗口"这条链。
+
+    这条测试的价值在于数据是真的：上面 ``ORCA_WATER_FREQS`` 抄自本机实跑的
+    ``probe.property.json``。它同时钉住三件容易悄悄跑偏的事：
+
+    1. 6 个平动/转动 0 模态被剔掉，只剩 3 个真振动（水是非线性的，正好 3N-6=3）；
+    2. 频率数值**不被改写**（HF/STO-3G 就是偏大，2043/4488/4790 —— 不许因为
+       "看着不像文献值"就顺手缩放，协议硬规矩 5）；
+    3. 窗口必须把 4790 这个大数包进去（只按默认 0~4000 画会把 OH 伸缩切掉）。
+    """
+    peaks, has_intensity = peaks_from_frequencies(ORCA_WATER_FREQS, None)
+    assert has_intensity is False
+    assert len(peaks) == 3, peaks
+    assert [round(p, 1) for p, _ in peaks] == [2043.2, 4488.4, 4790.4]
+    # 0 模态一个都不许漏进来
+    assert all(abs(p) > 1e-6 for p, _ in peaks)
+
+    x_min, x_max = default_range(peaks)
+    assert x_min <= 2043.23 and x_max >= 4790.41, (x_min, x_max)
+
+    # 把 .out 里那三个真实强度按位给上：最强峰必须是 4488.35（37.32 km/mol）
+    with_ints, has_intensity2 = peaks_from_frequencies(
+        ORCA_WATER_FREQS, [0.0] * 6 + ORCA_WATER_INTS
+    )
+    assert has_intensity2 is True
+    best = strongest_index(with_ints)
+    assert with_ints[best][0] == ORCA_WATER_FREQS[-2]      # 4488.3510718，原值不许被改写
+    assert with_ints[best][1] == 37.32
+    assert best == 1, best
+    print(f"    真实 ORCA 水：0 模态 6 个已剔，3 个振动 "
+          f"{[round(p, 1) for p, _ in peaks]}，窗口 {x_min} ~ {x_max}"
+          f"，最强峰 {with_ints[best][0]:.1f}")
+
+
+def test_missing_ir_intensity_downgrades_the_task_verdict():
+    """无强度谱 → 任务结论必须是"可用但有限制"，**不能是绿色可用**（硬规矩 3）。
+
+    为什么这条比"界面显示了一句提示"更重要：用户不读提示，只看那个绿点。
+    ORCA 的 IR 强度只在 ``.out`` 的 ``IR SPECTRUM`` 定宽表里，结构化输出
+    （``orca_2json`` 的 ``THERMOCHEMISTRY_Energies``）里没有，所以真实频率任务
+    一律拿不到强度 —— 这时候一条**等高峰谱**很容易被读成真实红外强度。
+
+    判据只降级到 ``limited``（不是 ``unusable``）：频率、热化学、虚频判断都还是
+    有效的，坏掉的只是"峰高"这一项，说"结果不可用"同样是假话。
+    """
+    server = Server()
+    try:
+        server.add_job("20200101-000000-verdictreal", FREQS, INTS)
+        server.add_job("20200101-000001-verdictnone", FREQS)
+
+        real = _json_get(server.base, "/api/jobs/20200101-000000-verdictreal")
+        assert real["result"]["verdict"] == "ok", real["result"]["verdict_reason"]
+
+        plain = _json_get(server.base, "/api/jobs/20200101-000001-verdictnone")
+        res = plain["result"]
+        assert res["verdict"] == "limited", res["verdict"]
+        assert res["verdict_label"] == "结果可用，但有限制", res["verdict_label"]
+        assert "无强度数据" in res["verdict_reason"], res["verdict_reason"]
+        assert "频率与热化学本身有效" in res["verdict_reason"], res["verdict_reason"]
+        print(f"    有强度 → {real['result']['verdict']}；"
+              f"无强度 → {res['verdict']}（{res['verdict_reason']}）")
+    finally:
+        server.close()
+
+
 def test_api_payload_reports_intensity_and_imaginary():
     """``/spectrum`` 的数据：峰表、虚频标记、强度有无、最强峰。"""
     server = Server()
@@ -679,6 +763,8 @@ def test_spectrum_section_shows_up_in_a_real_browser():
             assert key in text, f"缺少 {key}：{text}"
         assert "natural=880x450" in text, text
         assert "rows=9 imag_rows=1" in text, text
+        # 有真实强度 → 结论仍是绿色可用（不能把好任务误判成"有限制"）
+        assert "verdict_class=ok" in text, text
         ink = float(re.search(r"ink=([\d.]+)%", text).group(1))
         assert ink > 1.0, f"图上的非白像素只有 {ink}% —— 多半是空白图"
 
@@ -689,8 +775,52 @@ def test_spectrum_section_shows_up_in_a_real_browser():
         assert "imag_marked=PASS" in plain, plain
         assert "strongest_marked=NONE" in plain, plain
         assert "无强度数据" in plain, f"界面上没有写明是无强度谱：{plain}"
+        # 真浏览器里复核结论降级：横幅必须是"有限制"，理由就是无强度数据
+        assert "verdict_class=limited" in plain, plain
+        assert 'verdict_why="无强度数据' in plain, plain
         assert "n_imaginary" not in plain
-        print("    有强度任务：标了最强峰；无强度任务：写明无强度谱、不标最强峰")
+        print("    有强度任务：标了最强峰、结论可用；"
+              "无强度任务：写明无强度谱、不标最强峰、结论降级为 limited")
+    finally:
+        server.close()
+
+
+def _run_spectrum_fail_hook(base: str, job_id: str, timeout: int = 240) -> str:
+    """在无头浏览器里跑"谱图加载失败兜底"钩子，取回测试输出。"""
+    chrome = _browser()
+    profile = Path(tempfile.mkdtemp(prefix="qcgui_specfail_chrome_"))
+    url = f"{base}/?nosse=1&job={job_id}&sptestfail={job_id}"
+    proc = subprocess.run(
+        [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+         "--window-size=1600,1200", "--virtual-time-budget=30000",
+         f"--user-data-dir={profile}", "--dump-dom", url],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+    )
+    dom = proc.stdout or ""
+    match = re.search(r"__SPTF__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到兜底测试输出（页面可能没跑起来）\nDOM 片段:\n{dom[:800]}"
+    return match.group(1)
+
+
+def test_spectrum_image_failure_is_explained_in_a_real_browser():
+    """硬规矩 3：谱图画不出来的时候，用户看到的必须是**原因**，不是一个破图。
+
+    刻意不依赖本机有没有 Pillow（这台机器现在就没有）：把 ``<img>`` 指到一条
+    越界的 FWHM 上，服务端必然 400 并给出中文原因。要验三件事：
+    1. 界面上出现了那句原因（而不是空白或破图图标）；
+    2. 破图被藏起来了；
+    3. **峰值表还在** —— 图画不出来不该把频率数字一起吞掉，那是用户真正要的结果。
+    """
+    server = Server()
+    try:
+        server.add_job("20200101-000000-specrealfail", FREQS, INTS)
+        text = _run_spectrum_fail_hook(server.base, "20200101-000000-specrealfail")
+        print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+        assert "ERROR" not in text, text
+        assert "explained=PASS" in text, text
+        assert "img_hidden=PASS" in text, text
+        assert "table_kept=PASS" in text, text
+        assert "半高全宽" in text, text
     finally:
         server.close()
 

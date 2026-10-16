@@ -14,6 +14,11 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+#: "谱图没有真实强度"这句话**只有一份**：界面上的提示、PNG 图上的警告、任务结论的
+#: 理由全都用它。同一件事写三遍，早晚会分叉，而这句话正是"别把峰高读成强度"的
+#: 唯一提醒。
+from .spectrum import NO_INTENSITY_NOTE
+
 #: 状态取值
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
@@ -165,6 +170,23 @@ class Result:
         return self.status == STATUS_DONE
 
     @property
+    def lacks_ir_intensity(self) -> bool:
+        """频率任务，但拿不到 IR 强度 → 谱图只有峰位、没有峰高。
+
+        为什么这件事必须影响**任务结论**（而不只是画图）：ORCA 的 IR 强度只写在
+        ``.out`` 的 ``IR SPECTRUM`` 定宽表里，结构化输出（``orca_2json`` 的
+        ``THERMOCHEMISTRY_Energies``）里**没有**这个字段。按项目铁律 2
+        （结果只从结构化输出取），本轮没有去解析文本，所以 ``ir_intensities``
+        实际是空的，画出来的是一条**等高峰谱**。用户很容易把那些等高的峰读成
+        真实红外强度 —— 那就是"算错了还显示绿点"。所以结论降级为"可用但有限制"。
+
+        空 ``frequencies``（非频率任务）不算：没有谱可画，谈不上这个限制。
+        长度对不上按"没有"处理，与 :func:`qcgui.model.spectrum.peaks_from_frequencies`
+        的口径一致（数据不齐时宁可不画强度，也不要错位）。
+        """
+        return bool(self.frequencies) and len(self.ir_intensities) != len(self.frequencies)
+
+    @property
     def verdict(self) -> str:
         """这个结果能不能用：``ok`` / ``limited`` / ``unusable``。
 
@@ -180,6 +202,9 @@ class Result:
         if SEVERITY_BLOCKING in severities:
             return VERDICT_UNUSABLE
         if severities & {SEVERITY_MAJOR, SEVERITY_MINOR}:
+            return VERDICT_LIMITED
+        if self.lacks_ir_intensity:
+            # 频率/热化学本身没问题，坏的是"谱图峰高"这一项 —— 有限制，不是可用
             return VERDICT_LIMITED
         if self.warnings:
             # 有警告但没标严重度（老的结果文件）：保守处理
@@ -206,6 +231,10 @@ class Result:
         major = [i for i in self.issues if i.severity == SEVERITY_MAJOR]
         if major:
             return major[0].message
+        if self.lacks_ir_intensity:
+            # 比 minor/warnings 更该先说：它直接决定"图上那条谱能不能按强度读"。
+            # 同时说清哪些部分仍然有效，免得用户以为整个任务白算了。
+            return f"{NO_INTENSITY_NOTE}（频率与热化学本身有效）"
         minor = [i for i in self.issues if i.severity == SEVERITY_MINOR]
         if minor:
             return f"附带分析有缺失（{len(minor)} 项），主结果本身没受影响"

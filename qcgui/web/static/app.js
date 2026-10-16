@@ -383,6 +383,9 @@ async function applyUrlParams() {
   if (params.get('sptest')) {
     await runSpectrumUiTest(params.get('sptest'));
   }
+  if (params.get('sptestfail')) {
+    await runSpectrumFailUiTest(params.get('sptestfail'));
+  }
 }
 
 /**
@@ -500,6 +503,10 @@ async function runSpectrumUiTest(jobId) {
     const banner = body.querySelector('.res-verdict, .res-warning');
     lines.push(`after_verdict=${banner && (banner.compareDocumentPosition(section)
       & Node.DOCUMENT_POSITION_FOLLOWING) ? 'PASS' : 'FAIL'}`);
+    // 结论本身也要抓下来：无强度谱**必须是"可用但有限制"**，不能是绿色可用
+    const why = banner ? banner.querySelector('.res-verdict-why') : null;
+    lines.push(`verdict_class=${banner ? banner.className.replace('res-verdict', '').trim() : '—'}`
+      + ` verdict_why="${why ? why.textContent.trim() : ''}"`);
 
     // ---- 图：真的加载出来了吗 ----
     const img = section.querySelector('#spectrum-img');
@@ -573,6 +580,63 @@ async function runSpectrumUiTest(jobId) {
     lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
   }
   out.textContent = '__SPTEST__' + lines.join(' | ') + '__END__';
+}
+
+/**
+ * 真浏览器验证**谱图加载失败的兜底**（硬规矩 3：它失败的时候，用户看到的是什么）。
+ *
+ * 做法刻意不依赖"本机有没有装 Pillow"：把 ``#spectrum-img`` 的 src 换成一条
+ * **注定失败**的谱图 URL（``fwhm=99999`` → 服务端 400 + 中文原因），然后看
+ * 界面上出现的是不是那句能读懂的原因，而不是一个破图图标。
+ *
+ * 配合 `?job=<频率任务id>&sptestfail=<同一个id>`。
+ */
+async function runSpectrumFailUiTest(jobId) {
+  const out = document.createElement('pre');
+  out.id = 'sptestfail-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const note = () => {
+    const el = document.querySelector('#spectrum-img-error');
+    return el && !el.hidden ? el.textContent.trim() : '';
+  };
+  try {
+    await selectJob(jobId);
+    let img = null;
+    for (let i = 0; i < 100 && !img; i++) {
+      await sleep(200);
+      img = document.querySelector('#spectrum-img');
+    }
+    if (!img) {
+      lines.push('img=FAIL 谱图区的 <img> 都没出现');
+      out.textContent = '__SPTF__' + lines.join(' | ') + '__END__';
+      return;
+    }
+    lines.push('img=PASS');
+
+    // 故意指到一条越界的半高全宽上：服务端必然 400，并给出一句中文原因。
+    // 加个时间戳避免浏览器复用失败的缓存条目。
+    img.style.display = '';
+    img.setAttribute('src', '/api/jobs/' + encodeURIComponent(jobId)
+      + '/spectrum.png?kind=gaussian&fwhm=99999&t=' + Date.now());
+    let msg = '';
+    for (let i = 0; i < 60 && !msg; i++) {
+      await sleep(200);
+      msg = note();
+    }
+    lines.push(`fail_msg="${msg}"`);
+    lines.push(`explained=${msg.indexOf('半高全宽') >= 0 ? 'PASS' : 'FAIL'}`);
+    lines.push(`img_hidden=${img.style.display === 'none' ? 'PASS' : 'FAIL'}`);
+    // 峰值表不该因为图画不出来就消失 —— 频率数字仍然是有用的结果
+    const rows = document.querySelectorAll('#spectrum-table tbody tr');
+    lines.push(`table_kept=${rows.length > 0 ? 'PASS' : 'FAIL'} rows=${rows.length}`);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__SPTF__' + lines.join(' | ') + '__END__';
 }
 
 /**
@@ -2148,11 +2212,14 @@ function spectrumSection(data) {
       <a class="link" href="${esc(data.png_url)}" target="_blank" rel="noopener">新窗口看大图</a>
       <span class="muted" id="spectrum-hint">改线型或宽度会重画；展宽<b>不移动峰位</b></span>
     </div>
-    <a href="${esc(data.png_url)}" target="_blank" rel="noopener"
-      title="点开在新窗口看原始尺寸（结果栏较窄，图上的小字要放大才看得清）">
-      <img id="spectrum-img" class="spectrum-img" alt="红外谱图"
-        src="${esc(data.png_url)}">
-    </a>
+    <div id="spectrum-figure">
+      <a href="${esc(data.png_url)}" target="_blank" rel="noopener"
+        title="点开在新窗口看原始尺寸（结果栏较窄，图上的小字要放大才看得清）">
+        <img id="spectrum-img" class="spectrum-img" alt="红外谱图"
+          src="${esc(data.png_url)}">
+      </a>
+      <p class="hint warn" id="spectrum-img-error" hidden></p>
+    </div>
     ${note}${imagNote}
     <div class="table-scroll spec-table-scroll">
       <table class="data" id="spectrum-table">
@@ -2193,6 +2260,10 @@ async function loadSpectrumSection(jobId) {
       const redraw = () => draw(sel.value, inp.value);
       sel.addEventListener('change', redraw);
       inp.addEventListener('change', redraw);
+      // 图是后端画的：没装 Pillow → 503，参数越界 → 400。浏览器只会给一个破图
+      // 图标，用户根本不知道出了什么事（这正是硬规矩 3 要防的"坏了还像正常"）。
+      const img = body.querySelector('#spectrum-img');
+      if (img) img.addEventListener('error', () => spectrumImageFailed(body, img));
     } catch (err) {
       // 失败要说清楚为什么（不是频率任务 / 没装 Pillow / 参数不合法），
       // 不要留一个空白区让人以为"谱图就是这样"
@@ -2201,6 +2272,35 @@ async function loadSpectrumSection(jobId) {
   };
 
   await draw(state.spectrumKind, state.spectrumFwhm);
+}
+
+/**
+ * 谱图 PNG 加载失败时的兜底：**把服务端的原因原话摆出来，别留一个破图**。
+ *
+ * 为什么必须要这一段：PNG 由后端 Pillow 画（Pillow 是**可选依赖**，见
+ * requirements.txt / doctor.py）。没装 Pillow 时 ``/spectrum.png`` 返回 503
+ * 加一句中文说明，参数越界返回 400 —— 但浏览器看不懂这些，它只会在 ``<img>``
+ * 上画一个破图图标。用户看到"一块坏掉的图"，既不知道是没装依赖、也不知道
+ * 频率数字其实完好。最坏的 bug 不是算错，是坏了还显示得像正常（硬规矩 3）。
+ *
+ * 所以这里把同一个 URL 的 JSON 错误取回来显示；取不到就退到一句通用说明。
+ * 保留 ``<img>`` 本身（只隐藏）：重画时它还要用。
+ */
+async function spectrumImageFailed(body, img) {
+  const box = body.querySelector('#spectrum-figure');
+  const err = body.querySelector('#spectrum-img-error');
+  if (!box || !err) return;
+  img.style.display = 'none';
+  let why = '谱图 PNG 画不出来（服务端没给出原因）';
+  try {
+    const res = await fetch(img.getAttribute('src'), {
+      headers: { Accept: 'application/json' },
+    });
+    const data = await res.json();           // 拿到的是 PNG 就会抛，落到 catch
+    if (data && data.error) why = data.error;
+  } catch (e) { /* 拿不到原因，就用上面那句通用的 */ }
+  err.textContent = `红外谱图不可用：${why}`;
+  err.hidden = false;
 }
 
 async function loadScanSection(jobId) {
