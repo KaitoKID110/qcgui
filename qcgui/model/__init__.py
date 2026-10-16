@@ -1,11 +1,16 @@
 """引擎无关的数据模型。"""
 
 from .geometry import (
+    AlignmentError,
     ScanSpec,
+    check_same_elements,
     connectivity_change,
     dihedral,
+    kabsch_align,
     measure,
+    overlay,
     parse_scan_blocks,
+    rmsd,
     scan_warnings,
 )
 from .jobspec import JobSpec, JobType
@@ -28,4 +33,5 @@ __all__ = [
     "VERDICT_OK", "VERDICT_LIMITED", "VERDICT_UNUSABLE",
     "ScanSpec", "connectivity_change", "dihedral", "measure",
     "parse_scan_blocks", "scan_warnings",
+    "AlignmentError", "check_same_elements", "kabsch_align", "overlay", "rmsd",
 ]

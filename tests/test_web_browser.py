@@ -373,6 +373,86 @@ def test_bond_order_ui_in_real_browser():
     print("    键级界面在真页面里可用、可见、顺序正确")
 
 
+def test_overlay_two_structures_in_real_browser():
+    """结构叠加 RMSD 必须在真页面里点得动、看得见。
+
+    本项目已经三次栽在"DOM 里有但屏幕上没有"，所以这里除了读数，还要证明
+    **两个结构真的同时画在画布上**：
+
+    * 数画布实际发出的 ``arc`` 调用（每个原子一个球）—— 叠加后必须等于
+      "主结构原子数 + 被叠加结构原子数"
+    * 比较开启叠加前后的画布像素 —— 画面必须真的变了
+    * 两个结构的投影点都要落在画布可见区内
+    * 两个 RMSD（对齐前 / 对齐后）都要出现在面板和画布图例里
+
+    用料：同一个分子绕 z 轴 90° + 平移 —— 已知变换，所以对齐后必须 ≈ 0。
+    """
+    from qcgui.model import JobSpec, JobType, Molecule, Result
+
+    symbols = ["C", "O", "H", "N", "H", "C"]
+    coords = [[0.0, 0.0, 0.0], [1.21, 0.02, -0.31], [-0.55, 0.94, 0.12],
+              [0.35, -1.15, 0.63], [1.72, 0.51, 0.44], [-1.30, -0.42, 0.10]]
+    # 绕 z 轴 90°（x' = -y, y' = x）再平移 (1, -2, 3.5)
+    moved = [[-c[1] + 1.0, c[0] - 2.0, c[2] + 3.5] for c in coords]
+
+    server = Server()
+    try:
+        ids = []
+        for tag, xyz in (("ovref", coords), ("ovmov", moved)):
+            job_id = f"20200101-000000-{tag}"
+            body = "\n".join(f"{s} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}"
+                             for s, c in zip(symbols, xyz))
+            molecule = Molecule.from_xyz(f"{len(symbols)}\n{tag}\n{body}\n", name=tag)
+            spec = JobSpec(molecule=molecule, job_type=JobType.OPT,
+                           method="HF", basis="STO-3G")
+            server.manager.store.create(spec, job_id=job_id)
+            job_dir = server.manager.store.job_dir(job_id)
+            (job_dir / "jobspec.json").write_text(spec.canonical_json(), encoding="utf-8")
+            Result(status="done", job_type="opt", method="HF",
+                   geometry={"symbols": symbols, "coords": xyz, "units": "angstrom"},
+                   job_dir=str(job_dir)).save(job_dir / "result.json")
+            server.manager.store.update(job_id, status="done", final_energy=-1.0)
+            ids.append(job_id)
+
+        chrome = _browser()
+        profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
+        url = f"{server.base}/?nosse=1&job={ids[0]}&overtest={ids[1]}"
+        proc = subprocess.run(
+            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+             "--window-size=1500,1000", "--virtual-time-budget=30000",
+             f"--user-data-dir={profile}", "--dump-dom", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        dom = proc.stdout or ""
+    finally:
+        server.close()
+
+    match = re.search(r"__OVERTEST__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到叠加界面测试输出\nDOM 片段:\n{dom[:800]}"
+    text = match.group(1)
+    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+
+    assert "ERROR" not in text, text
+    for key in ("section=PASS", "visible=PASS", "option_present=PASS", "readout=PASS",
+                "legend=PASS", "both_structures_drawn=PASS", "canvas_changed=PASS",
+                "on_screen=PASS", "clear=PASS"):
+        assert key in text, f"{key} 没通过：{text}"
+
+    # 对齐前必须是个明显不为 0 的数（两个文件本来就摆在不同位置）
+    before = re.search(r"rmsd_before=([0-9.eE+-]+)", text)
+    after = re.search(r"rmsd_after=([0-9.eE+-]+)", text)
+    assert before and after, text
+    assert float(before.group(1)) > 1.0, f"对齐前应当明显不为 0：{text}"
+    assert float(after.group(1)) < 1e-6, f"已知旋转 + 平移，对齐后应当 ≈ 0：{text}"
+    # 被叠加的结构也要有自己的成键（虚线键不是空的）
+    bonds = re.search(r"viewer_overlay_bonds=(\d+)", text)
+    assert bonds and int(bonds.group(1)) > 0, f"叠加结构没推断出成键：{text}"
+    # 顺序：叠加区必须排在结论横幅之后（结论横幅永远最上面）
+    assert text.index("res-verdict") < text.index("overlay-section"), \
+        f"叠加区不该排在结论横幅前面：{text}"
+    print("    两个结构同时在画布上，对齐前/后两个 RMSD 都在页面里显示")
+
+
 def test_page_loads_without_javascript_errors():
     """页面首屏不得抛 JS 异常：用一个会渲染失败的探针检测。"""
     server = Server()
