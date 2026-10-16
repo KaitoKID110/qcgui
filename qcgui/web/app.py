@@ -19,6 +19,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
 
@@ -32,6 +33,19 @@ from ..external import (
 )
 from ..jobs import BatchRunner, JobManager
 from ..model import JobSpec, JobType, Molecule, scan_warnings
+from ..model.spectrum import (
+    CM_UNIT,
+    DEFAULT_FWHM,
+    DEFAULT_KIND,
+    DEFAULT_STEP,
+    KIND_LABELS,
+    KINDS,
+    NO_INTENSITY_NOTE,
+    broaden,
+    default_range,
+    peaks_from_frequencies,
+    strongest_index,
+)
 from ..model.trajectory import read_xyz_frames
 from ..orcatools import export_mo_cube, make_molden, probe as probe_orca_tools
 from ..paths import jobs_root
@@ -888,6 +902,152 @@ def create_app(manager: JobManager | None = None) -> Flask:
         if not profile:
             return jsonify({"error": "该任务没有扫描数据（不是势能面扫描）"}), 404
         return jsonify(profile)
+
+    # ------------------------------------------------------------ 红外谱图
+    #
+    # 为什么要有这一对接口：频率任务在界面上原本只有一列数字，看不出谱形，
+    # 而"算完频率直接看红外谱图"正是 GaussView 最常见的用法（也是判断
+    # 过渡态对不对的最快办法 —— 看有没有虚频、虚频在哪）。
+    #
+    # 分工：``/spectrum`` 给**数据**（峰表 + 波数窗口），``/spectrum.png`` 给**图**。
+    # 两者共用下面这一份 ``_spectrum_data``，免得"表里的峰"和"图上的峰"哪天分叉。
+    # 展宽是纯计算（``qcgui.model.spectrum``），不碰引擎层。
+
+    def _spectrum_params() -> tuple[str, float]:
+        """读查询参数：线型 + 半高全宽 (cm⁻¹)。"""
+        kind = (request.args.get("kind") or DEFAULT_KIND).strip()
+        if kind not in KINDS:
+            raise ValueError(f"不认识的线型 {kind!r}，可选 {'、'.join(KINDS)}")
+        raw = request.args.get("fwhm")
+        fwhm = DEFAULT_FWHM
+        if raw not in (None, ""):
+            try:
+                fwhm = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"半高全宽要是个数（cm⁻¹）：{raw!r}") from None
+        if not 0.1 <= fwhm <= 1000.0:
+            raise ValueError(f"半高全宽要在 0.1 ~ 1000 cm⁻¹ 之间，现在是 {fwhm:g}")
+        return kind, fwhm
+
+    def _spectrum_data(job_id: str) -> dict:
+        """算好谱图的全部输入（峰、波数窗口、曲线、标题）。
+
+        失败用异常表达，由路由翻译成 HTTP 状态码：
+        ``LookupError`` → 404（任务/频率不存在），``ValueError`` → 400（参数不合法）。
+        """
+        record = mgr.store.get(job_id)
+        if record is None:
+            raise LookupError("任务不存在")
+        result = mgr.store.load_result(job_id)
+        if result is None or not result.frequencies:
+            raise LookupError("该任务没有频率数据（不是频率类任务）")
+
+        kind, fwhm = _spectrum_params()
+        # 强度缺失按 1.0 处理，但**要不要当作真实强度**由 has_intensity 决定：
+        # 界面上必须写明"无强度谱"。详见 model/spectrum.py 的说明。
+        peaks, has_intensity = peaks_from_frequencies(
+            result.frequencies, result.ir_intensities
+        )
+        if not peaks:
+            raise LookupError("只有平动/转动的 0 cm⁻¹ 模态，没有可画的振动频率")
+
+        x_min, x_max = default_range(peaks)
+        xs, ys = broaden(peaks, x_min, x_max, DEFAULT_STEP, fwhm, kind)
+        best = strongest_index(peaks) if has_intensity else None
+        imag = [p for p, _ in peaks if p < 0.0]
+
+        rows = []
+        for k, (pos, intensity) in enumerate(peaks):
+            rows.append({
+                "wavenumber": round(pos, 4),
+                "intensity": round(intensity, 6),
+                "imaginary": pos < 0.0,
+                "strongest": best == k,
+                # 表里要不要显示"强度"这一列，由它决定 —— 缺强度时显示"—"，
+                # 绝不把补出来的 1.0 摆成真实强度
+                "intensity_available": has_intensity,
+            })
+
+        payload = {
+            "job_id": job_id,
+            "kind": kind,
+            "kind_label": KIND_LABELS.get(kind, kind),
+            "kinds": [{"value": k, "label": KIND_LABELS[k]} for k in KINDS],
+            "fwhm": fwhm,
+            "step": DEFAULT_STEP,
+            "x_min": x_min,
+            "x_max": x_max,
+            "n_points": len(xs),
+            "n_peaks": len(peaks),
+            "n_modes": len(result.frequencies),
+            "dropped_zero_modes": len(result.frequencies) - len(peaks),
+            "has_intensity": has_intensity,
+            "intensity_unit": "km/mol" if has_intensity else "",
+            "imaginary_count": len(imag),
+            "imaginary_wavenumbers": [round(p, 2) for p in imag],
+            "note": "" if has_intensity else NO_INTENSITY_NOTE,
+            "strongest": (None if best is None else {
+                "wavenumber": round(peaks[best][0], 4),
+                "intensity": round(peaks[best][1], 6),
+            }),
+            "peaks": rows,
+            # 图上的波数单位用 ASCII（字体里没有上标减号），表头用 HTML 的 ⁻¹
+            "png_url": (f"/api/jobs/{quote(job_id, safe='')}/spectrum.png"
+                        f"?kind={kind}&fwhm={fwhm:g}"),
+        }
+        return {
+            "payload": payload,
+            "peaks": peaks,
+            "x_min": x_min,
+            "x_max": x_max,
+            "fwhm": fwhm,
+            "kind": kind,
+            "has_intensity": has_intensity,
+            "title": f"红外谱图 · {KIND_LABELS.get(kind, kind)} · FWHM {fwhm:g} {CM_UNIT}",
+        }
+
+    @app.get("/api/jobs/<job_id>/spectrum")
+    def api_job_spectrum(job_id: str):
+        """红外谱图的**数据**：峰表（含虚频/最强峰标记）+ 波数窗口。"""
+        try:
+            return jsonify(_spectrum_data(job_id)["payload"])
+        except LookupError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/jobs/<job_id>/spectrum.png")
+    def api_job_spectrum_png(job_id: str):
+        """红外谱图**本身**（PNG，Pillow + 3 倍超采样渲染）。
+
+        PIL 是可选依赖，所以这里惰性导入：没装 Pillow 时只这一块不可用，
+        界面其余部分照常（返回 503 + 一句能照做的提示，不是 500 白屏）。
+        """
+        try:
+            data = _spectrum_data(job_id)
+        except LookupError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            from .spectrum_plot import render_spectrum_png
+        except ImportError:
+            return jsonify({
+                "error": "本机没有 Pillow，画不了谱图（pip install Pillow）。"
+                         "结果里的频率数字不受影响。"
+            }), 503
+
+        png = render_spectrum_png(
+            data["peaks"],
+            x_min=data["x_min"], x_max=data["x_max"], step=DEFAULT_STEP,
+            fwhm=data["fwhm"], kind=data["kind"],
+            has_intensity=data["has_intensity"],
+            intensity_unit="强度 (km/mol)" if data["has_intensity"] else "相对强度",
+            title=data["title"],
+        )
+        return Response(png, mimetype="image/png",
+                        headers={"Cache-Control": "no-store"})
 
     @app.get("/api/jobs/<job_id>/bondorders")
     def api_job_bond_orders(job_id: str):

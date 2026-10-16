@@ -135,6 +135,11 @@ class Result:
     mayer_bond_orders: dict = field(default_factory=dict)
     #: 谐振频率 (cm⁻¹)。含平动/转动对应的 0.0 模态。
     frequencies: list[float] = field(default_factory=list)
+    #: 对应的红外强度 (km/mol)，与 ``frequencies`` **一一对应**（同长度同顺序）。
+    #: 目前引擎层还没解析它（ORCA 输出里的 ``IR SPECTRUM`` 表），所以实际任务
+    #: 这里是空的 —— 谱图遇到空强度会按 1.0 画并在界面上标注"无强度谱"。
+    #: 留好这个字段是为了让"补上强度解析"只动引擎层一处，界面不用改。
+    ir_intensities: list[float] = field(default_factory=list)
     #: 热化学，规范键见 engines.orca._THERMO_FIELDS（Hartree / K / atm / amu）
     thermo: dict = field(default_factory=dict)
     #: 分子轨道：{"unit","orbitals":[{index,energy,occupancy,symmetry}],

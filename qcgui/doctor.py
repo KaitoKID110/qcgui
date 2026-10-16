@@ -26,7 +26,7 @@ DEPENDENCIES: tuple[tuple[str, str, bool, str], ...] = (
     ("flask", "Flask", True, "界面与接口完全无法启动"),
     ("werkzeug", "Werkzeug", True, "同上（Flask 的依赖）"),
     ("rdkit", "rdkit", False, "「从 SMILES 生成结构」不可用；xyz/cjson 文件照常"),
-    ("PIL", "Pillow", False, "只有 tools/plot_scan.py 导图片会失败"),
+    ("PIL", "Pillow", False, "tools/plot_scan.py 导图片、结果面板的「红外谱图」不可用"),
     ("tkinter", "tkinter", False, "桌面界面 --tk 与启动失败弹窗不可用；网页界面不受影响"),
 )
 

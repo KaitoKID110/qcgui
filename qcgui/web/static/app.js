@@ -19,6 +19,10 @@ const state = {
   recipe: null,          // 当前选中的配方
   moleculePath: null,    // 当前结构的来源文件（工具栏外部工具要用）
   busy: false,
+  // 红外谱图：线型与半高全宽（重画时保持用户的选择）
+  spectrumKind: 'gaussian',
+  spectrumFwhm: 20,
+  spectrumData: null,    // 最近一次拿到的谱图数据（峰表 + 波数窗口）
 };
 
 // ------------------------------------------------------------------ 小工具
@@ -376,6 +380,9 @@ async function applyUrlParams() {
   if (params.get('botest')) {
     await runBondOrderUiTest(params.get('botest'), params.get('bokind') || 'mayer');
   }
+  if (params.get('sptest')) {
+    await runSpectrumUiTest(params.get('sptest'));
+  }
 }
 
 /**
@@ -442,6 +449,130 @@ async function runBondOrderUiTest(jobId, kind) {
     lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
   }
   out.textContent = '__BOTEST__' + lines.join(' | ') + '__END__';
+}
+
+/**
+ * 真浏览器验证红外谱图区（功能 C）。
+ *
+ * 为什么非要真浏览器：本项目已经三次栽在"DOM 里有但屏幕上没有"。
+ * 谱图是**后端画的 PNG**，所以这里要验的东西比纯逻辑多一层：
+ * 1. 区块确实插进了结果面板、有实际尺寸（不是 0×0 或者被挤到滚动区外）；
+ * 2. `<img>` 真的**加载成功**（naturalWidth > 0）—— 这一步就证明
+ *    /spectrum.png 在真服务里能出图，而不只是单元测试里能出图；
+ * 3. 图**不是空白**：把图片画进离屏 canvas 数非白像素。只检查 src 非空
+ *    是不够的 —— 一张全白的 PNG 也有 src（这正是本项目反复踩的坑）；
+ * 4. 虚频行在表里有醒目标记、缺强度时有"无强度"说明。
+ *
+ * 需要配合 `?job=<频率任务id>&sptest=<同一个id>`，结果写进 DOM 供 --dump-dom 读。
+ */
+async function runSpectrumUiTest(jobId) {
+  const out = document.createElement('pre');
+  out.id = 'sptest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    await selectJob(jobId);
+    // 谱图区是异步填进去的：等表格出现（最多 20 秒）
+    let table = null;
+    for (let i = 0; i < 100 && !table; i++) {
+      await sleep(200);
+      table = document.querySelector('#spectrum-table tbody tr');
+    }
+    if (!table) {
+      const err = document.querySelector('#spectrum-body .warn');
+      lines.push('section=FAIL ' + (err ? 'body="' + err.textContent.trim() + '"' : '表格没出现'));
+      out.textContent = '__SPTEST__' + lines.join(' | ') + '__END__';
+      return;
+    }
+
+    const section = document.getElementById('spectrum-section');
+    const body = $('result-body');
+    lines.push('order=' + Array.from(body.children)
+      .map((n) => n.id || n.className).join('>'));
+    const rect = section.getBoundingClientRect();
+    lines.push(`visible=${rect.width > 200 && rect.height > 120 ? 'PASS' : 'FAIL'}`
+      + ` w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+
+    // 结论横幅必须仍在谱图区前面（那是"结果能不能用"的第一信息）
+    const banner = body.querySelector('.res-verdict, .res-warning');
+    lines.push(`after_verdict=${banner && (banner.compareDocumentPosition(section)
+      & Node.DOCUMENT_POSITION_FOLLOWING) ? 'PASS' : 'FAIL'}`);
+
+    // ---- 图：真的加载出来了吗 ----
+    const img = section.querySelector('#spectrum-img');
+    for (let i = 0; i < 100 && !(img && img.complete && img.naturalWidth > 0); i++) {
+      await sleep(200);
+    }
+    const loaded = !!(img && img.complete && img.naturalWidth > 0);
+    lines.push(`img_loaded=${loaded ? 'PASS' : 'FAIL'}`
+      + ` natural=${img ? img.naturalWidth + 'x' + img.naturalHeight : '—'}`
+      + ` src=${img ? img.getAttribute('src') : '—'}`);
+
+    // ---- 图不是空白：数非白像素（这一条才是"看得见"的证据）----
+    let ink = -1;
+    if (loaded) {
+      const cv = document.createElement('canvas');
+      cv.width = img.naturalWidth;
+      cv.height = img.naturalHeight;
+      const cx = cv.getContext('2d');
+      cx.drawImage(img, 0, 0);
+      const px = cx.getImageData(0, 0, cv.width, cv.height).data;
+      let colored = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i] < 245 || px[i + 1] < 245 || px[i + 2] < 245) colored++;
+      }
+      ink = colored / (cv.width * cv.height) * 100;
+      lines.push(`nonblank=${ink > 1 ? 'PASS' : 'FAIL'} ink=${ink.toFixed(2)}%`);
+      // 蓝色谱线必须真的画上去了：数一下接近 C_CURVE (47,111,208) 的像素
+      let blue = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (Math.abs(px[i] - 47) < 26 && Math.abs(px[i + 1] - 111) < 26
+            && Math.abs(px[i + 2] - 208) < 26) blue++;
+      }
+      lines.push(`curve_pixels=${blue > 200 ? 'PASS' : 'FAIL'} n=${blue}`);
+    } else {
+      lines.push('nonblank=FAIL ink=-1');
+    }
+
+    // ---- 峰值表：虚频醒目、缺强度要说明 ----
+    const rows = section.querySelectorAll('#spectrum-table tbody tr');
+    const imagRows = section.querySelectorAll('#spectrum-table tbody tr.imag-row');
+    lines.push(`table=PASS rows=${rows.length} imag_rows=${imagRows.length}`);
+    lines.push(`imag_marked=${imagRows.length > 0
+      && imagRows[0].querySelector('.imag') ? 'PASS' : 'FAIL'}`);
+    const note = section.querySelector('#spec-note');
+    lines.push(`note="${note ? note.textContent.trim() : ''}"`);
+    lines.push(`strongest_marked=${
+      section.querySelector('#spectrum-table tbody tr .strong') ? 'PASS' : 'NONE'}`
+      + ` strongest_row=${Array.from(rows).findIndex(
+        (r) => r.querySelector('.strong'))}`);
+
+    // ---- 控制条：改 FWHM 要能触发重画（换一张图，且峰位不移动）----
+    const fwhmInput = section.querySelector('#spec-fwhm');
+    const before = img.getAttribute('src');
+    const beforePeaks = (state.spectrumData.peaks || [])
+      .map((p) => p.wavenumber.toFixed(1)).join(',');
+    fwhmInput.value = String(Number(fwhmInput.value) * 3);
+    fwhmInput.dispatchEvent(new Event('change', { bubbles: true }));
+    let after = before;
+    for (let i = 0; i < 100 && after === before; i++) {
+      await sleep(200);
+      const cur = section.querySelector('#spectrum-img');
+      after = cur ? cur.getAttribute('src') : before;
+    }
+    lines.push(`fwhm_control=${after !== before ? 'PASS' : 'FAIL'}`
+      + ` new_src=${after}`);
+    const afterPeaks = (state.spectrumData.peaks || [])
+      .map((p) => p.wavenumber.toFixed(1)).join(',');
+    lines.push(`peak_positions_kept=${afterPeaks === beforePeaks ? 'PASS' : 'FAIL'}`);
+    lines.push(`after_fwhm=${state.spectrumData.fwhm}`);
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__SPTEST__' + lines.join(' | ') + '__END__';
 }
 
 /**
@@ -1252,6 +1383,11 @@ function renderResult(job, result) {
     const real = result.frequencies.filter((f) => Math.abs(f) > 1e-6);
     parts.push(`<div class="res-section"><h4>振动频率 (cm⁻¹) · 虚频 ${result.n_imaginary_frequencies ?? 0}</h4>
       <div class="freq-list">${real.map((f) => `<span class="${f < 0 ? 'imag' : ''}">${f.toFixed(1)}</span>`).join('')}</div></div>`);
+
+    // 红外谱图区：**仅当任务有频率时**才出现（没有频率的任务不占位置）。
+    // 只有一列数字看不出谱形，而"算完频率直接看谱图"正是 GaussView 最常见的用法。
+    // 真实数据由 /spectrum 异步取（图由后端 Pillow 画，前端不引任何绘图库）。
+    parts.push(spectrumSectionShell());
   }
 
   const irc = result.irc || {};
@@ -1295,6 +1431,7 @@ function renderResult(job, result) {
   bindOrbitalButtons();
   loadScanSection(job.job_id);      // 扫描任务才有数据，其它任务静默跳过
   loadBondOrderSection(job.job_id); // 键级要手动点「开始分析」才跑
+  loadSpectrumSection(job.job_id);  // 有频率才有红外谱图，其它任务静默跳过
 }
 
 function renderBatch(payload) {
@@ -1960,6 +2097,110 @@ function refreshViewerValues() {
     return;
   }
   state.viewer.setValueDisplay('charge', charges, bonds.length ? bonds : null);
+}
+
+// ------------------------------------------------------------------ 红外谱图
+
+/**
+ * 红外谱图区的**空壳**（同步插进结果面板）。
+ *
+ * 为什么要先插空壳再异步填内容：真数据要从 /spectrum 取（峰表与图共用后端
+ * 算出来的同一份数据）。如果等拿到数据才插 DOM，用户点到频率任务时会先看到
+ * 面板"闪一下没有谱图"，而且截图/自动化脚本要跟不确定的时序赛跑。
+ */
+function spectrumSectionShell() {
+  return `<div class="res-section" id="spectrum-section">
+    <div class="res-section-head">红外谱图 <span class="muted">频率展宽</span></div>
+    <div id="spectrum-body"><p class="hint">谱图绘制中…</p></div>
+  </div>`;
+}
+
+/** 谱图区的实际内容：控制条 + 谱线图 + 峰值表。 */
+function spectrumSection(data) {
+  const rows = (data.peaks || []).map((p) => {
+    // 虚频是判断过渡态对不对的头号指标：整行加底色 + 红色"虚频"标签。
+    // 缺强度时强度列显示"—"，**不把补出来的 1.0 摆成真实强度**。
+    const kindText = (p.imaginary ? '<b class="imag">虚频</b>' : '实频')
+      + (p.strongest ? ' · <b class="strong">最强峰</b>' : '');
+    return `<tr class="${p.imaginary ? 'imag-row' : ''}">
+      <td class="num">${p.wavenumber.toFixed(1)}</td>
+      <td class="num">${p.intensity_available ? Number(p.intensity).toFixed(2) : '—'}</td>
+      <td>${kindText}</td></tr>`;
+  }).join('');
+
+  const unit = data.intensity_unit ? esc(data.intensity_unit) : '—';
+  const note = data.note
+    ? `<p class="hint warn" id="spec-note">${esc(data.note)}</p>`
+    : '<p class="hint" id="spec-note"></p>';
+  const imagNote = data.imaginary_count
+    ? `<p class="hint warn">检测到 <b>${data.imaginary_count}</b> 个虚频（红色标出）：`
+      + '过渡态应当正好 1 个虚频，极小点应当 0 个。</p>'
+    : '<p class="hint">没有虚频 —— 这是极小点（过渡态的话应当正好 1 个虚频）。</p>';
+  const options = (data.kinds || []).map((k) => `<option value="${esc(k.value)}"`
+    + `${k.value === data.kind ? ' selected' : ''}>${esc(k.label)}</option>`).join('');
+  const dropped = data.dropped_zero_modes
+    ? `（已略去 ${data.dropped_zero_modes} 个平动/转动的 0 cm⁻¹ 模态）` : '';
+
+  return `<div class="spec-controls">
+      <label>线型 <select id="spec-kind">${options}</select></label>
+      <label>半高全宽 <input type="number" id="spec-fwhm" class="input" min="0.1"
+        max="1000" step="1" value="${data.fwhm}"> cm⁻¹</label>
+      <a class="link" href="${esc(data.png_url)}" target="_blank" rel="noopener">新窗口看大图</a>
+      <span class="muted" id="spectrum-hint">改线型或宽度会重画；展宽<b>不移动峰位</b></span>
+    </div>
+    <a href="${esc(data.png_url)}" target="_blank" rel="noopener"
+      title="点开在新窗口看原始尺寸（结果栏较窄，图上的小字要放大才看得清）">
+      <img id="spectrum-img" class="spectrum-img" alt="红外谱图"
+        src="${esc(data.png_url)}">
+    </a>
+    ${note}${imagNote}
+    <div class="table-scroll spec-table-scroll">
+      <table class="data" id="spectrum-table">
+        <thead><tr><th>波数 (cm⁻¹)</th>
+          <th style="text-align:right">强度 (${unit})</th><th>类型</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <p class="hint">共 ${data.n_peaks} 个振动峰${dropped}；波数窗口
+      ${data.x_min} ~ ${data.x_max} cm⁻¹，采样步长 ${data.step} cm⁻¹。</p>`;
+}
+
+/**
+ * 取红外谱图数据并画到面板上。
+ *
+ * 图由**后端 Pillow 渲染**（前端零依赖，也不引任何绘图库；matplotlib 在本机
+ * 是坏的）。非频率任务在 renderResult 里就不会插这个空壳，这里直接早退。
+ */
+async function loadSpectrumSection(jobId) {
+  const section = document.getElementById('spectrum-section');
+  if (!section) return;
+  const body = section.querySelector('#spectrum-body');
+  state.spectrumData = null;
+
+  const draw = async (kind, fwhm) => {
+    state.spectrumKind = kind || 'gaussian';
+    state.spectrumFwhm = fwhm;
+    body.innerHTML = '<p class="hint">谱图绘制中…</p>';
+    try {
+      const url = '/api/jobs/' + encodeURIComponent(jobId) + '/spectrum?kind='
+        + encodeURIComponent(state.spectrumKind) + '&fwhm=' + encodeURIComponent(fwhm);
+      const data = await api(url);
+      body.innerHTML = spectrumSection(data);
+      state.spectrumData = data;
+      const sel = body.querySelector('#spec-kind');
+      const inp = body.querySelector('#spec-fwhm');
+      // 换线型/宽度重画。峰位不变，只是"峰看起来多宽"，所以不用重新拉频率数据。
+      const redraw = () => draw(sel.value, inp.value);
+      sel.addEventListener('change', redraw);
+      inp.addEventListener('change', redraw);
+    } catch (err) {
+      // 失败要说清楚为什么（不是频率任务 / 没装 Pillow / 参数不合法），
+      // 不要留一个空白区让人以为"谱图就是这样"
+      body.innerHTML = `<p class="hint warn">红外谱图不可用：${esc(err.message)}</p>`;
+    }
+  };
+
+  await draw(state.spectrumKind, state.spectrumFwhm);
 }
 
 async function loadScanSection(jobId) {

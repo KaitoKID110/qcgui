@@ -20,6 +20,22 @@ from .result import (
     Issue,
     Result,
 )
+from .spectrum import (
+    DEFAULT_FWHM,
+    DEFAULT_KIND,
+    DEFAULT_STEP,
+    KIND_GAUSSIAN,
+    KIND_LABELS,
+    KIND_LORENTZIAN,
+    KINDS,
+    broaden,
+    default_range,
+    gaussian_broadened,
+    lorentzian_broadened,
+    normalize_peaks,
+    peaks_from_frequencies,
+    strongest_index,
+)
 
 __all__ = [
     "Atom", "Molecule", "JobSpec", "JobType", "Result", "Issue",
@@ -28,4 +44,9 @@ __all__ = [
     "VERDICT_OK", "VERDICT_LIMITED", "VERDICT_UNUSABLE",
     "ScanSpec", "connectivity_change", "dihedral", "measure",
     "parse_scan_blocks", "scan_warnings",
+    "KINDS", "KIND_LABELS", "KIND_GAUSSIAN", "KIND_LORENTZIAN",
+    "DEFAULT_FWHM", "DEFAULT_STEP", "DEFAULT_KIND",
+    "broaden", "gaussian_broadened", "lorentzian_broadened",
+    "normalize_peaks", "peaks_from_frequencies", "default_range",
+    "strongest_index",
 ]
