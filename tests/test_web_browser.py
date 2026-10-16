@@ -103,16 +103,50 @@ class Server:
 
     @staticmethod
     def real_jobs_root() -> Path | None:
-        """本机真实任务库（机器相关，找不到就跳过 —— CI 上正是这种情形）。"""
+        """本机真实任务库（机器相关，找不到就跳过 —— CI 上正是这种情形）。
+
+        解析顺序：``QCGUI_JOBS_ROOT`` → ``QCGUI_HOME/jobs`` → ``%LOCALAPPDATA%\\qcgui\\jobs``。
+
+        为什么要认 ``QCGUI_HOME``：qcgui 自己就是用这个变量覆盖数据目录的
+        （``qcgui/paths.py``）。本机 ``%LOCALAPPDATA%`` 对进程不可写，真正的
+        任务库在 ``QCGUI_HOME`` 指向的位置；只认 ``%LOCALAPPDATA%`` 会让这些
+        用例读到另一个（旧）库，甚至因为不可写而失败。
+        """
         override = os.environ.get("QCGUI_JOBS_ROOT")
         if override:
             root = Path(override)
             return root if root.is_dir() else None
+        home = os.environ.get("QCGUI_HOME")
+        if home:
+            root = Path(home) / "jobs"
+            if root.is_dir():
+                return root
         local = os.environ.get("LOCALAPPDATA")
         if not local:
             return None
         root = Path(local) / "qcgui" / "jobs"
         return root if root.is_dir() else None
+
+    @staticmethod
+    def jobs_root_is_writable(root: Path | None) -> bool:
+        """任务库能不能写。
+
+        为什么要问这个：Multiwfn 那两条用例会**往任务目录里落原始输出**
+        （``orbcomp_*.txt`` 等，这是项目刻意留的痕）。任务库不可写时，
+        它们必然失败 —— 但那不是被测代码的问题。
+
+        以前这种情形是"找不到任务就 print 一句然后 return"，看起来像通过，
+        等于**静默跳过、没有牙齿**。现在改成由调用方明确 skip 并说明原因。
+        """
+        if root is None or not Path(root).is_dir():
+            return False
+        probe = Path(root) / "_write_probe.tmp"
+        try:
+            probe.write_text("x", encoding="ascii")
+            probe.unlink()
+            return True
+        except OSError:
+            return False
 
     def finished_job_with_gbw(self) -> str | None:
         """找一个既有 .gbw 又已完成的任务。找不到返回 None（调用方跳过）。"""
@@ -336,15 +370,19 @@ def test_bond_order_ui_in_real_browser():
 
     exe, _ = resolve_tool("multiwfn")
     if not exe:
-        print("    跳过：本机没有 Multiwfn")
-        return
+        _skip("本机没有 Multiwfn")
 
-    server = Server(Server.real_jobs_root())
+    root = Server.real_jobs_root()
+    if not Server.jobs_root_is_writable(root):
+        # 明确跳过并说明原因，而不是"找不到就 print 一句 return"（那是静默跳过，
+        # 看起来像通过）。Multiwfn 会把原始输出落进任务目录，不可写就必然失败。
+        _skip(f"真实任务库不可写（{root}）—— Multiwfn 的原始输出要落盘才能测")
+
+    server = Server(root)
     try:
         job_id = server.finished_job_with_gbw()
         if job_id is None:
-            print("    跳过：真实任务库里没有带 .gbw 的已完成任务")
-            return
+            _skip("真实任务库里没有带 .gbw 的已完成任务")
         chrome = _browser()
         profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
         url = f"{server.base}/?nosse=1&job={job_id}&botest={job_id}&bokind=mayer"
@@ -386,15 +424,17 @@ def test_orbital_composition_ui_in_real_browser():
 
     exe, _ = resolve_tool("multiwfn")
     if not exe:
-        print("    跳过：本机没有 Multiwfn")
-        return
+        _skip("本机没有 Multiwfn")
 
-    server = Server(Server.real_jobs_root())
+    root = Server.real_jobs_root()
+    if not Server.jobs_root_is_writable(root):
+        _skip(f"真实任务库不可写（{root}）—— Multiwfn 的原始输出要落盘才能测")
+
+    server = Server(root)
     try:
         job_id = server.finished_job_with_gbw()
         if job_id is None:
-            print("    跳过：真实任务库里没有带 .gbw 的已完成任务")
-            return
+            _skip("真实任务库里没有带 .gbw 的已完成任务")
         chrome = _browser()
         profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
         url = f"{server.base}/?nosse=1&job={job_id}&octest={job_id}"

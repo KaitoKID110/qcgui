@@ -237,12 +237,23 @@ def test_all_source_files_are_tracked_by_git():
 
     excluded = ("__pycache__", "audit/", "tools/local/", ".git/", ".gitenv", ".git-portable",
                 ".pytest_cache", "jobs/", "runs/")
+
+    # 临时产物：`tempfile.mkdtemp()` 默认前缀是 "tmp"，测试用它造任务库/Chrome 档。
+    # 临时目录不可写的机器上，tempfile 会**退回当前工作目录**，于是这些 tmp* 就落在
+    # 仓库里（本机 2026-10-16 之后正是这种情形）。它们不是仓库内容，
+    # 更不是"克隆出来会缺的东西"，所以按名字排除。
+    # 唯一的例外：如果一个 tmp* 条目**已经被 git 跟踪**了，那说明它是有意提交的，
+    # 应当照常检查（这里不做特殊处理 —— 被跟踪的不会被算进 missing）。
+    temp_prefixes = ("tmp", "qcgui_")
+
     missing: list[str] = []
     for path in repo.rglob("*"):
         if not path.is_file():
             continue
         rel = path.relative_to(repo).as_posix()
         if any(part in rel for part in excluded):
+            continue
+        if path.name.startswith(temp_prefixes):
             continue
         if rel not in tracked:
             missing.append(rel)
