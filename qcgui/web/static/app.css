@@ -280,6 +280,18 @@ select.input { cursor: pointer; }
 }
 .overlay-line { color: #cfe2f5; text-shadow: 0 1px 3px rgba(0,0,0,.7); }
 .overlay-line.muted { color: #7e93a9; font-size: 11px; }
+/* 叠加图例：作者样式的 display 会盖掉 hidden 的 UA 规则，必须显式写 */
+.ov-legend { margin-top: 3px; font-size: 11px; color: #ffd7ef; display: flex;
+  align-items: center; gap: 5px; flex-wrap: wrap; }
+.ov-legend[hidden] { display: none; }
+.ov-legend b { color: #fff; }
+.ov-legend b.hi { color: #ff9ede; }
+.ov-swatch {
+  display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+  border: 1px solid rgba(0,0,0,.5); vertical-align: middle; margin-right: 2px;
+}
+.ov-swatch.ref { background: #909090; }
+.ov-swatch.ghost { opacity: .75; }
 
 .viewer-empty {
   position: absolute; inset: 0;
@@ -591,4 +603,18 @@ table.data tr.min td { color: #9ecbff; }
 .geom-row.active .geom-idx { box-shadow: inset 3px 0 0 0 #22d3ee; color: #22d3ee; }
 .geom-row.active .geom-value { color: #7fe7f7; font-weight: 600; }
 .geom-none td { color: var(--text-faint); text-align: center; padding: 8px 0; }
+/* ------------------------------------------------------------ 结构叠加 RMSD */
+/* 两个 RMSD 是对比的核心数字：字放大、对齐后那个用强调色。 */
+
+.ov-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 4px;
+  flex-wrap: wrap;
+}
+.ov-controls select { flex: 1 1 150px; min-width: 120px; }
+.ov-grid { margin: 4px 0 6px; }
+.ov-grid dd.ov-before { color: var(--text-dim); }
+.ov-grid dd.ov-after { font-size: 13px; font-weight: 600; }
 

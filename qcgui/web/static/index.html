@@ -194,6 +194,9 @@
       <div class="viewer-overlay">
         <div class="overlay-line" id="viewer-caption">尚未载入结构</div>
         <div class="overlay-line muted" id="viewer-sub">拖拽旋转 · 滚轮缩放 · 右键平移 · 双击复位</div>
+        <!-- 叠加对比的图例：哪个颜色是哪个结构 + 对齐前后的 RMSD。
+             放在画布上（不是右栏）—— 右栏要滚动，数字被滚出视野就等于没显示 -->
+        <div class="overlay-line ov-legend" id="viewer-overlay-legend" hidden></div>
       </div>
       <div class="viewer-empty" id="viewer-empty">
         <p>把 <code>.xyz</code> 文件拖进来，或点击左侧「打开文件」</p>

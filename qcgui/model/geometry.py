@@ -357,6 +357,286 @@ def describe_connectivity_change(symbols, coords_before, coords_after) -> str | 
     return f"成键发生变化（{change.describe(symbols)}）"
 
 
+# ------------------------------------------------------------ 结构叠加（Kabsch）
+#
+# 为什么需要：GaussView 里"把优化前和优化后叠起来看 + 报一个 RMSD"是常规操作。
+# 没有它，两个构象的差别只能靠肉眼在两个画面上来回切换着看 —— 而"看起来叠上了"
+# 恰恰是最不可靠的判断方式（本项目已有三次栽在"看着对"上）。
+#
+# **不引入 numpy**：这里只需要 3×3 的旋转，用四元数法（Horn 1987）把问题化归成
+# 一个 4×4 对称矩阵的最大特征向量，自带的 Jacobi 迭代几十行就能算到机器精度。
+# 引 numpy 会给界面进程加上一个几十 MB 的依赖，而它换来的只是这点算术 ——
+# 与项目"前端零依赖 / 界面进程不加重依赖"的取向冲突。
+
+
+class AlignmentError(ValueError):
+    """两个结构无法叠加（原子数不同、元素顺序不同、坐标非法）。
+
+    单独一个异常类型是为了让调用方能把"用户选错了两个结构"和
+    其它 ``ValueError`` 区分开 —— 前者要给出可读的中文提示，
+    而不是把它当成内部错误。
+    """
+
+
+def _as_coords(coords, what: str = "坐标") -> list[tuple[float, float, float]]:
+    """把坐标统一成 ``[(x, y, z), ...]``，非法就明确报错。"""
+    if coords is None:
+        raise AlignmentError(f"{what}不能为空")
+    out: list[tuple[float, float, float]] = []
+    for index, point in enumerate(coords):
+        try:
+            x, y, z = (float(point[0]), float(point[1]), float(point[2]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise AlignmentError(
+                f"{what}里第 {index} 个原子不是三个数：{point!r}"
+            ) from exc
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            raise AlignmentError(f"{what}里第 {index} 个原子的坐标不是有限数：{point!r}")
+        out.append((x, y, z))
+    if not out:
+        raise AlignmentError(f"{what}为空 —— 没有原子可以叠加")
+    return out
+
+
+def check_same_elements(symbols_a, symbols_b) -> None:
+    """两个结构的**元素顺序必须逐个一致**，否则明确报错。
+
+    为什么必须报错而不是"尽力对齐"：Kabsch 只做刚体变换，它默认第 i 个原子
+    对应第 i 个原子。如果两个文件的原子顺序不同（非常常见：换了个建模工具、
+    重新优化过、手改了 xyz），硬算出来的 RMSD 是**没有物理意义的数字** ——
+    而且它看起来完全正常（通常偏大但不离谱），用户没有任何办法察觉。
+    报错是唯一安全的做法。本项目的定位就是"自动找对应原子"不在范围内。
+    """
+    if symbols_a is None or symbols_b is None:
+        raise AlignmentError(
+            "叠加需要两个结构各自的元素顺序（symbols）—— 只给坐标无法保证对应关系"
+        )
+    a = [str(s).strip() for s in symbols_a]
+    b = [str(s).strip() for s in symbols_b]
+    if len(a) != len(b):
+        raise AlignmentError(
+            f"两个结构的原子数不同（{len(a)} vs {len(b)}）—— "
+            f"叠加要求原子数相同且顺序一致，本功能不会自动找对应原子"
+        )
+    for index, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            raise AlignmentError(
+                f"两个结构的元素顺序不一致：第 {index + 1} 个原子是 {x}，"
+                f"另一个结构是 {y}。叠加要求顺序完全一致"
+                f"（自动找对应原子不在本功能范围内）"
+            )
+
+
+def _centroid(points) -> tuple[float, float, float]:
+    n = len(points)
+    return (
+        sum(p[0] for p in points) / n,
+        sum(p[1] for p in points) / n,
+        sum(p[2] for p in points) / n,
+    )
+
+
+def _jacobi_eigen(matrix, max_sweeps: int = 64, tol: float = 1e-18):
+    """对称矩阵的 Jacobi 特征分解。
+
+    返回 ``(eigenvalues, eigenvectors)``，其中 ``eigenvectors[k]`` 是第 k 个
+    特征值对应的特征向量（已归一化）。只用于 4×4 的四元数矩阵 ——
+    Jacobi 每次消掉一对非对角元，几十次扫描后非对角元平方和降到 1e-18 以下，
+    对 4×4 来说这就是机器精度。
+    """
+    n = len(matrix)
+    m = [[float(matrix[i][j]) for j in range(n)] for i in range(n)]
+    v = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+
+    for _ in range(max_sweeps):
+        off = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                off += m[i][j] * m[i][j]
+        if off <= tol:
+            break
+        for p in range(n - 1):
+            for q in range(p + 1, n):
+                apq = m[p][q]
+                if abs(apq) <= 1e-300:
+                    continue
+                theta = (m[q][q] - m[p][p]) / (2.0 * apq)
+                # t 是旋转量；theta 为 0 时取 45°（任意选择，必定减小非对角元）
+                t = (math.copysign(1.0, theta) / (abs(theta) + math.sqrt(theta * theta + 1.0))
+                     if theta != 0.0 else 1.0)
+                c = 1.0 / math.sqrt(t * t + 1.0)
+                s = t * c
+                # 左乘再右乘同一个旋转（G^T A G）—— 对称性因此保持
+                for k in range(n):
+                    mkp, mkq = m[k][p], m[k][q]
+                    m[k][p] = c * mkp - s * mkq
+                    m[k][q] = s * mkp + c * mkq
+                for k in range(n):
+                    mpk, mqk = m[p][k], m[q][k]
+                    m[p][k] = c * mpk - s * mqk
+                    m[q][k] = s * mpk + c * mqk
+                for k in range(n):
+                    vkp, vkq = v[k][p], v[k][q]
+                    v[k][p] = c * vkp - s * vkq
+                    v[k][q] = s * vkp + c * vkq
+
+    values = [m[i][i] for i in range(n)]
+    vectors = [[v[i][j] for i in range(n)] for j in range(n)]
+    return values, vectors
+
+
+def _rotation_from_quaternion(q) -> tuple[tuple[float, float, float], ...]:
+    """单位四元数 → 旋转矩阵（行优先的 3×3）。"""
+    w, x, y, z = q
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm < 1e-300:
+        return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    return (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)),
+        (2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
+        (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)),
+    )
+
+
+def _apply_rotation(rotation, point):
+    return (
+        rotation[0][0] * point[0] + rotation[0][1] * point[1] + rotation[0][2] * point[2],
+        rotation[1][0] * point[0] + rotation[1][1] * point[1] + rotation[1][2] * point[2],
+        rotation[2][0] * point[0] + rotation[2][1] * point[1] + rotation[2][2] * point[2],
+    )
+
+
+#: 单位旋转矩阵（供退化情形与测试使用）
+IDENTITY_ROTATION = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def kabsch_align(coords_a, coords_b):
+    """把结构 A 最优叠加到结构 B 上（Kabsch / 四元数法）。
+
+    返回 ``(rotated_a, rotation, translation)``：
+
+    * ``rotated_a``：把 A 的每个原子做刚体变换后的坐标
+    * ``rotation``：3×3 旋转矩阵（行优先）
+    * ``translation``：3 元素平移向量
+
+    满足 ``rotated_a[i] == rotation @ coords_a[i] + translation``。
+
+    只做**刚体**变换（旋转 + 平移，不缩放、不镜像）—— 化学结构的比较里缩放
+    没有物理意义，而镜像会把一对对映体"叠"成 RMSD 0，那是彻底错误的结论。
+    因此返回的 ``rotation`` 行列式恒为 +1；纯镜像的两个结构叠不到 0
+    （这不是缺陷，是应有的行为）。
+
+    .. note::
+       元素顺序不在本函数的检查范围内（这里只有坐标）。调用方要用带
+       ``symbols`` 的 :func:`overlay`，它会先做 :func:`check_same_elements`。
+    """
+    a = _as_coords(coords_a, "结构 A 的坐标")
+    b = _as_coords(coords_b, "结构 B 的坐标")
+    if len(a) != len(b):
+        raise AlignmentError(
+            f"两个结构的原子数不同（{len(a)} vs {len(b)}）—— 叠加要求原子数相同"
+        )
+
+    ca, cb = _centroid(a), _centroid(b)
+    ac = [(p[0] - ca[0], p[1] - ca[1], p[2] - ca[2]) for p in a]
+    bc = [(p[0] - cb[0], p[1] - cb[1], p[2] - cb[2]) for p in b]
+
+    # 单原子没有方向信息：任何旋转都同样好，取单位阵（结果 RMSD 仍是 0）
+    if len(a) < 2:
+        rotation = IDENTITY_ROTATION
+    else:
+        # S[i][j] = Σ a_i · b_j，即 H = AᵀB；四元数矩阵 N 由 H 的分量拼出
+        s = [[sum(p[i] * q[j] for p, q in zip(ac, bc)) for j in range(3)] for i in range(3)]
+        (sxx, sxy, sxz), (syx, syy, syz), (szx, szy, szz) = s
+        n = [
+            [sxx + syy + szz, syz - szy, szx - sxz, sxy - syx],
+            [syz - szy, sxx - syy - szz, sxy + syx, szx + sxz],
+            [szx - sxz, sxy + syx, -sxx + syy - szz, syz + szy],
+            [sxy - syx, szx + sxz, syz + szy, -sxx - syy + szz],
+        ]
+        values, vectors = _jacobi_eigen(n)
+        best = max(range(4), key=lambda k: values[k])
+        rotation = _rotation_from_quaternion(vectors[best])
+
+    # 平移：让 A 的质心（旋转后）落到 B 的质心上
+    ca_rot = _apply_rotation(rotation, ca)
+    translation = (cb[0] - ca_rot[0], cb[1] - ca_rot[1], cb[2] - ca_rot[2])
+    rotated_a = [
+        tuple(c + t for c, t in zip(_apply_rotation(rotation, p), translation))
+        for p in a
+    ]
+    return rotated_a, rotation, translation
+
+
+def rmsd(coords_a, coords_b, align: bool = False,
+         symbols_a=None, symbols_b=None) -> float:
+    """两个结构的 RMSD（Å）。
+
+    ``align=False``：直接比原始坐标 —— 这就是"把两个文件不用任何处理直接比较"，
+    两个结构只要在空间里的摆放不同（旋转/平移），这个数就很大。
+    ``align=True``：先做 Kabsch 最优叠加再比 —— 这才是"结构相似度"。
+
+    两个数一起看才有意义：**对齐后变小**才说明差别只是摆放不同；
+    对齐后仍很大，说明构象/成键真的不同。
+
+    给了 ``symbols_a`` / ``symbols_b`` 就先检查元素顺序（见
+    :func:`check_same_elements`）—— 顺序不一致时算出来的数字没有意义。
+    """
+    if symbols_a is not None or symbols_b is not None:
+        check_same_elements(symbols_a, symbols_b)
+
+    a = _as_coords(coords_a, "结构 A 的坐标")
+    b = _as_coords(coords_b, "结构 B 的坐标")
+    if len(a) != len(b):
+        raise AlignmentError(
+            f"两个结构的原子数不同（{len(a)} vs {len(b)}）—— RMSD 要求原子数相同"
+        )
+    if align:
+        a = kabsch_align(a, b)[0]
+
+    total = 0.0
+    for p, q in zip(a, b):
+        total += (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2
+    return math.sqrt(total / len(a))
+
+
+def overlay(symbols_a, coords_a, symbols_b, coords_b) -> dict:
+    """两个结构的叠加结果 —— API 与界面共用的那一份计算。
+
+    约定：**A 不动，B 被叠到 A 所在的参考系上**（"参考结构"与"被比较结构"）。
+    这样界面里 A 保持用户看到的原样，B 被搬过来，用户不会失去参照。
+
+    返回字典的字段即 API 的返回体（见 ``qcgui.web.app.api_job_overlay``）：
+
+    * ``rmsd_before``：叠加前的原始 RMSD（≥ 0）
+    * ``rmsd_after``：最优叠加后的 RMSD（≤ before，且只有刚体差别时 ≈ 0）
+    * ``aligned_coords``：B 叠到 A 之后的坐标
+    * ``rotation`` / ``translation``：作用在 B 上的刚体变换
+    * ``n_atoms`` / ``symbols``：原子数与元素顺序（供画图与校验）
+    """
+    check_same_elements(symbols_a, symbols_b)
+
+    a = _as_coords(coords_a, "结构 A 的坐标")
+    b = _as_coords(coords_b, "结构 B 的坐标")
+    aligned, rotation, translation = kabsch_align(b, a)
+
+    before = rmsd(a, b, align=False)
+    after = rmsd(a, aligned, align=False)
+    # 浮点误差可能让 after 比理论最小值小到 -0（不可能为负，这里只做保护性夹紧）
+    after = max(0.0, after)
+    return {
+        "rmsd_before": before,
+        "rmsd_after": after,
+        "aligned_coords": [list(c) for c in aligned],
+        "rotation": [list(row) for row in rotation],
+        "translation": list(translation),
+        "n_atoms": len(a),
+        "symbols": [str(s).strip() for s in symbols_a],
+        "moved": "b",
+    }
+
+
 def parse_scan_blocks(blocks) -> list[ScanSpec]:
     """从 ``extra_blocks`` 里解析 ``%geom`` 的 ``Scan`` 段。
 

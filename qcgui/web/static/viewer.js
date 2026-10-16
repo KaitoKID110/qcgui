@@ -66,9 +66,28 @@
   const DEFAULT_COVALENT = 1.4;
   const DEFAULT_VDW = 1.8;
 
+  // 「第二个结构」（叠加对比）的配色：把元素色往这个色调上拉。
+  //
+  // 为什么不用"整个第二结构统一一个颜色"：那样就完全看不出第二个结构里
+  // 哪个是氧、哪个是碳 —— 而对比构象时恰恰要看"这个氧跑到哪去了"。
+  // 所以保留元素色的色相、只把它往一个统一的品红调子上拉，
+  // 再用半透明 + 虚线键和主结构区分开。
+  const OVERLAY_TINT = [255, 40, 170];
+  const OVERLAY_TINT_MIX = 0.62;   // 拉过去的比例
+  const OVERLAY_ALPHA = 0.5;
+
   const covalentRadius = (s) => COVALENT[s] || DEFAULT_COVALENT;
   const vdwRadius = (s) => VDW[s] || DEFAULT_VDW;
   const elementColor = (s) => COLORS[s] || DEFAULT_COLOR;
+
+  /** 把颜色往叠加色上混，得到「第二个结构」的颜色。 */
+  function overlayColor(color) {
+    return [
+      Math.round(color[0] + (OVERLAY_TINT[0] - color[0]) * OVERLAY_TINT_MIX),
+      Math.round(color[1] + (OVERLAY_TINT[1] - color[1]) * OVERLAY_TINT_MIX),
+      Math.round(color[2] + (OVERLAY_TINT[2] - color[2]) * OVERLAY_TINT_MIX),
+    ];
+  }
 
   // ---------------------------------------------------------------- 小工具
 
@@ -112,6 +131,10 @@
       this.coords = [];
       this.charges = null;
       this.bonds = [];
+      // 叠加对比的第二个结构（对齐后坐标）。null = 没有叠加。
+      // 和主结构共用同一个参考系（对齐由后端算好），所以渲染时共用投影参数。
+      this.overlay = null;
+      this.overlayBonds = [];
       this.frames = [];
       this.framePos = 0;          // 可为小数，表示两帧之间
       this.playing = false;
@@ -157,6 +180,10 @@
       this.symbols = data.symbols.slice();
       this.coords = data.coords.map((c) => [c[0], c[1], c[2]]);
       this.charges = data.charges ? data.charges.slice() : null;
+      // 换了主结构，旧叠加的坐标就是别的参考系里的数了 —— 必须丢掉，
+      // 否则画面上会出现一个"飘在旁边的幽灵分子"（而且看不出错在哪）
+      this.overlay = null;
+      this.overlayBonds = [];
       this.frames = [];
       this.framePos = 0;
       // 换了分子，旧的高亮下标就没有意义了（可能指向不存在的原子）
@@ -211,6 +238,42 @@
     setCharges(charges) {
       this.charges = charges ? charges.slice() : null;
       this._schedule();
+    }
+
+    /**
+     * 叠加第二个结构（用于"优化前 vs 优化后"这类对比）。
+     *
+     * ``data.coords`` 必须是**已经叠好**的坐标 —— 也就是后端
+     * ``GET /api/jobs/<id>/overlay/<other>`` 里的 ``aligned_coords``。
+     * 为什么不在前端算叠加：Kabsch 只能有一份实现。前端再写一遍，
+     * 迟早和后端算出两个不一样的 RMSD，而用户无从分辨哪个对。
+     *
+     * 坐标与主结构共用参考系（叠加就是把 B 搬到 A 的参考系），
+     * 所以居中/缩放/投影都用主结构那一套 —— 两个结构才会真的重合在一起。
+     */
+    setOverlay(data) {
+      if (!data || !data.symbols || !data.coords
+          || !data.symbols.length || data.symbols.length !== data.coords.length) {
+        this.clearOverlay();
+        return;
+      }
+      this.overlay = {
+        symbols: data.symbols.slice(),
+        coords: data.coords.map((c) => [c[0], c[1], c[2]]),
+        label: data.label || '',
+      };
+      this._prepare();
+      this._schedule();
+    }
+
+    clearOverlay() {
+      const had = !!this.overlay;
+      this.overlay = null;
+      this.overlayBonds = [];
+      if (had) {
+        this._prepare();
+        this._schedule();
+      }
     }
 
     setStyle(style) {
@@ -294,7 +357,9 @@
     // ------------------------------------------------------------ 内部准备
 
     _prepare() {
-      // 居中并计算特征半径
+      // 居中并计算特征半径。
+      // **居中只用主结构的质心**：叠加后的第二结构本来就是同一个参考系里的
+      // 坐标，用同一个中心才对得上；要是两者各算各的中心，画出来永远差一个位移。
       let cx = 0, cy = 0, cz = 0;
       const n = this.coords.length;
       for (const c of this.coords) {
@@ -303,26 +368,34 @@
       cx /= n || 1; cy /= n || 1; cz /= n || 1;
       this.center = [cx, cy, cz];
 
+      // 半径要把第二结构也算进去，否则叠加进来的原子会被画到画布外 ——
+      // 现象是"数据说叠上了，屏幕上只看得到一个分子"。
       let maxR = 0.1;
-      for (const c of this.coords) {
+      const grow = (c) => {
         const d = Math.hypot(c[0] - cx, c[1] - cy, c[2] - cz);
         if (d > maxR) maxR = d;
-      }
+      };
+      for (const c of this.coords) grow(c);
+      if (this.overlay) for (const c of this.overlay.coords) grow(c);
       this.radius = maxR;
-      this.bonds = this._inferBonds();
+
+      this.bonds = this._inferBondsFor(this.symbols, this.coords);
+      this.overlayBonds = this.overlay
+        ? this._inferBondsFor(this.overlay.symbols, this.overlay.coords)
+        : [];
     }
 
-    _inferBonds() {
+    _inferBondsFor(symbols, coords) {
       const bonds = [];
-      const n = this.coords.length;
+      const n = coords.length;
       const tol = this.options.bondTolerance;
       for (let i = 0; i < n; i++) {
-        const ri = covalentRadius(this.symbols[i]);
-        const ci = this.coords[i];
+        const ri = covalentRadius(symbols[i]);
+        const ci = coords[i];
         for (let j = i + 1; j < n; j++) {
-          const rj = covalentRadius(this.symbols[j]);
+          const rj = covalentRadius(symbols[j]);
           const limit = (ri + rj) * tol;
-          const cj = this.coords[j];
+          const cj = coords[j];
           const dx = ci[0] - cj[0];
           if (dx > limit || dx < -limit) continue;
           const dy = ci[1] - cj[1];
@@ -334,6 +407,10 @@
         }
       }
       return bonds;
+    }
+
+    _inferBonds() {
+      return this._inferBondsFor(this.symbols, this.coords);
     }
 
     // ------------------------------------------------------------ 尺寸 / 事件
@@ -510,10 +587,49 @@
           width: w2, color: this._colorFor(j),
         });
       }
+
+      // 叠加对比的第二个结构（品红调 + 半透明 + 虚线键）。
+      // **必须进同一个 prims 列表一起排序**：分成两次画的话，第二个结构的球
+      // 会整片盖在主结构上面，前后关系就全错了（看上去"第一个结构不见了"）。
+      if (this.overlay) {
+        const oRot = this.overlay.coords.map((p) => this._rotate(p, pr));
+        const oScr = oRot.map((r) => this._toScreen(r, pr));
+        for (let i = 0; i < this.overlay.symbols.length; i++) {
+          const st = this._atomStyle(this.overlay.symbols[i], i);
+          prims.push({
+            kind: 'oatom',
+            z: oRot[i][2],
+            screen: oScr[i],
+            radius: st.radius * pr.scale * oScr[i][3],
+            color: overlayColor(elementColor(this.overlay.symbols[i])),
+            alpha: OVERLAY_ALPHA,
+            label: this.overlay.symbols[i] + i,
+          });
+        }
+        for (const [i, j] of this.overlayBonds) {
+          const a = oScr[i], b = oScr[j];
+          const w2 = bondW * pr.scale * ((a[3] + b[3]) / 2);
+          if (w2 <= 0.15) continue;
+          const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+          const zi = oRot[i][2], zj = oRot[j][2];
+          const ci = overlayColor(elementColor(this.overlay.symbols[i]));
+          const cj = overlayColor(elementColor(this.overlay.symbols[j]));
+          prims.push({
+            kind: 'obond', z: zi * 0.75 + zj * 0.25, dashed: true,
+            x1: a[0], y1: a[1], x2: mx, y2: my,
+            width: w2, color: ci, alpha: OVERLAY_ALPHA,
+          });
+          prims.push({
+            kind: 'obond', z: zj * 0.75 + zi * 0.25, dashed: true,
+            x1: mx, y1: my, x2: b[0], y2: b[1],
+            width: w2, color: cj, alpha: OVERLAY_ALPHA,
+          });
+        }
+      }
       prims.sort((p, q) => p.z - q.z);
 
       for (const p of prims) {
-        if (p.kind === 'bond') this._drawBond(ctx, p);
+        if (p.kind === 'bond' || p.kind === 'obond') this._drawBond(ctx, p);
         else this._drawAtom(ctx, p);
       }
 
@@ -554,29 +670,34 @@
     }
 
     _drawBond(ctx, p) {
-      ctx.strokeStyle = rgba(p.color, 0.88);
+      ctx.strokeStyle = rgba(p.color, p.alpha === undefined ? 0.88 : p.alpha);
       ctx.lineWidth = Math.max(1, p.width);
+      // 叠加结构的键用虚线：颜色相近的两种元素（比如两边都是碳）
+      // 光靠半透明仍然分不清哪个键属于哪个结构
+      if (p.dashed) ctx.setLineDash([Math.max(3, p.width * 1.6), Math.max(2, p.width * 1.1)]);
       ctx.beginPath();
       ctx.moveTo(p.x1, p.y1);
       ctx.lineTo(p.x2, p.y2);
       ctx.stroke();
+      if (p.dashed) ctx.setLineDash([]);
     }
 
     _drawAtom(ctx, p) {
       const [x, y] = p.screen;
+      const alpha = p.alpha === undefined ? 1 : p.alpha;
       const r = Math.max(1.2, p.radius);
       const g = ctx.createRadialGradient(
         x - r * 0.35, y - r * 0.35, r * 0.1,
         x, y, r
       );
-      g.addColorStop(0, rgba(p.color.map((c) => Math.min(255, c + 70))));
-      g.addColorStop(0.55, rgba(p.color));
-      g.addColorStop(1, rgba(p.color.map((c) => Math.round(c * 0.45))));
+      g.addColorStop(0, rgba(p.color.map((c) => Math.min(255, c + 70)), alpha));
+      g.addColorStop(0.55, rgba(p.color, alpha));
+      g.addColorStop(1, rgba(p.color.map((c) => Math.round(c * 0.45)), alpha));
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+      ctx.strokeStyle = `rgba(0,0,0,${0.35 * alpha})`;
       ctx.lineWidth = Math.min(1.5, r * 0.08);
       ctx.stroke();
     }
@@ -698,5 +819,9 @@
 
   // 导出
   MoleculeViewer.ELEMENTS = { covalent: COVALENT, vdw: VDW, colors: COLORS };
+  // 图例色块要和画布上用**同一个**混色函数，否则图例说"橙色那个是叠加结构"、
+  // 画面上却是另一个颜色 —— 这种不一致比没有图例更糟
+  MoleculeViewer.overlayColor = overlayColor;
+  MoleculeViewer.OVERLAY_ALPHA = OVERLAY_ALPHA;
   global.MoleculeViewer = MoleculeViewer;
 })(typeof window !== 'undefined' ? window : globalThis);

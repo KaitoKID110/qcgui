@@ -1042,6 +1042,80 @@ def create_app(manager: JobManager | None = None) -> Flask:
             }), 400
         return jsonify(result.to_dict())
 
+    @app.get("/api/jobs/<job_id>/overlay/<other_id>")
+    def api_job_overlay(job_id: str, other_id: str):
+        """两个任务的结构叠加 + RMSD（叠加前 / 最优叠加后）。
+
+        为谁做的：GaussView 里"优化前 vs 优化后""两个构象""反应物 vs 产物"
+        叠起来看是常规操作，本项目原先一次只能看一个结构，没法定量比较 ——
+        "看起来叠上了"恰恰是最不可靠的判断。
+
+        约定：**第一个 id 是参考结构（不动），第二个被叠上来**。
+        允许 ``<id>`` 与 ``<other_id>`` 相同 —— 那是"和自己比"，RMSD 必须为 0，
+        正好也是验证这条链路的最简例子。
+
+        几何来自两侧 ``result.json`` 里的结果几何（不是输入几何）——
+        叠加要比较的是"算出来的结构"。
+        计算全部在纯几何层（:func:`qcgui.model.geometry.overlay`）完成，
+        本进程依旧不 import 任何引擎。
+        """
+        from ..model.geometry import AlignmentError, overlay
+
+        sides: dict[str, dict] = {}
+        for key, jid in (("a", job_id), ("b", other_id)):
+            record = mgr.store.get(jid)
+            if record is None:
+                return jsonify({"error": f"任务不存在: {jid}"}), 404
+            result = mgr.store.load_result(jid)
+            geometry = (result.geometry if result is not None else None) or {}
+            symbols = list(geometry.get("symbols") or [])
+            coords = list(geometry.get("coords") or [])
+            if not symbols or len(symbols) != len(coords):
+                return jsonify({
+                    "error": f"任务 {jid} 没有可用的结果几何"
+                             f"（叠加需要已算出结构、且结果里带几何的任务）"
+                }), 400
+            sides[key] = {
+                "job_id": jid,
+                "label": record.molecule or jid,
+                "job_type": record.job_type,
+                "status": record.status,
+                "symbols": [str(s) for s in symbols],
+            }
+            # 结果几何是**解析出来的数据**，形状不一定对（旧版本写下的 result.json、
+            # 手工改过的文件）。畸形坐标应当是 400，而不是一路抛到 500。
+            try:
+                sides[key]["coords"] = [
+                    [float(c[0]), float(c[1]), float(c[2])] for c in coords
+                ]
+            except (TypeError, ValueError, IndexError) as exc:
+                return jsonify({
+                    "error": f"任务 {jid} 的结果几何里有无法解析的坐标：{exc}"
+                }), 400
+
+        try:
+            info = overlay(sides["a"]["symbols"], sides["a"]["coords"],
+                           sides["b"]["symbols"], sides["b"]["coords"])
+        except AlignmentError as exc:
+            # 原子数/元素顺序不一致属于**用户选错了两个结构**，是 400 不是 500
+            return jsonify({"error": str(exc)}), 400
+
+        # 坐标已在 _as_coords 里验过是有限数，RMSD 必定是有限数，直接给出去
+        return jsonify({
+            "a": sides["a"],
+            # B 同时给原始与叠加后两份坐标：界面要把"没叠"和"叠好"都画得出来
+            "b": dict(sides["b"], aligned_coords=info["aligned_coords"]),
+            "rmsd_before": info["rmsd_before"],
+            "rmsd_after": info["rmsd_after"],
+            "n_atoms": info["n_atoms"],
+            "symbols": info["symbols"],
+            "rotation": info["rotation"],
+            "translation": info["translation"],
+            "moved": "b",
+            "same_job": job_id == other_id,
+            "units": "angstrom",
+        })
+
     @app.get("/api/jobs/<job_id>/file/<role>")
     def api_job_file(job_id: str, role: str):
         record = mgr.store.get(job_id)

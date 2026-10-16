@@ -169,6 +169,32 @@ def test_render_empty_does_not_throw():
     print("    空结构渲染只画提示文字，不抛异常")
 
 
+def test_overlay_second_structure_is_really_drawn():
+    """叠加对比：第二个结构必须**真的画在画布上**，取消后要清干净。
+
+    只看"overlay 字段有值"是不够的 —— 本项目已经三次栽在
+    "DOM 里有 / 数据对了，但屏幕上没有"。这里数的是画布上实际发出的
+    ``arc`` 调用（每个原子一个球）：叠加后必须**多出第二个结构的原子数**。
+    """
+    data = run_case("overlay")
+    # 3 + 3 个原子各一个球：第二个结构确实被画了
+    assert data["arcsAfter"] - data["arcsBefore"] == 6, data
+    assert data["overlayBonds"] == 2, f"第二个结构自己的成键要单独推断：{data}"
+    # 第二个结构在 9 Å 外，取景范围必须把它算进去，否则会被画到画布外
+    assert data["radiusAfter"] > data["radiusBefore"], f"叠加进来的原子没被算进取景：{data}"
+    # 取消 / 换主结构都要清干净，否则会留下别的参考系里的"幽灵分子"
+    assert data["clearedBySetMolecule"] is True, "换主结构必须清掉叠加"
+    assert data["afterClear"]["overlay"] is None and data["afterClear"]["bonds"] == 0, data
+    assert abs(data["afterClear"]["radius"] - data["radiusBefore"]) < 1e-12, data
+    # 叠加色要明显区别于元素色，否则用户分不清哪个是哪个
+    color = data["overlay_color"]
+    assert color[0] > 150 and color[0] > color[1] + 60, f"叠加色应偏品红：{color}"
+    assert color != data["carbon_color"], "叠加结构不能和主结构一个颜色"
+    print(f"    叠加：多画 {data['arcsAfter'] - data['arcsBefore']} 个球、"
+          f"{data['overlayBonds']} 根虚线键；取消后取景半径复原到 "
+          f"{data['afterClear']['radius']:.3f}")
+
+
 def test_playback_state_machine():
     data = run_case("playback_state")
     assert data["idle"] is False

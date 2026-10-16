@@ -23,6 +23,9 @@ const state = {
   orbComp: null,
   orbCompPartition: 'mulliken',
   orbCompOrbital: 'homo',
+  // 结构叠加（feat/overlay-rmsd）：最近一次叠合结果与被叠加的任务 id
+  overlay: null,
+  overlayOther: null,
   // —— 几何参数表（feat/geom-table）：数据来自 /api/geometry/parameters（纯几何，不碰引擎）。
   // geomSource 记住"这张表是哪套几何算出来的" —— 点行高亮前要拿它跟 3D 里
   // 显示的几何比对，否则原子编号会指到别的原子上（本项目踩过很多次）——
@@ -394,6 +397,15 @@ async function applyUrlParams() {
   }
   if (params.get('geomtest') === '1') {
     await runGeometryTableTest();
+  }
+  // ?overlay=<另一个任务 id>：把它叠到 ?job= 选中的任务上（便于分享与截图）
+  if (params.get('overlay') && job) {
+    await applyOverlay(job, params.get('overlay'),
+                       document.getElementById('overlay-section'));
+  }
+  // ?overtest=<任务 id>：叠加界面自检；?overbad=<不一致的任务 id> 顺带验失败路径
+  if (params.get('overtest')) {
+    await runOverlayUiTest(params.get('overtest'), params.get('overbad'));
   }
 }
 
@@ -1468,6 +1480,7 @@ function renderResult(job, result) {
   loadGeometrySection();            // 几何参数表（结果几何优先，其次载入的结构）
   loadBondOrderSection(job.job_id); // 键级要手动点「开始分析」才跑
   loadOrbCompSection(job.job_id);   // 轨道成分同样要手动点（Multiwfn 读波函数）
+  loadOverlaySection(job.job_id);   // 叠加要手动点「与当前结构叠加」才跑
 }
 
 function renderBatch(payload) {
@@ -2973,3 +2986,308 @@ async function openExternal(tool) {
 }
 
 document.addEventListener('DOMContentLoaded', init);
+
+// ---------------------------------------------------------------- 结构叠加 RMSD
+
+/**
+ * 选一个已完成任务，叠到**当前显示的结构**上，并报对齐前 / 对齐后两个 RMSD。
+ *
+ * 为什么两个数都要看：对齐前大、对齐后小 → 两个结构其实一样，只是摆放不同；
+ * 对齐后仍然大 → 构象真的不同（这才是"优化前后差多少"的答案）。
+ * 只给一个数的话，用户没法分辨这两种完全不同的情况。
+ *
+ * 计算全在后端（``GET /api/jobs/<id>/overlay/<other>``），前端只负责画 ——
+ * Kabsch 只能有一份实现，前端再写一遍迟早和后面报的数不一致。
+ */
+function overlaySection(jobId) {
+  const options = state.jobs
+    .filter((j) => j.status === 'done' && j.job_id !== jobId)
+    .slice(0, 80)
+    .map((j) => `<option value="${esc(j.job_id)}">${esc(j.molecule || j.job_id)}`
+      + ` · ${esc(j.job_type)} · ${esc(j.job_id.slice(0, 15))}</option>`)
+    .join('');
+  return `<div class="res-section" id="overlay-section">
+    <div class="res-section-head">结构叠加 RMSD <span class="muted">Kabsch 最优叠加</span></div>
+    <div class="ov-controls">
+      <select id="ov-other" class="grow">${options || '<option value="">没有其它已完成任务</option>'}</select>
+      <button class="btn small" id="ov-run"${options ? '' : ' disabled'}>与当前结构叠加</button>
+      <button class="btn ghost small" id="ov-clear" disabled>取消叠加</button>
+    </div>
+    <div id="ov-body">
+      <p class="hint">把另一个已完成任务的结构叠到当前结构上。对齐前 / 对齐后两个
+      RMSD 一起看：对齐后明显变小说明差别只是摆放不同；对齐后仍很大说明构象真的不同。
+      两个结构的原子数必须相同、元素顺序必须一致（本功能不会自动找对应原子）。</p>
+    </div>
+  </div>`;
+}
+
+function overlayReadout(data) {
+  const f = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(4));
+  const drop = data.rmsd_before > 1e-9
+    ? (1 - data.rmsd_after / data.rmsd_before) * 100 : 0;
+  return `<dl class="res-grid ov-grid">
+      <dt>原子数</dt><dd>${data.n_atoms}</dd>
+      <dt>对齐前 RMSD</dt><dd class="ov-before">${f(data.rmsd_before)} Å</dd>
+      <dt>对齐后 RMSD</dt><dd class="ov-after hi">${f(data.rmsd_after)} Å</dd>
+    </dl>
+    <p class="hint">参考 <b>${esc(data.a.label)}</b>（原色，不动）· 叠加
+      <b>${esc(data.b.label)}</b>（品红半透明、虚线键）</p>
+    <p class="hint">${drop > 1
+      ? `最优叠加把 RMSD 从 ${f(data.rmsd_before)} Å 降到 ${f(data.rmsd_after)} Å（降 ${drop.toFixed(1)}%）`
+      : '两个结构本来就在同一个摆放上，叠加前后没有差别'}</p>`;
+}
+
+function updateOverlayLegend(data) {
+  const line = $('viewer-overlay-legend');
+  if (!line) return;
+  if (!data) {
+    line.hidden = true;
+    line.innerHTML = '';
+    return;
+  }
+  // 用查看器导出的同一个混色函数取色，图例和画布才不会各说各话
+  const c = MoleculeViewer.overlayColor([190, 190, 190]);
+  line.hidden = false;
+  line.innerHTML = `<span class="ov-swatch ref"></span>${esc(data.a.label)}`
+    + `　<span class="ov-swatch ghost" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span>`
+    + `${esc(data.b.label)} · 对齐前 <b>${Number(data.rmsd_before).toFixed(4)}</b> Å`
+    + ` → 对齐后 <b class="hi">${Number(data.rmsd_after).toFixed(4)}</b> Å`;
+}
+
+function clearOverlayUi(notify) {
+  state.overlay = null;
+  if (state.viewer) state.viewer.clearOverlay();
+  const line = $('viewer-overlay-legend');
+  if (line) { line.hidden = true; line.innerHTML = ''; }
+  const body = $('ov-body');
+  if (body) body.innerHTML = '<p class="hint">已取消叠加，当前只显示一个结构。</p>';
+  const btn = $('ov-clear');
+  if (btn) btn.disabled = true;
+  if (notify) toast('已取消叠加');
+}
+
+async function applyOverlay(jobId, otherId, node) {
+  const holder = node || document.getElementById('overlay-section');
+  const out = holder ? holder.querySelector('#ov-body') : null;
+  if (!otherId) {
+    toast('没有可叠加的其它已完成任务', 'warn');
+    return null;
+  }
+  if (out) out.innerHTML = '<div class="bo-loading">读取两个结构并做最优叠加…</div>';
+  try {
+    const data = await api('/api/jobs/' + encodeURIComponent(jobId)
+      + '/overlay/' + encodeURIComponent(otherId));
+    state.overlay = data;
+    state.viewer.setOverlay({
+      symbols: data.b.symbols,
+      coords: data.b.aligned_coords,
+      label: data.b.label,
+    });
+    if (out) out.innerHTML = overlayReadout(data);
+    updateOverlayLegend(data);
+    const clear = holder && holder.querySelector('#ov-clear');
+    if (clear) clear.disabled = false;
+    logLine(`叠加对比 ${data.a.label} ↔ ${data.b.label}：对齐前 `
+      + `${Number(data.rmsd_before).toFixed(4)} Å → 对齐后 `
+      + `${Number(data.rmsd_after).toFixed(4)} Å`, 'l-dim');
+    return data;
+  } catch (err) {
+    state.overlay = null;
+    state.viewer.clearOverlay();
+    updateOverlayLegend(null);
+    if (out) out.innerHTML = `<div class="bo-error">叠加失败：${esc(err.message)}</div>`;
+    toast('叠加失败: ' + err.message, 'err');
+    logLine('✖ 叠加失败：' + err.message, 'l-err');
+    return null;
+  }
+}
+
+/**
+ * 把叠加区挂到结果面板上。
+ *
+ * 插入顺序：结论横幅 → 扫描曲线 → 键级 → 叠加。
+ * 结论横幅永远在最上面（那是"这个结果能不能用"），这条顺序本项目已经踩过坑
+ * （扫描区把结论横幅挤到滚动区下面，截图才发现），所以这里显式避让。
+ */
+function loadOverlaySection(jobId) {
+  const body = $('result-body');
+  const old = document.getElementById('overlay-section');
+  if (old) old.remove();
+
+  const holder = document.createElement('div');
+  holder.innerHTML = overlaySection(jobId);
+  const node = holder.firstElementChild;
+  const anchor = document.getElementById('bondorder-section')
+    || document.getElementById('scan-section')
+    || body.querySelector('.res-verdict, .res-warning');
+  if (anchor) anchor.after(node);
+  else body.prepend(node);
+
+  node.querySelector('#ov-run').addEventListener('click', () => {
+    applyOverlay(jobId, node.querySelector('#ov-other').value, node);
+  });
+  node.querySelector('#ov-clear').addEventListener('click', () => clearOverlayUi(true));
+  return node;
+}
+
+/**
+ * 真浏览器验证「结构叠加 RMSD」这条链路。
+ *
+ * 为什么非要真浏览器：本项目已经三次栽在"DOM 里有但屏幕上没有"。这里要证明的
+ * 恰恰是**两个结构真的同时画在画布上**，所以除了读数还在 DOM 里，
+ * 还要：
+ *   * 数画布上实际发出了多少个 ``arc``（每个原子一个球）；
+ *     叠加后必须等于"主结构原子数 + 被叠加结构原子数"
+ *   * 比较开启叠加前后的画布像素，确认画面**真的变了**
+ *   * 把两个结构的投影点都算出来，确认都落在画布可见区内
+ *
+ * ``badId`` 给了就再跑一遍**失败路径**：选一个原子数/元素顺序不一致的结构
+ * 点「与当前结构叠加」，必须显示红色错误，而且不能留下任何叠加数据/图例/
+ * 多画的球 —— 项目规矩里最坏的情况就是"算错了还显示绿色成功"。
+ */
+async function runOverlayUiTest(otherId, badId) {
+  const out = document.createElement('pre');
+  out.id = 'overtest-output';
+  out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
+    + 'color:#0f0;background:#000;padding:4px;max-width:96vw;white-space:pre-wrap';
+  document.body.appendChild(out);
+  const lines = [];
+  const canvas = $('viewer');
+
+  /** 统计下一次重绘会画几个球（arc 调用次数）。 */
+  const countArcs = () => {
+    const proto = Object.getPrototypeOf(canvas.getContext('2d'));
+    const original = proto.arc;
+    let n = 0;
+    proto.arc = function (...args) { n += 1; return original.apply(this, args); };
+    try { state.viewer.render(); } finally { proto.arc = original; }
+    return n;
+  };
+  /** 取画布像素快照（用于"画面真的变了"）。 */
+  const snapshot = () => {
+    state.viewer.render();
+    try { return canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data; }
+    catch (err) { return null; }
+  };
+  const changedPixels = (a, b) => {
+    if (!a || !b) return -1;
+    let n = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      if (a[i] !== b[i] || a[i + 1] !== b[i + 1] || a[i + 2] !== b[i + 2]) n += 1;
+    }
+    return n;
+  };
+
+  try {
+    const section = document.getElementById('overlay-section');
+    lines.push(`section=${section ? 'PASS' : 'FAIL'}`);
+    if (section) {
+      const rect = section.getBoundingClientRect();
+      lines.push(`visible=${rect.width > 40 && rect.height > 10 ? 'PASS' : 'FAIL'}`
+        + ` w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+      const bodyKids = Array.from($('result-body').children)
+        .map((n) => n.id || n.className);
+      lines.push(`order=${bodyKids.join('>')}`);
+    }
+
+    const primaryAtoms = state.viewer.symbols.length;
+    const arcsBefore = countArcs();
+    const shotBefore = snapshot();
+
+    const sel = document.getElementById('ov-other');
+    const hasOption = !!(sel && Array.from(sel.options).some((o) => o.value === otherId));
+    lines.push(`option_present=${hasOption ? 'PASS' : 'FAIL'}`
+      + ` options=${sel ? sel.options.length : 0}`);
+    if (sel) sel.value = otherId;
+    // 点**真按钮**（不是直接调函数）—— 接线错了这里就会露馅
+    document.getElementById('ov-run').click();
+
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      const body = document.getElementById('ov-body');
+      if (state.overlay && body && /对齐后/.test(body.textContent)) break;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    const body = document.getElementById('ov-body');
+    const text = body ? body.textContent.replace(/\s+/g, ' ').trim() : '';
+    lines.push(`readout=${/对齐前/.test(text) && /对齐后/.test(text) ? 'PASS' : 'FAIL'}`);
+    lines.push(`readout_text="${text.slice(0, 160)}"`);
+    if (!state.overlay) {
+      lines.push('ERROR 叠加没有产生数据');
+    } else {
+      lines.push(`rmsd_before=${Number(state.overlay.rmsd_before).toFixed(6)}`);
+      lines.push(`rmsd_after=${Number(state.overlay.rmsd_after).toFixed(6)}`);
+      lines.push(`viewer_overlay_atoms=${state.viewer.overlay ? state.viewer.overlay.symbols.length : 0}`);
+      lines.push(`viewer_overlay_bonds=${state.viewer.overlayBonds.length}`);
+      const legend = document.getElementById('viewer-overlay-legend');
+      lines.push(`legend=${legend && !legend.hidden && /对齐后/.test(legend.textContent) ? 'PASS' : 'FAIL'}`);
+      lines.push(`legend_text="${legend ? legend.textContent.replace(/\s+/g, ' ').trim().slice(0, 140) : ''}"`);
+
+      const arcsAfter = countArcs();
+      const expected = primaryAtoms
+        + (state.viewer.overlay ? state.viewer.overlay.symbols.length : 0);
+      lines.push(`arcs_before=${arcsBefore} arcs_after=${arcsAfter} expected=${expected}`);
+      lines.push(`both_structures_drawn=${arcsAfter === expected && arcsBefore === primaryAtoms
+        ? 'PASS' : 'FAIL'}`);
+
+      const shotAfter = snapshot();
+      const changed = changedPixels(shotBefore, shotAfter);
+      lines.push(`canvas_changed=${changed > 200 ? 'PASS' : 'FAIL'} changed_px=${changed}`);
+
+      // 两个结构的投影点都要落在画布可见区内 —— 这才是"用户看得见"
+      const pr = state.viewer._project();
+      const inside = (coords) => coords.map((p) => state.viewer._toScreen(
+        state.viewer._rotate(p, pr), pr
+      )).filter((s) => s[0] >= 0 && s[1] >= 0
+        && s[0] <= canvas.clientWidth && s[1] <= canvas.clientHeight).length;
+      const inPrimary = inside(state.viewer.coords);
+      const inOverlay = inside(state.viewer.overlay.coords);
+      lines.push(`on_screen=${inPrimary === primaryAtoms
+        && inOverlay === state.viewer.overlay.coords.length ? 'PASS' : 'FAIL'}`
+        + ` primary=${inPrimary}/${primaryAtoms} overlay=${inOverlay}/${state.viewer.overlay.coords.length}`);
+    }
+
+    // 取消叠加：画面必须回到只有一个结构
+    const clearBtn = document.getElementById('ov-clear');
+    if (clearBtn) {
+      clearBtn.click();
+      const arcsCleared = countArcs();
+      lines.push(`clear=${state.viewer.overlay === null && arcsCleared === primaryAtoms
+        ? 'PASS' : 'FAIL'} arcs=${arcsCleared} expected=${primaryAtoms}`);
+    }
+
+    // 失败路径：选一个**不兼容**的结构（原子数或元素顺序不一致）再点一次。
+    // 要证明的是"失败时用户看到的是什么"：必须是红色错误，且不能留下任何
+    // 叠加数据、图例、或者多画出来的球 —— 否则就是"算错了还显示绿点"。
+    if (badId) {
+      const sel2 = document.getElementById('ov-other');
+      const hasBad = !!(sel2 && Array.from(sel2.options).some((o) => o.value === badId));
+      lines.push(`bad_option_present=${hasBad ? 'PASS' : 'FAIL'}`);
+      if (sel2) sel2.value = badId;
+      document.getElementById('ov-run').click();
+      let errNode = null;
+      const errDeadline = Date.now() + 30000;
+      while (Date.now() < errDeadline) {
+        errNode = document.querySelector('#ov-body .bo-error');
+        if (errNode) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const errText = errNode ? errNode.textContent.replace(/\s+/g, ' ').trim() : '';
+      lines.push(`error_shown=${errNode ? 'PASS' : 'FAIL'}`);
+      lines.push(`error_text="${errText.slice(0, 140)}"`);
+      lines.push(`error_mentions_cause=${/原子数|元素顺序/.test(errText) ? 'PASS' : 'FAIL'}`);
+      lines.push(`error_no_overlay_data=${state.overlay === null
+        && state.viewer.overlay === null ? 'PASS' : 'FAIL'}`);
+      const legend2 = document.getElementById('viewer-overlay-legend');
+      lines.push(`error_no_legend=${legend2 && legend2.hidden ? 'PASS' : 'FAIL'}`);
+      const arcsErr = countArcs();
+      lines.push(`error_only_primary_drawn=${arcsErr === primaryAtoms ? 'PASS' : 'FAIL'}`
+        + ` arcs=${arcsErr} expected=${primaryAtoms}`);
+    }
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+  out.textContent = '__OVERTEST__' + lines.join(' | ') + '__END__';
+}
+

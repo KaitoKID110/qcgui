@@ -221,6 +221,50 @@ const CASES = {
     };
   },
 
+  /**
+   * 叠加对比：第二个结构必须真的进渲染管线，取消/换结构后要清干净。
+   *
+   * 数的是画布上**实际发出的 arc 调用**（每个原子一个球），不是
+   * "overlay 字段有没有值" —— 本项目已经三次栽在"数据对了但用户看不见"。
+   */
+  overlay() {
+    const V = loadViewer();
+    const canvas = makeCanvas();
+    const v = new V(canvas, {});
+    const mol = { symbols: ['C', 'C', 'O'], coords: [[0, 0, 0], [1.5, 0, 0], [0, 0, 1.4]] };
+    v.setMolecule(mol);
+    const radiusBefore = v.radius;
+    v.render();
+    const arcsBefore = canvas._calls.arc || 0;
+
+    // 第二个结构故意放在 9 Å 外：它必须被算进取景范围，否则会被画到画布外
+    v.setOverlay({
+      symbols: ['C', 'C', 'O'],
+      coords: [[9, 0, 0], [10.5, 0, 0], [9, 0, 1.4]],
+      label: 'other',
+    });
+    const radiusAfter = v.radius;
+    const overlayBonds = v.overlayBonds.length;
+    v.render();
+    const arcsAfter = canvas._calls.arc || 0;
+
+    // 换主结构必须把叠加清掉（否则会留下另一个参考系里的"幽灵分子"）
+    v.setMolecule({ symbols: ['O', 'H', 'H'], coords: [[0, 0, 0], [0, 0.76, 0], [0, -0.76, 0]] });
+    const clearedBySetMolecule = v.overlay === null;
+
+    v.setMolecule(mol);
+    v.setOverlay({ symbols: ['C', 'C', 'O'], coords: [[9, 0, 0], [10.5, 0, 0], [9, 0, 1.4]] });
+    v.clearOverlay();
+    const afterClear = { overlay: v.overlay, bonds: v.overlayBonds.length, radius: v.radius };
+
+    return {
+      radiusBefore, radiusAfter, arcsBefore, arcsAfter, overlayBonds,
+      clearedBySetMolecule, afterClear,
+      overlay_color: V.overlayColor([128, 128, 128]),
+      carbon_color: V.ELEMENTS.colors.C,
+    };
+  },
+
   /** 播放/暂停状态机 */
   playback_state() {
     const V = loadViewer();
