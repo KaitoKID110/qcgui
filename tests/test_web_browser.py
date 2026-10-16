@@ -453,6 +453,85 @@ def test_overlay_two_structures_in_real_browser():
     print("    两个结构同时在画布上，对齐前/后两个 RMSD 都在页面里显示")
 
 
+def test_overlay_mismatch_shows_a_red_error_not_a_green_number():
+    """两个结构不兼容时，用户必须看到**红色错误**，而不是一个假数字。
+
+    这是项目规矩「最坏的 bug 不是算错，是算错了还显示绿点」的直接检验。
+    后端的 400 早就有测试了，但"那时候用户看到的是什么"只有真页面能回答：
+    所以这里在真 Chrome 里再点一次「与当前结构叠加」（选中一个原子数不同的
+    任务），并逐条检查
+
+    * ``#ov-body`` 里出现 ``.bo-error`` 且文字点明了原因（原子数/元素顺序）
+    * 不能留下叠加数据、不能出现画布图例
+    * 画布上不能多出任何球（只画主结构）
+    * **成功路径同一个页面里也要照常工作**（防止"为了报错把正常路径搞坏"）
+    """
+    from qcgui.model import JobSpec, JobType, Molecule, Result
+
+    symbols = ["C", "O", "H", "N", "H", "C"]
+    coords = [[0.0, 0.0, 0.0], [1.21, 0.02, -0.31], [-0.55, 0.94, 0.12],
+              [0.35, -1.15, 0.63], [1.72, 0.51, 0.44], [-1.30, -0.42, 0.10]]
+    moved = [[-c[1] + 1.0, c[0] - 2.0, c[2] + 3.5] for c in coords]
+    # 原子数不同（3 vs 6）—— 后端必须 400，界面上必须变成红色错误
+    bad_symbols = ["O", "H", "H"]
+    bad_coords = [[0.0, 0.0, 0.117], [0.0, 0.757, -0.469], [0.0, -0.757, -0.469]]
+
+    server = Server()
+    try:
+        ids = []
+        for tag, sym, xyz in (("errref", symbols, coords),
+                              ("errmov", symbols, moved),
+                              ("errbad", bad_symbols, bad_coords)):
+            job_id = f"20200101-000000-{tag}"
+            body = "\n".join(f"{s} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}"
+                             for s, c in zip(sym, xyz))
+            molecule = Molecule.from_xyz(f"{len(sym)}\n{tag}\n{body}\n", name=tag)
+            spec = JobSpec(molecule=molecule, job_type=JobType.OPT,
+                           method="HF", basis="STO-3G")
+            server.manager.store.create(spec, job_id=job_id)
+            job_dir = server.manager.store.job_dir(job_id)
+            (job_dir / "jobspec.json").write_text(spec.canonical_json(), encoding="utf-8")
+            Result(status="done", job_type="opt", method="HF",
+                   geometry={"symbols": sym, "coords": xyz, "units": "angstrom"},
+                   job_dir=str(job_dir)).save(job_dir / "result.json")
+            server.manager.store.update(job_id, status="done", final_energy=-1.0)
+            ids.append(job_id)
+
+        chrome = _browser()
+        profile = Path(tempfile.mkdtemp(prefix="qcgui_chrome_"))
+        url = (f"{server.base}/?nosse=1&job={ids[0]}&overtest={ids[1]}"
+               f"&overbad={ids[2]}")
+        proc = subprocess.run(
+            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+             "--window-size=1500,1000", "--virtual-time-budget=30000",
+             f"--user-data-dir={profile}", "--dump-dom", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        dom = proc.stdout or ""
+    finally:
+        server.close()
+
+    match = re.search(r"__OVERTEST__(.*?)__END__", dom, re.S)
+    assert match, f"没拿到叠加界面测试输出\nDOM 片段:\n{dom[:800]}"
+    text = match.group(1)
+    print("    " + "\n    ".join(p.strip() for p in text.split(" | ")))
+
+    assert "ERROR" not in text, text
+    # 失败路径
+    for key in ("bad_option_present=PASS", "error_shown=PASS",
+                "error_mentions_cause=PASS", "error_no_overlay_data=PASS",
+                "error_no_legend=PASS", "error_only_primary_drawn=PASS"):
+        assert key in text, f"{key} 没通过：{text}"
+    # 成功路径在同一个页面里仍然完好
+    for key in ("readout=PASS", "legend=PASS", "both_structures_drawn=PASS", "clear=PASS"):
+        assert key in text, f"成功路径被搞坏了：{key}：{text}"
+    # 错误文字要说人话（点明原子的对应关系问题），不能是内部异常
+    err = re.search(r'error_text="([^"]*)"', text)
+    assert err and "原子数" in err.group(1), f"错误提示没有说明原因：{text}"
+    assert "Traceback" not in err.group(1) and "500" not in err.group(1), text
+    print("    不兼容结构 → 页面出现红色错误、无叠加数据/图例/多余原子；成功路径不受影响")
+
+
 def test_page_loads_without_javascript_errors():
     """页面首屏不得抛 JS 异常：用一个会渲染失败的探针检测。"""
     server = Server()

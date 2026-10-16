@@ -383,8 +383,10 @@ async function applyUrlParams() {
     await applyOverlay(job, overlayWith, document.getElementById('overlay-section'));
   }
   // 叠加界面自动化测试（真点按钮 + 数画布上真的画了几个球）
+  // ?overbad=<第三个任务 id>：成功路径跑完之后，再点一次**不兼容**的结构，
+  // 检验失败时用户看到的是红色错误、而不是一个假数字或绿点。
   if (params.get('overtest')) {
-    await runOverlayUiTest(params.get('overtest'));
+    await runOverlayUiTest(params.get('overtest'), params.get('overbad'));
   }
 }
 
@@ -464,8 +466,12 @@ async function runBondOrderUiTest(jobId, kind) {
  *     叠加后必须等于"主结构原子数 + 被叠加结构原子数"
  *   * 比较开启叠加前后的画布像素，确认画面**真的变了**
  *   * 把两个结构的投影点都算出来，确认都落在画布可见区内
+ *
+ * ``badId`` 给了就再跑一遍**失败路径**：选一个原子数/元素顺序不一致的结构
+ * 点「与当前结构叠加」，必须显示红色错误，而且不能留下任何叠加数据/图例/
+ * 多画的球 —— 项目规矩里最坏的情况就是"算错了还显示绿色成功"。
  */
-async function runOverlayUiTest(otherId) {
+async function runOverlayUiTest(otherId, badId) {
   const out = document.createElement('pre');
   out.id = 'overtest-output';
   out.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;font-size:10px;'
@@ -575,6 +581,35 @@ async function runOverlayUiTest(otherId) {
       const arcsCleared = countArcs();
       lines.push(`clear=${state.viewer.overlay === null && arcsCleared === primaryAtoms
         ? 'PASS' : 'FAIL'} arcs=${arcsCleared} expected=${primaryAtoms}`);
+    }
+
+    // 失败路径：选一个**不兼容**的结构（原子数或元素顺序不一致）再点一次。
+    // 要证明的是"失败时用户看到的是什么"：必须是红色错误，且不能留下任何
+    // 叠加数据、图例、或者多画出来的球 —— 否则就是"算错了还显示绿点"。
+    if (badId) {
+      const sel2 = document.getElementById('ov-other');
+      const hasBad = !!(sel2 && Array.from(sel2.options).some((o) => o.value === badId));
+      lines.push(`bad_option_present=${hasBad ? 'PASS' : 'FAIL'}`);
+      if (sel2) sel2.value = badId;
+      document.getElementById('ov-run').click();
+      let errNode = null;
+      const errDeadline = Date.now() + 30000;
+      while (Date.now() < errDeadline) {
+        errNode = document.querySelector('#ov-body .bo-error');
+        if (errNode) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const errText = errNode ? errNode.textContent.replace(/\s+/g, ' ').trim() : '';
+      lines.push(`error_shown=${errNode ? 'PASS' : 'FAIL'}`);
+      lines.push(`error_text="${errText.slice(0, 140)}"`);
+      lines.push(`error_mentions_cause=${/原子数|元素顺序/.test(errText) ? 'PASS' : 'FAIL'}`);
+      lines.push(`error_no_overlay_data=${state.overlay === null
+        && state.viewer.overlay === null ? 'PASS' : 'FAIL'}`);
+      const legend2 = document.getElementById('viewer-overlay-legend');
+      lines.push(`error_no_legend=${legend2 && legend2.hidden ? 'PASS' : 'FAIL'}`);
+      const arcsErr = countArcs();
+      lines.push(`error_only_primary_drawn=${arcsErr === primaryAtoms ? 'PASS' : 'FAIL'}`
+        + ` arcs=${arcsErr} expected=${primaryAtoms}`);
     }
   } catch (err) {
     lines.push('ERROR ' + (err && err.message ? err.message : String(err)));

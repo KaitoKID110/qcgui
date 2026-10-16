@@ -550,6 +550,60 @@ def test_api_overlay_with_a_real_optimisation_job():
         server.close()
 
 
+def test_api_rejects_malformed_geometry_with_400():
+    """结果几何畸形时必须是 400，而不是 500、也不是一个假数字。
+
+    为什么单独测这条：``result.json`` 是**磁盘上的数据**，可能是旧版本写的、
+    手工改过的、或者写到一半崩掉的。三种畸形各有各的坏结果：
+
+    * 坐标不是三个数 → 不改的话会抛 ``IndexError``，用户看到 500「内部错误」
+    * ``symbols`` 与 ``coords`` 长度不符 → 不加检查会用错位的原子算出一个假 RMSD
+    * 坐标是 NaN/inf → 会得到 ``RMSD = nan`` 并**照常显示**，比报错糟得多
+
+    这三条都是"算错了却看起来正常"的典型，所以在这里钉死。
+    """
+    server = Server()
+    try:
+        good = add_job(server, _fake_job_id("okg"), SYMBOLS, COORDS, "ok")
+
+        def broken_result(tag: str, mutate) -> str:
+            job_id = add_job(server, _fake_job_id(tag), SYMBOLS, COORDS, tag)
+            path = server.manager.store.job_dir(job_id) / "result.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mutate(data["geometry"])
+            path.write_text(json.dumps(data), encoding="utf-8")
+            return job_id
+
+        # a) 有一行坐标只有两个数
+        two_numbers = broken_result(
+            "shortrow", lambda g: g["coords"].__setitem__(1, [1.0, 2.0]))
+        status, body = server.get(f"/api/jobs/{good}/overlay/{two_numbers}")
+        assert status == 400, (status, body)
+        assert "坐标" in body["error"], body
+
+        # b) symbols 比 coords 多（长度不一致）
+        short_coords = broken_result(
+            "shortcoords", lambda g: g.__setitem__("coords", g["coords"][:3]))
+        status, body = server.get(f"/api/jobs/{good}/overlay/{short_coords}")
+        assert status == 400, (status, body)
+        assert "几何" in body["error"], body
+
+        # c) 坐标里有 NaN —— 最危险的一种：算出来是 nan，界面照样显示
+        nan_coords = broken_result(
+            "nanrow",
+            lambda g: g["coords"].__setitem__(2, [float("nan"), 0.0, 0.0]))
+        status, body = server.get(f"/api/jobs/{good}/overlay/{nan_coords}")
+        assert status == 400, (status, body)
+        assert "有限数" in body["error"] or "坐标" in body["error"], body
+
+        # 反过来（好任务当参考、坏任务当被叠）也一样
+        status, body = server.get(f"/api/jobs/{nan_coords}/overlay/{good}")
+        assert status == 400, (status, body)
+    finally:
+        server.close()
+    print("    畸形的 result.json（短行 / 长度不符 / NaN）→ 一律 400，不给 500 也不给 nan")
+
+
 # ---------------------------------------------------------------- 脚本模式
 
 def _main() -> int:
