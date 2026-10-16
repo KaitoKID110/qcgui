@@ -128,6 +128,103 @@ def bond_set(symbols, coords, tolerance: float = _BOND_TOLERANCE) -> set[tuple[i
     return bonds
 
 
+# ------------------------------------------------------------------ 几何参数表
+
+def _parameter(symbols, atoms, value: float, unit: str) -> dict:
+    """组装一条几何参数。``label`` 用 ``元素+下标``（0 起，与 ORCA 输入一致）——
+    光有元素符号分不清是哪个碳，编号对不上正是本项目反复踩过的一类问题。"""
+    label = "–".join(f"{symbols[i]}{i}" for i in atoms)
+    return {"atoms": list(atoms), "label": label, "value": value, "unit": unit}
+
+
+def _by_value(rows: list[dict]) -> list[dict]:
+    """按值从小到大排；值相同时按原子下标，保证同样的几何每次得到同样的顺序。
+
+    界面要「按值排序」——最小/最大的键长、最扁的键角一眼就能看出来。
+    这里先排好，前端就不必再排一遍（两边各排一次迟早会不一致）。
+    """
+    return sorted(rows, key=lambda r: (r["value"], r["atoms"]))
+
+
+def geometry_parameters(symbols, coords) -> dict:
+    """把一套几何里**所有**键长 / 键角 / 二面角列出来（GaussView 的 Table 窗口那种）。
+
+    为什么要一次全列：用鼠标一个个点原子只能看单个测量值，
+    既看不全也没法比较（"这根 C–O 比那根长多少"根本没法问）。
+
+    三组都由 :func:`bond_set` 判出的键接决定，数值一律走 :func:`measure` ——
+    即"已经校准过的那个实现"（二面角约定尤其容易写反，绝不能另写一套）。
+
+    返回 ``{"bonds": [...], "angles": [...], "dihedrals": [...]}``，每条是
+    ``{"atoms": [0 起下标...], "label": "H1–O0–H2", "value": 104.5, "unit": "°"}``；
+    键长单位 ``Å``，键角/二面角单位 ``°``。每组按值升序。
+
+    * 键角：每个原子的**成键**邻居两两配对，中心原子在中间
+    * 二面角：每条键两侧各取一个邻居（同一原子被取到两次时跳过 ——
+      三元环里那正是"i 和 l 是同一个原子"的退化情形，量不出二面角）
+
+    原子数与坐标数不一致时抛 ``ValueError``：与其返回一张**对不上的表**
+    （编号会整体错位，用户看着还挺像回事），不如让调用方明确报错。
+    """
+    symbols = list(symbols or ())
+    coords = list(coords or ())
+    if len(symbols) != len(coords):
+        raise ValueError(
+            f"原子数与坐标数不一致：{len(symbols)} 个元素符号 vs {len(coords)} 组坐标"
+        )
+    points: list[tuple[float, float, float]] = []
+    for index, coord in enumerate(coords):
+        try:
+            # 多给一个数也当坏输入：悄悄忽略第 4 个数，用户拿到的是
+            # "看着像回事"的表（这正是本模块最不想要的失败方式）
+            if len(coord) != 3:
+                raise ValueError("坐标必须是三个数")
+            points.append((float(coord[0]), float(coord[1]), float(coord[2])))
+        except (TypeError, ValueError, IndexError, KeyError) as exc:
+            raise ValueError(f"第 {index} 个原子的坐标不是三个数字：{coord!r}") from exc
+
+    pairs = sorted(bond_set(symbols, points))
+    neighbours: dict[int, set[int]] = {i: set() for i in range(len(symbols))}
+    for i, j in pairs:
+        neighbours[i].add(j)
+        neighbours[j].add(i)
+
+    bonds: list[dict] = []
+    for i, j in pairs:
+        value = measure(symbols, points, "B", (i, j))
+        if value is not None:
+            bonds.append(_parameter(symbols, (i, j), value, "Å"))
+
+    angles: list[dict] = []
+    for center in range(len(symbols)):
+        near = sorted(neighbours[center])
+        for a in range(len(near)):
+            for b in range(a + 1, len(near)):
+                atoms = (near[a], center, near[b])
+                value = measure(symbols, points, "A", atoms)
+                if value is not None:
+                    angles.append(_parameter(symbols, atoms, value, "°"))
+
+    dihedrals: list[dict] = []
+    for i, j in pairs:
+        left = sorted(neighbours[i] - {j})
+        right = sorted(neighbours[j] - {i})
+        for a in left:
+            for b in right:
+                if a == b:
+                    continue
+                atoms = (a, i, j, b)
+                value = measure(symbols, points, "D", atoms)
+                if value is not None:
+                    dihedrals.append(_parameter(symbols, atoms, value, "°"))
+
+    return {
+        "bonds": _by_value(bonds),
+        "angles": _by_value(angles),
+        "dihedrals": _by_value(dihedrals),
+    }
+
+
 @dataclass(frozen=True)
 class ConnectivityChange:
     """两套几何之间的成键差异。"""

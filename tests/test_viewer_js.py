@@ -215,6 +215,24 @@ def test_labels_are_drawn_with_an_outline():
     print(f"    编号：{data['on_stroke']} 次描边 + {data['on_fill']} 次填字；关闭时 0 次")
 
 
+def test_highlight_draws_rings_for_the_selected_atoms():
+    """高亮：几何参数表点一行 → 3D 里圈出对应原子。
+
+    关键是 **画出来了** 而不是"数据设进去了"：``highlightDrawCount``
+    数的是上次 render 真正画的高亮环个数。本项目已经三次栽在
+    "DOM/数据里有但屏幕上没有"，所以这里连描边调用都一起数。
+    """
+    data = run_case("highlight")
+    assert data["on"] == 2 and data["setAfter"] == [0, 2], data
+    assert data["drawn"] == 2, f"设了 2 个高亮却画了 {data['drawn']} 个环"
+    assert data["strokes_added"] > 0, "高亮环没有产生任何描边调用"
+    assert data["cleared"] == 0 and data["drawnAfterClear"] == 0, "清除高亮后还在画环"
+    assert data["afterSwap"] == 0, "换分子后旧的高亮下标必须作废"
+    # 越界/非法下标直接丢掉：3 个输入里只有 0 是合法的
+    assert data["filtered"] == 1 and data["drawnFiltered"] == 1, data
+    print(f"    高亮 2 个原子 → 画 {data['drawn']} 个环；清除/换分子/越界都正确")
+
+
 # ------------------------------------------------------------------ 脚本模式
 
 def _main() -> int:

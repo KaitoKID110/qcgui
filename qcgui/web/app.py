@@ -31,7 +31,7 @@ from ..external import (
     view_with_avogadro,
 )
 from ..jobs import BatchRunner, JobManager
-from ..model import JobSpec, JobType, Molecule, scan_warnings
+from ..model import JobSpec, JobType, Molecule, geometry_parameters, scan_warnings
 from ..model.trajectory import read_xyz_frames
 from ..orcatools import export_mo_cube, make_molden, probe as probe_orca_tools
 from ..paths import jobs_root
@@ -692,6 +692,28 @@ def create_app(manager: JobManager | None = None) -> Flask:
         except (RuntimeError, ValueError, TypeError) as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"molecule": molecule_to_dict(molecule)})
+
+    # ---------------------------------------------------------------- 几何参数
+
+    @app.post("/api/geometry/parameters")
+    def api_geometry_parameters():
+        """把一套几何里所有键长/键角/二面角算出来（结果面板的「几何参数」表用）。
+
+        用 POST 而不是 GET：坐标是**任意一套几何**，不是服务器上的某个对象 ——
+        前端自己决定拿哪套（优先任务结果，其次当前载入的结构），
+        服务器这边只做纯几何计算，不碰引擎、不读任务目录（架构铁律）。
+        """
+        payload = _json_payload()
+        symbols = payload.get("symbols")
+        coords = payload.get("coords")
+        if not isinstance(symbols, list) or not isinstance(coords, list):
+            return jsonify({"error": "需要 symbols 与 coords 两个数组"}), 400
+        try:
+            return jsonify(geometry_parameters(symbols, coords))
+        except ValueError as exc:
+            # 原子数对不上这类输入必须明确 400 —— 静默返回一张错位的表
+            # 比报错糟糕得多：编号整体错位，看着还挺像回事
+            return jsonify({"error": str(exc)}), 400
 
     # ---------------------------------------------------------------- 任务
 

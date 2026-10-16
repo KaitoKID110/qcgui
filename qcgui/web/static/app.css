@@ -557,3 +557,38 @@ table.data tr.min td { color: #9ecbff; }
   line-height: 1.5;
 }
 
+/* ------------------------------------------------------------ 几何参数表 */
+/* 键长/键角/二面角一览（GaussView 的 Table 那种）。行要高亮得出来：
+   点一行就去 3D 里圈出对应原子，所以选中行必须有明确的视觉反馈。 */
+
+.geom-tabs { gap: 0; margin: 4px 0 6px; display: inline-flex; }
+.geom-tabs button { display: inline-flex; align-items: center; gap: 5px; }
+.geom-count {
+  font-style: normal;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .07);
+  color: var(--text-dim);
+}
+.geom-tabs button.active .geom-count { background: rgba(47, 143, 224, .3); color: #cfe6ff; }
+
+/* 表体限高滚动：caffeine 这种 24 原子的分子有几十条二面角，
+   不限高会把下面真正重要的区块全推到看不见 */
+.geom-scroll { max-height: 190px; }
+
+.geom-table { font-variant-numeric: tabular-nums; }
+.geom-table .geom-idx { width: 26px; color: var(--text-faint); }
+.geom-table .geom-atoms { white-space: nowrap; }
+.geom-table .geom-value-head { text-align: right; }
+.geom-table .geom-value { text-align: right; font-family: var(--mono); white-space: nowrap; }
+.geom-table .geom-unit { margin-left: 5px; color: var(--text-faint); font-size: 10.5px; }
+.geom-row { cursor: pointer; transition: background .12s; }
+.geom-row:hover { background: rgba(255, 255, 255, .05); }
+/* 选中的行：左侧色条 + 底色，跟 3D 里的青色高亮环是同一件事的两端 */
+.geom-row.active { background: rgba(34, 211, 238, .13); }
+.geom-row.active .geom-idx { box-shadow: inset 3px 0 0 0 #22d3ee; color: #22d3ee; }
+.geom-row.active .geom-value { color: #7fe7f7; font-weight: 600; }
+.geom-none td { color: var(--text-faint); text-align: center; padding: 8px 0; }
+
