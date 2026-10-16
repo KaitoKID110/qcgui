@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from qcgui.jobs import JobManager  # noqa: E402
+from qcgui.model import JobSpec, JobType, Molecule  # noqa: E402
 from qcgui.web.app import create_app  # noqa: E402
 
 WATER_HF_DEF2SVP = -75.960983978583
@@ -36,6 +37,16 @@ O   0.000000   0.000000   0.117300
 H   0.000000   0.757200  -0.469200
 H   0.000000  -0.757200  -0.469200
 """
+
+
+def _spec_for_store() -> JobSpec:
+    """给 JobStore.create() 用的最小任务定义（不真跑）。
+
+    列表接口的结论判定只读 result.json，不依赖 spec —— 用它是为了造出
+    一条**真实的任务记录**（否则列表里查不到这个 job_id）。
+    """
+    return JobSpec(molecule=Molecule.from_xyz(WATER_XYZ),
+                   job_type=JobType.ENERGY, method="HF", basis="STO-3G")
 
 
 class _Skipped(Exception):
@@ -720,6 +731,112 @@ def test_external_swaps_unreadable_role_for_a_readable_one():
         picked_av = _external_file("avogadro", job_id, loaded, server.manager)
         assert picked_av.endswith(".molden.input"), picked_av
         print("    Multiwfn/Avogadro 都拿到了自己能读的 Molden")
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------- 任务列表的实时结论（P0）
+
+def test_job_list_recomputes_verdict_instead_of_trusting_the_stored_one():
+    """列表里的结论必须**实时重算**，不能照着写库那一刻的 message 显示。
+
+    背景：``store.save_result()`` 只在**保存结果时**把 ``⛔`` / ``⚠`` 前缀写进
+    message，而几何/电荷守卫是后来才加的 —— 所以历史任务卡片永远停在旧结论上。
+    实测真实任务库：库里 95 个任务标着 ok，实时判定其实是 10 个 limited +
+    2 个 unusable；那两个 unusable 就是原子相距 0.300 / 0.150 Å 的坏几何。
+
+    这条钉住的是：**保存结果时不带前缀（模拟历史任务），列表接口也要给出正确结论**。
+    """
+    from qcgui.model import Result
+
+    server = Server()
+    try:
+        # 造一个坏几何结果，但**故意**把它存成"没有前缀"的样子 ——
+        # 直接写 result.json，绕过 save_result 的前缀逻辑，等价于历史任务
+        job_id = "20260101-000000-badgegeombad"
+        job_dir = server.manager.store.job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        result = Result(status="done", job_type="energy", method="HF/STO-3G")
+        result.geometry = {"symbols": ["C", "C"],
+                           "coords": [[0.0, 0.0, 0.0], [0.300, 0.0, 0.0]],
+                           "units": "angstrom"}
+        result.charge = 0
+        (job_dir / "result.json").write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False), encoding="utf-8")
+        server.manager.store.create(_spec_for_store(), job_id=job_id)
+        server.manager.store.update(job_id, status="done", message="")  # 无前缀
+
+        status, body = server.get("/api/jobs?limit=50")
+        assert status == 200, body
+        assert "total" in body, "列表应回报总数，界面才能如实说明截断"
+        row = next((j for j in body["jobs"] if j["job_id"] == job_id), None)
+        assert row is not None, "新建的任务没出现在列表里"
+        assert row["verdict"] == "unusable", row
+        assert row["message"].startswith("⛔"), row["message"]
+        assert "0.3" in row["message"], row["message"]
+        print("    bad-geometry 任务在列表里被判为 unusable，并带上 ⛔ 前缀")
+
+        # 正常几何不得误报
+        ok_id = "20260101-000001-badgegeomok"
+        ok_dir = server.manager.store.job_dir(ok_id)
+        ok_dir.mkdir(parents=True, exist_ok=True)
+        ok = Result(status="done", job_type="energy", method="HF/STO-3G")
+        ok.geometry = {"symbols": ["O", "H", "H"],
+                       "coords": [[0.0, 0.0, 0.1173], [0.0, 0.7572, -0.4692],
+                                  [0.0, -0.7572, -0.4692]],
+                       "units": "angstrom"}
+        ok.charge = 0
+        (ok_dir / "result.json").write_text(
+            json.dumps(ok.to_dict(), ensure_ascii=False), encoding="utf-8")
+        server.manager.store.create(_spec_for_store(), job_id=ok_id)
+        server.manager.store.update(ok_id, status="done", message="")
+
+        status, body = server.get("/api/jobs?limit=50")
+        row = next(j for j in body["jobs"] if j["job_id"] == ok_id)
+        assert row["verdict"] == "ok", row
+        assert not row["message"].startswith(("⛔", "⚠")), row["message"]
+        print("    正常几何仍是 ok、无徽章（零误报）")
+    finally:
+        server.close()
+
+
+def test_job_list_verdict_is_cached_but_invalidates_on_change():
+    """判定要缓存（列表是轮询的），但结果变了必须失效。
+
+    缓存用 result.json 的 mtime+size 当键，所以重写结果后必须重算 ——
+    否则用户重跑任务修好了几何，列表里那个红徽章会一直挂着。
+    """
+    from qcgui.model import Result
+
+    server = Server()
+    try:
+        job_id = "20260101-000002-badgecache"
+        job_dir = server.manager.store.job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        def write_result(gap):
+            r = Result(status="done", job_type="energy", method="HF/STO-3G")
+            r.geometry = {"symbols": ["C", "C"],
+                          "coords": [[0.0, 0.0, 0.0], [gap, 0.0, 0.0]],
+                          "units": "angstrom"}
+            r.charge = 0
+            (job_dir / "result.json").write_text(
+                json.dumps(r.to_dict(), ensure_ascii=False), encoding="utf-8")
+
+        server.manager.store.create(_spec_for_store(), job_id=job_id)
+        server.manager.store.update(job_id, status="done", message="")
+
+        write_result(0.300)          # 坏几何
+        _, body = server.get("/api/jobs?limit=50")
+        assert next(j for j in body["jobs"] if j["job_id"] == job_id)["verdict"] == "unusable"
+
+        time.sleep(0.01)             # 保证 mtime 变（有些文件系统精度只有 10ms）
+        write_result(1.500)          # 修好了
+        _, body = server.get("/api/jobs?limit=50")
+        row = next(j for j in body["jobs"] if j["job_id"] == job_id)
+        assert row["verdict"] == "ok", f"结果已改好，列表还挂着旧结论：{row}"
+        print("    结果改写后缓存正确失效（坏几何 → ok）")
     finally:
         server.close()
 

@@ -357,6 +357,85 @@ def _result_payload(result, spec=None) -> dict | None:
     return data
 
 
+#: 任务结论的前缀。与 ``jobs/store.py::save_result`` 保持一致 ——
+#: 前端就是靠 message 以这两个字符开头来画红/黄徽章的（见 app.js::renderJobs）。
+_VERDICT_PREFIX = {"unusable": "⛔ ", "limited": "⚠ "}
+
+#: 每个「结果文件」的判定缓存。键是 job_id，值是
+#: ``(mtime, size, verdict, verdict_label, reason)``。
+#:
+#: 为什么要缓存：``/api/jobs`` 每次刷新都要看 limit 个任务（默认 80），
+#: 实测 120 个任务全量「加载 + 判定」约 100 ms（0.84 ms/个）。单看能接受，
+#: 但列表是**轮询**的（有任务在跑时每 5 秒一次），没必要重复算同一批文件。
+#: 用 mtime+size 当失效条件：结果被重算覆盖时自动重算。
+_VERDICT_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
+
+
+def _verdict_for(job_id: str, result_path) -> tuple[str, str, str] | None:
+    """某个任务的**实时**判定 ``(verdict, label, reason)``；拿不到就 None。
+
+    为什么列表也要算：``store.save_result()`` 只在**写库那一刻**把结论前缀写进
+    message，而几何/电荷守卫是后来才加的 —— 历史任务卡片因此永远停在旧结论上。
+    实测：库里 95 个任务标着 ok，实时判定其实是 10 个 limited + 15 个 unusable。
+    卡片不刷新的话，那 25 个任务在列表里看着完全正常，正是本项目最怕的
+    「算错了却显示成功」。
+    """
+    try:
+        st = os.stat(result_path)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        return None
+
+    cached = _VERDICT_CACHE.get(job_id)
+    if cached and cached[0] == key[0] and cached[1] == key[1]:
+        return cached[2], cached[3], cached[4]
+
+    from ..model import Result
+
+    try:
+        result = Result.from_dict(json.loads(Path(result_path).read_text(encoding="utf-8")))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+    data = _result_payload(result, None)  # 守卫不看 spec（见 _result_payload 第三段）
+    if not data:
+        return None
+    verdict = data.get("verdict") or result.verdict
+    label = data.get("verdict_label") or result.verdict_label
+    reason = data.get("verdict_reason") or result.verdict_reason or ""
+    _VERDICT_CACHE[job_id] = (key[0], key[1], verdict, label, reason)
+    return verdict, label, reason
+
+
+def _job_payload(record) -> dict:
+    """列表用的任务字典：把**实时判定**补进去，让卡片能自己变红。
+
+    只加字段、不改行为：
+    * ``message`` 在前面带上 ``⛔ `` / ``⚠ `` —— 前端既有代码靠这个画徽章，
+      不用改前端；
+    * 另外给出结构化的 ``verdict`` / ``verdict_label``，以后前端想用可以直接用，
+      不必再解析字符串前缀。
+    """
+    data = record.to_dict()
+    # 只有「已完成」的任务才谈得上结果结论；失败/运行中不改它的 message
+    if record.status != "done":
+        return data
+    job_dir = Path(data.get("job_dir") or "")
+    result_path = job_dir / "result.json"
+    if not result_path.exists():
+        return data
+    got = _verdict_for(record.job_id, result_path)
+    if not got:
+        return data
+    verdict, label, reason = got
+    data["verdict"] = verdict
+    data["verdict_label"] = label
+    prefix = _VERDICT_PREFIX.get(verdict)
+    if prefix:
+        data["message"] = (prefix + (reason or label))[:500]
+    return data
+
+
 def _apply_charge_multiplicity(molecule: Molecule, payload: dict) -> Molecule:
     """把**顶层的** ``charge`` / ``multiplicity`` 应用到分子上。
 
@@ -769,7 +848,14 @@ def create_app(manager: JobManager | None = None) -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         limit = max(1, min(limit, 1000))
-        return jsonify({"jobs": [r.to_dict() for r in mgr.store.list(limit=limit)]})
+        # 用 _job_payload 而不是 record.to_dict()：列表里的结论必须**实时重算**，
+        # 否则历史任务会一直显示写库那一刻的旧结论（见 _verdict_for 的说明）。
+        # 同时回报总数，让界面能如实说明"只显示了前 N 条"，而不是静默截断 ——
+        # 实测两个"结果不可用"的任务排在第 84/86 名，界面上限曾是 80，
+        # 它们因此在列表里完全看不到。
+        records = mgr.store.list(limit=limit)
+        return jsonify({"jobs": [_job_payload(r) for r in records],
+                        "total": mgr.store.count()})
 
     @app.get("/api/jobs/<job_id>")
     def api_job(job_id: str):

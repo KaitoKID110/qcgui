@@ -1035,8 +1035,13 @@ function readLocalFile(file) {
 
 async function refreshJobs() {
   try {
-    const data = await api('/api/jobs?limit=80');
+    // 列表上限：以前是 80，但**结论徽章是按任务算的**，被截掉的老任务就等于
+    // 没有徽章 —— 实测两个"结果不可用"的坏几何任务排在第 84、86 名，
+    // 正好落在 80 之外，用户在列表里永远看不到它们变红。
+    // 所以放宽到 300，并把"只显示了前 N 条"如实标出来，不再静默截断。
+    const data = await api('/api/jobs?limit=300');
     state.jobs = data.jobs || [];
+    state.jobsTotal = data.total ?? state.jobs.length;
     renderJobs();
   } catch (err) {
     logLine('刷新任务失败: ' + err.message, 'l-err');
@@ -1068,7 +1073,15 @@ function startJobWatch(intervalMs = 5000) {
 
 function renderJobs() {
   const list = $('jobs-list');
-  $('jobs-count').textContent = state.jobs.length;
+  // 如实说明截断：总数超过显示上限时写清"还有多少条没列出来"，
+  // 否则用户会以为任务真的只有这么多（实测就是这么漏掉两个红徽章任务的）。
+  const shown = state.jobs.length;
+  const total = state.jobsTotal || shown;
+  const badge = $('jobs-count');
+  if (badge) {
+    badge.textContent = shown === total ? String(shown) : `${shown} / ${total}`;
+    badge.title = shown === total ? '' : `列表有上限，只显示了最近 ${shown} 条，另有 ${total - shown} 条未列出`;
+  }
   if (!state.jobs.length) {
     list.innerHTML = '<p class="empty">还没有任务</p>';
     return;

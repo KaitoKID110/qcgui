@@ -237,6 +237,18 @@ class JobStore:
             ).fetchall()
         return [_row_to_record(r) for r in rows]
 
+    def count(self) -> int:
+        """任务总数。
+
+        为什么需要它：``/api/jobs`` 有 ``limit``，界面据此只显示前 N 条。
+        以前界面既不知道总量、也不说"被截断了" —— 实测两个"结果不可用"的任务
+        排在第 84/86 名，而界面上限是 80，它们因此在列表里**完全看不见**。
+        有了总数，界面才能如实写出"只显示了前 300 条，另有 M 条未显示"。
+        """
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()
+        return int(row["n"]) if row else 0
+
     def load_spec(self, job_id: str) -> JobSpec | None:
         """读回任务定义；文件缺失**或读不出来**都返回 ``None``。
 
