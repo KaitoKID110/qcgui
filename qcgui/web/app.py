@@ -300,6 +300,36 @@ def _result_payload(result, spec=None) -> dict | None:
                                     message=problem))
                 added = True
 
+    # 第三段：结果侧几何/电荷合法性 —— **不看 spec、不看 job_type**。
+    #
+    # 为什么不能挂在上面两段的 `spec is not None and job_type in MOVING_JOB_TYPES`
+    # 上：实测反例 20261013-162908-bf2e781befd90603 是 `energy`（单点不在白名单里），
+    # 而且 `store.load_spec()` 会故意吞掉 Molecule 抛出的 ValueError 返回 None ——
+    # 即使放开白名单，补算仍会被 `spec is not None` 跳过。所以这一段的输入只有
+    # `result.geometry` 与电荷数组，两处缺口**同时**被绕开。
+    #
+    # 代价 O(n²) 最小间距（15 原子 = 105 次距离计算），与上面两段同级。
+    from ..model.charges import charge_sanity_problems, geometry_sanity_problems
+
+    geometry = result.geometry or {}
+    coords_after = geometry.get("coords")
+    symbols_after = list(geometry.get("symbols") or [])
+    if coords_after and len(symbols_after) == len(coords_after):
+        for issue in geometry_sanity_problems(symbols_after, coords_after):
+            if issue.code not in known:
+                issues.append(issue)
+                known.add(issue.code)
+                added = True
+    for issue in charge_sanity_problems(symbols_after, result.charge, {
+        "Löwdin 电荷": result.loewdin_charges,
+        "Mulliken 电荷": result.mulliken_charges,
+        "Mayer 电荷": result.mayer_charges,
+    }):
+        if issue.code not in known:
+            issues.append(issue)
+            known.add(issue.code)
+            added = True
+
     if added:
         result.issues = issues
         result.warnings = [i.message for i in issues]
