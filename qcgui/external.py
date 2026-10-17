@@ -189,20 +189,131 @@ def convert_with_obabel(src: str | Path, dst: str | Path, timeout: float = 60.0)
 
 # ------------------------------------------------------------------ 文件管理器
 
+#: explorer.exe 在受限令牌下 DLL 初始化失败时的退出码（STATUS_DLL_INIT_FAILED）。
+#: 实测本机 "打开结果文件夹" 一按就弹 "explorer.exe - 应用程序错误
+#: (0xc0000142)"，窗口不出现 —— 必须识别这个码才能兜底。
+_EXPLORER_DLL_INIT_FAILED = 0xC0000142
+
+#: 等 explorer 交接给已有窗口的宽限时间（秒）。
+#: 正常机器上 explorer.exe <dir> 会把请求转给已经常驻的 shell 进程然后退出，
+#: 通常远小于这个值；只有真的崩了才会立刻带着错误码退出。
+_EXPLORER_GRACE = 2.5
+
+
+def _explorer_failed(code: int | None) -> bool:
+    """explorer 的退出码是不是"起了但崩了"。
+
+    只认 0xC0000142 这一种：正常交接退出是 0 或 1（1 = 交给已有实例），
+    不能把它们当失败 —— 否则正常机器上每次都会误走兜底。
+    """
+    if code is None:
+        return False
+    return (code & 0xFFFFFFFF) == _EXPLORER_DLL_INIT_FAILED
+
+
+def _open_with_explorer(folder: Path, select: Path | None = None):
+    """用 explorer 打开目录（或选中文件）；失败返回 False。
+
+    直接执行真实动作再看退出码，不做"能不能跑"的猜测 ——
+    之前用 ``explorer /?`` 探测是错的：explorer 会真的开窗口然后挂住，
+    超时被误判成"可用"，于是静默失败。
+    """
+    args = ["explorer"]
+    if select is not None:
+        args += ["/select,", str(select)]
+    else:
+        args += [str(folder)]
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    try:
+        code = proc.wait(timeout=_EXPLORER_GRACE)
+    except subprocess.TimeoutExpired:
+        # 还在跑 = 窗口开起来了，正常
+        return True
+    # 已经退出：只有 DLL 初始化失败才算失败
+    return not _explorer_failed(code)
+
+
+def browse_folder_tk(path: str | Path, title: str = "结果文件") -> ToolResult:
+    """用自带的 Tk 浏览器打开目录（explorer.exe 不可用时的兜底）。
+
+    必须用**独立进程**启动，不能在本进程里 tk.Tk() + mainloop()：
+    tkinter 的事件循环要求在主线程，而 qcgui 的调用点在 Flask 的请求线程里，
+    直接建窗口会**静默失败**（实测：接口返回 ok，窗口根本不出现）。
+
+    所以这里起 ``qcgui_browse.py`` 的新进程 —— 它的主线程天然就是 Tk 线程。
+    """
+    folder = Path(path)
+    if not folder.is_dir():
+        return ToolResult(False, "explorer", f"目录不存在: {folder}")
+
+    browser = Path(__file__).with_name("qcgui_browse.py")
+    if not browser.is_file():
+        return ToolResult(False, "explorer", f"缺少浏览器脚本: {browser}")
+
+    # 用 pythonw（GUI 子系统）启动，避免多一个控制台窗口；找不到就退回 python
+    exe = Path(sys.executable)
+    if exe.name.lower().startswith("python"):
+        pyw = exe.with_name("pythonw.exe")
+        if pyw.is_file():
+            exe = pyw
+
+    try:
+        proc = subprocess.Popen(
+            [str(exe), str(browser), str(folder), title],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError as exc:
+        return ToolResult(False, "explorer",
+                          f"无法启动自带浏览器: {type(exc).__name__}: {exc}")
+
+    return ToolResult(True, "explorer", f"已打开 {folder}", pid=proc.pid)
+
+
 def open_in_file_manager(path: str | Path) -> ToolResult:
-    """在系统文件管理器里打开目录（或选中文件所在目录）。"""
+    """打开目录（或选中文件所在目录）。
+
+    默认用**自带浏览器**（``qcgui_browse.py``），因为它在这个环境里稳定可用。
+    想用系统资源管理器时，在 ``config.json`` 里设 ``"file_manager": "explorer"``。
+
+    为什么默认不是 explorer.exe：实测本机由服务进程启动 explorer 会以
+    ``0xC0000142``（DLL 初始化失败）退出并弹"应用程序错误"，窗口不出现；
+    而同一个 explorer.exe 由非受限进程启动是正常的。这跟路径、权限都无关，
+    是进程创建环境的限制 —— 与其让用户每次看到错误框，不如用自带的那套。
+    另外自带浏览器不依赖 shell 集成，远程桌面/无桌面会话里也能列出文件。
+    """
     target = Path(path)
     folder = target if target.is_dir() else target.parent
     if not folder.is_dir():
         return ToolResult(False, "explorer", f"目录不存在: {folder}")
 
+    mode = ""
     try:
-        if platform.system() == "Windows":
-            if target.is_file():
-                subprocess.Popen(["explorer", "/select,", str(target)])
-            else:
-                os.startfile(str(folder))  # noqa: S606 - Windows 专用
-        elif platform.system() == "Darwin":
+        from .config import load_config as _load_cfg
+        mode = str((_load_cfg() or {}).get("file_manager") or "").strip().lower()
+    except Exception:                    # noqa: BLE001 - 读不到配置就按默认走
+        mode = ""
+
+    system = platform.system()
+    if system == "Windows" and mode != "explorer":
+        # 默认路径：自带浏览器（独立进程，不依赖 shell 集成）
+        return browse_folder_tk(folder)
+
+    if system == "Windows":
+        # 显式要求用系统资源管理器
+        select = target if target.is_file() else None
+        if _open_with_explorer(folder, select):
+            return ToolResult(True, "explorer", f"已打开 {folder}")
+        # 资源管理器起不来 → 兜底到自带浏览器，别让按钮点了没反应
+        return browse_folder_tk(folder)
+
+    try:
+        if system == "Darwin":
             subprocess.Popen(["open", str(folder)])
         else:
             subprocess.Popen(["xdg-open", str(folder)])
