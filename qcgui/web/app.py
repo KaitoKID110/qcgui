@@ -79,23 +79,108 @@ SOLVENT_CHOICES = [
 # ------------------------------------------------------------------ 事件总线
 
 class EventBus:
-    """把 JobManager 的事件广播给所有 SSE 订阅者。"""
+    """把 JobManager 的事件广播给所有 SSE 订阅者。
+
+    **日志必须合批发**：实测一个 13 原子的优化任务，ORCA 输出
+    ``C_C_C_CO_opt.out`` 有 **296,389 行**。如果每行都发一个 SSE 事件，
+    前端就要做 296k 次 DOM 插入 + 296k 次 ``scrollTop`` 强制重排，
+    浏览器标签页直接被拖死（用户报的"算大分子时浏览器内存暴涨、电脑卡死"）。
+
+    所以这里把 ``log`` 事件按时间窗（``_FLUSH_INTERVAL``）攒成一批，
+    一条 SSE 消息带 ``lines`` 数组发出去。事件名**仍是 ``log``**，
+    前端既能吃 ``lines`` 也能吃单行 ``line``，向后兼容。
+    """
+
+    #: 攒多久发一次（秒）。120ms 对"实时日志"来说完全看不出来，
+    #: 但能把事件数从"每行一个"降到"每秒约 8 个"。
+    _FLUSH_INTERVAL = 0.12
+    #: 一批最多带多少行（避免单条 SSE 消息过大）。
+    _MAX_BATCH_LINES = 400
+    #: 单个任务最多积压多少行；超过就丢弃并计数（宁可少显示，不可拖死界面）。
+    _MAX_PENDING_LINES = 20_000
+    #: 单行最长保留字符数（ORCA 有时会打超长行）。
+    _MAX_LINE_CHARS = 4000
 
     def __init__(self) -> None:
         self._subs: set[queue.Queue] = set()
         self._lock = threading.Lock()
+        # 待发日志：job_id -> 行列表；以及各自的丢弃计数
+        self._pending: dict[str, list[str]] = {}
+        self._dropped: dict[str, int] = {}
+        self._flusher: threading.Thread | None = None
+        self._stop = threading.Event()
 
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=4000)
         with self._lock:
             self._subs.add(q)
+            self._ensure_flusher_locked()
         return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
             self._subs.discard(q)
 
+    # ---------- 合批 ----------
+
+    def _ensure_flusher_locked(self) -> None:
+        """确保后台冲批线程在跑（调用方已持锁）。"""
+        if self._flusher is not None and self._flusher.is_alive():
+            return
+        self._flusher = threading.Thread(
+            target=self._flush_loop, name="eventbus-flusher", daemon=True)
+        self._flusher.start()
+
+    def _flush_loop(self) -> None:
+        while not self._stop.wait(self._FLUSH_INTERVAL):
+            self.flush()
+
+    def flush(self) -> None:
+        """把积压的日志作为一批发出去（线程安全，可随时调用）。"""
+        with self._lock:
+            if not self._pending:
+                return
+            pending, self._pending = self._pending, {}
+            dropped, self._dropped = self._dropped, {}
+            subscribers = list(self._subs)
+        for job_id, lines in pending.items():
+            if not lines:
+                continue
+            payload: dict = {"job_id": job_id, "event": "log", "lines": lines}
+            n_drop = dropped.get(job_id) or 0
+            if n_drop:
+                payload["dropped"] = n_drop
+            for q in subscribers:
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    pass
+
     def publish(self, job_id: str, event: dict) -> None:
+        """发布一条事件。``log`` 会被攒起来合批，其余事件立刻发。
+
+        非日志事件前**先把积压冲掉**，保证"日志 → 完成"的顺序不会颠倒。
+        """
+        if event.get("event") == "log":
+            line = event.get("line")
+            if line is None:
+                return
+            if len(line) > self._MAX_LINE_CHARS:
+                line = line[: self._MAX_LINE_CHARS] + " …(已截断)"
+            need_flush = False
+            with self._lock:
+                buf = self._pending.setdefault(job_id, [])
+                if len(buf) < self._MAX_PENDING_LINES:
+                    buf.append(line)
+                    need_flush = len(buf) >= self._MAX_BATCH_LINES
+                else:
+                    self._dropped[job_id] = self._dropped.get(job_id, 0) + 1
+                self._ensure_flusher_locked()
+            if need_flush:
+                self.flush()
+            return
+
+        self.flush()
         payload = {"job_id": job_id, **event}
         with self._lock:
             subscribers = list(self._subs)

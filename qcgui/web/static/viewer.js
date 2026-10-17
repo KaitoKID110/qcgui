@@ -118,6 +118,17 @@
 
   // ---------------------------------------------------------------- 主类
 
+  // ------------------------------------------------------------ 大分子降级阈值
+  //
+  // 实测：每帧给每个原子建一次 createRadialGradient 是最贵的一步。
+  // 原子多了以后渐变带来的观感提升几乎看不出，但开销是线性增长的，
+  // 所以超过阈值就退成纯色填充；再多就不画标签和描边。
+  const LARGE_ATOMS_NO_GRADIENT = 300;
+  const LARGE_ATOMS_NO_LABELS = 800;
+  const LARGE_ATOMS_NO_STROKE = 1500;
+  //: 轨迹帧数上限：超过则均匀抽样（帧 × 原子数决定了内存占用）。
+  const MAX_TRAJECTORY_FRAMES = 400;
+
   class MoleculeViewer {
     constructor(canvas, options) {
       this.canvas = canvas;
@@ -195,11 +206,25 @@
     /** frames: [{symbols, coords, energy?}, ...] */
     setTrajectory(frames) {
       if (!frames || !frames.length) return;
-      this.frames = frames.map((f) => ({
+      // 帧数上限：frames × atoms 决定内存占用。IRC 可能有上千帧，
+      // 一个 500 原子的体系 × 1000 帧 = 150 万个坐标，足以把标签页顶爆。
+      // 超过上限就均匀抽样（保留首帧、末帧，过渡态附近自然也被采到），
+      // 播放观感几乎不受影响，但内存成倍下降。
+      let picked = frames;
+      if (frames.length > MAX_TRAJECTORY_FRAMES) {
+        const step = (frames.length - 1) / (MAX_TRAJECTORY_FRAMES - 1);
+        picked = [];
+        for (let k = 0; k < MAX_TRAJECTORY_FRAMES; k++) {
+          picked.push(frames[Math.round(k * step)]);
+        }
+      }
+      this.frames = picked.map((f) => ({
         symbols: f.symbols.slice(),
         coords: f.coords.map((c) => [c[0], c[1], c[2]]),
         energy: f.energy,
       }));
+      this.framesSampled = picked.length !== frames.length;
+      this.framesOriginalCount = frames.length;
       this.symbols = this.frames[0].symbols.slice();
       this.coords = this.frames[0].coords.map((c) => c.slice());
       this.framePos = 0;
@@ -686,20 +711,32 @@
       const [x, y] = p.screen;
       const alpha = p.alpha === undefined ? 1 : p.alpha;
       const r = Math.max(1.2, p.radius);
-      const g = ctx.createRadialGradient(
-        x - r * 0.35, y - r * 0.35, r * 0.1,
-        x, y, r
-      );
-      g.addColorStop(0, rgba(p.color.map((c) => Math.min(255, c + 70)), alpha));
-      g.addColorStop(0.55, rgba(p.color, alpha));
-      g.addColorStop(1, rgba(p.color.map((c) => Math.round(c * 0.45)), alpha));
-      ctx.fillStyle = g;
+      const atomCount = this.symbols.length;
+
+      // 大分子不做逐原子渐变：上千个渐变对象/帧会把主线程和 GC 拖垮，
+      // 而这个尺寸下渐变几乎看不出来。
+      if (atomCount <= LARGE_ATOMS_NO_GRADIENT) {
+        const g = ctx.createRadialGradient(
+          x - r * 0.35, y - r * 0.35, r * 0.1,
+          x, y, r
+        );
+        g.addColorStop(0, rgba(p.color.map((c) => Math.min(255, c + 70)), alpha));
+        g.addColorStop(0.55, rgba(p.color, alpha));
+        g.addColorStop(1, rgba(p.color.map((c) => Math.round(c * 0.45)), alpha));
+        ctx.fillStyle = g;
+      } else {
+        ctx.fillStyle = rgba(p.color, alpha);
+      }
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
-      ctx.strokeStyle = `rgba(0,0,0,${0.35 * alpha})`;
-      ctx.lineWidth = Math.min(1.5, r * 0.08);
-      ctx.stroke();
+
+      // 原子很多时描边也省掉：每圈一次 stroke 同样是线性开销
+      if (atomCount <= LARGE_ATOMS_NO_STROKE) {
+        ctx.strokeStyle = `rgba(0,0,0,${0.35 * alpha})`;
+        ctx.lineWidth = Math.min(1.5, r * 0.08);
+        ctx.stroke();
+      }
     }
 
     /**
@@ -722,6 +759,9 @@
     }
 
     _drawLabels(ctx, prims) {
+      // 原子太多时文字会糊成一片，而且每个标签都是一次 fillText —— 直接不画。
+      // 数值模式例外：用户显式点了"显示数值"，那是他此刻唯一关心的东西。
+      if (!this.valueMode && this.symbols.length > LARGE_ATOMS_NO_LABELS) return;
       if (this.valueMode) return this._drawValues(ctx, prims);
       // 白字 + 深色描边。原来用"黑字打底、白字错开半像素"的假阴影，
       // 压在跟文字同色系的球面上根本读不出来（实测就是这么糊的）。

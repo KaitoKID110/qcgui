@@ -77,7 +77,105 @@ function logLine(text, cls) {
   if (cls) span.className = cls;
   span.textContent = text + '\n';
   pre.appendChild(span);
-  while (pre.childNodes.length > 4000) pre.removeChild(pre.firstChild);
+  _logChars += span.textContent.length;
+  trimLog(pre);
+  if ($('input-autoscroll').checked) pre.scrollTop = pre.scrollHeight;
+}
+
+// ---------------------------------------------------------- 日志批处理
+//
+// 为什么不能一行一个 DOM：实测一个 13 原子优化的 ORCA 输出有 **296,389 行**。
+// 每行一次 appendChild + 一次 scrollTop（强制重排），浏览器会被直接拖死 ——
+// 用户报的"算大分子时浏览器内存暴涨、电脑卡死"就是它。
+//
+// 所以 SSE 来的日志先进缓冲，每 ~120ms 批量画一次：同类行合并成一个 span，
+// 一次插入，自动滚动也只做一次。
+const LOG_FLUSH_MS = 120;
+const LOG_MAX_NODES = 2500;
+const LOG_MAX_CHARS = 2_000_000;
+
+let _logPending = [];
+let _logTimer = null;
+// #log 里当前总字符数。为什么自己数：`pre.textContent` 是 O(总字符数) 的，
+// 每次 flush 都去读一遍会反复分配几十 MB 临时字符串，把省下来的开销还回去。
+let _logChars = 0;
+
+function classifyLogLine(line) {
+  if (/ERROR|Error:|错误|失败|❌/.test(line)) return 'l-err';
+  if (/✅|完成|NORMALLY/.test(line)) return 'l-ok';
+  return '';
+}
+
+function queueLogLine(text) {
+  // 单行过长时截断：ORCA 偶尔会打超长行，一条就能吃掉大量内存
+  if (typeof text !== 'string') text = String(text == null ? '' : text);
+  if (text.length > 4000) text = text.slice(0, 4000) + ' …(已截断)';
+  _logPending.push(text);
+  // 缓冲堆到上限说明"生产比消费快"（突发补发）。这里**立即冲刷**而不是丢弃：
+  // 工作量有界（一次最多 2 万行），但日志一行不丢。丢行会让人以为任务出错。
+  if (_logPending.length > 20000) {
+    flushLogLines();
+    return;
+  }
+  if (_logTimer) return;
+  _logTimer = setTimeout(flushLogLines, LOG_FLUSH_MS);
+}
+
+function trimLog(pre) {
+  // 节点数上限
+  let guard = 0;
+  while (pre.childNodes.length > LOG_MAX_NODES && pre.firstChild && guard++ < 10000) {
+    const gone = pre.removeChild(pre.firstChild);
+    _logChars -= (gone.textContent ? gone.textContent.length : 0);
+  }
+  // 字符总量上限：节点数少但每行很长时单靠节点数不够。
+  // 超了就从最旧开始删，一次删到一半（摊还，避免每次都删一两行）。
+  if (_logChars > LOG_MAX_CHARS) {
+    const target = Math.floor(LOG_MAX_CHARS / 2);
+    let guard2 = 0;
+    while (_logChars > target && pre.firstChild && guard2++ < 100000) {
+      const gone = pre.removeChild(pre.firstChild);
+      _logChars -= (gone.textContent ? gone.textContent.length : 0);
+    }
+  }
+  if (_logChars < 0) _logChars = 0;
+}
+
+function flushLogLines() {
+  _logTimer = null;
+  if (!_logPending.length) return;
+  const lines = _logPending;
+  _logPending = [];
+  const pre = $('log');
+  const frag = document.createDocumentFragment();
+
+  // 把连续同类行合并进同一个 span：29.6 万行 → 只增几千个节点
+  let curCls = null;
+  let buf = [];
+  let addedChars = 0;
+  const flushGroup = () => {
+    if (!buf.length) return;
+    const span = document.createElement('span');
+    if (curCls) span.className = curCls;
+    span.textContent = buf.join('\n') + '\n';
+    addedChars += span.textContent.length;
+    frag.appendChild(span);
+    buf = [];
+  };
+  for (const line of lines) {
+    const cls = classifyLogLine(line);
+    if (cls !== curCls) {
+      flushGroup();
+      curCls = cls;
+    }
+    buf.push(line);
+  }
+  flushGroup();
+
+  pre.appendChild(frag);
+  _logChars += addedChars;
+  trimLog(pre);
+  // 自动滚动一次就够 —— 以前每行一次是强制重排的主要来源
   if ($('input-autoscroll').checked) pre.scrollTop = pre.scrollHeight;
 }
 
@@ -418,6 +516,10 @@ async function applyUrlParams() {
   // ?sptestfail=<任务 id>：谱图加载失败时的可读原因（不能只留一个破图）
   if (params.get('sptestfail')) {
     await runSpectrumFailUiTest(params.get('sptestfail'));
+  }
+  // ?logburst=N：日志渲染压力自检（N 行日志灌进真实渲染路径）
+  if (params.get('logburst')) {
+    await runLogBurstTest(parseInt(params.get('logburst'), 10) || 100000);
   }
 }
 
@@ -2760,12 +2862,15 @@ function connectEvents() {
     if (kind === 'hello') return;
 
     if (kind === 'log') {
-      const line = data.line || '';
-      let cls = '';
-      if (/ERROR|Error:|错误|失败|❌/.test(line)) cls = 'l-err';
-      else if (/✅|完成|NORMALLY/.test(line)) cls = 'l-ok';
-      else if (/^\s*$/.test(line)) cls = '';
-      logLine(line, cls);
+      // 服务端会把日志按时间窗合批：优先吃 lines 数组；单行 line 兼容旧格式
+      if (Array.isArray(data.lines)) {
+        for (let i = 0; i < data.lines.length; i++) queueLogLine(data.lines[i]);
+        if (data.dropped) {
+          queueLogLine(`…（输出过快，本次省略了 ${data.dropped} 行）`);
+        }
+      } else {
+        queueLogLine(data.line || '');
+      }
       return;
     }
 
@@ -3475,6 +3580,53 @@ async function spectrumImageFailed(body, img) {
  *
  * 需要配合 `?job=<频率任务id>&sptest=<同一个id>`，结果写进 DOM 供 --dump-dom 读。
  */
+/**
+ * `?logburst=N`：日志渲染压力自检。
+ *
+ * 把 N 行日志用**与 SSE 完全相同的入口**（queueLogLine）灌进去，再报告
+ * 耗时、#log 的 DOM 节点数、总字符数、首末行是否都在。
+ *
+ * 为什么需要：日志合批是性能修复，"看起来没问题"不能算验证 ——
+ * 得在真浏览器里量出节点数确实被压住了（296k 行不该产生 296k 个节点，
+ * 旧实现是 1 行 1 节点 + 每行一次强制重排）。
+ */
+async function runLogBurstTest(count) {
+  const out = document.createElement('pre');
+  out.id = 'logburst-output';
+  out.style.display = 'none';
+  document.body.appendChild(out);
+  const log = $('log');
+  while (log.firstChild) log.removeChild(log.firstChild);
+
+  const t0 = performance.now();
+  for (let i = 0; i < count; i++) {
+    queueLogLine('scf iter ' + i + '  E= -75.960983978583  dE=1.0e-09');
+  }
+  const tQueue = performance.now() - t0;
+
+  await new Promise((r) => setTimeout(r, 500));
+  const tTotal = performance.now() - t0;
+
+  const nodes = log.childNodes.length;
+  const chars = log.textContent.length;
+  const text0 = log.textContent;
+  // 控制台保留的是**尾部**（旧的会被裁掉，这是故意的），所以只验最后一行
+  const lastOk = text0.includes('scf iter ' + (count - 1));
+  const trimmed = !text0.includes('scf iter 0 ') && count > 1000;
+
+  const lines = [];
+  lines.push('count=' + count);
+  lines.push('queue_ms=' + tQueue.toFixed(1));
+  lines.push('total_ms=' + tTotal.toFixed(1));
+  lines.push('dom_nodes=' + nodes);
+  lines.push('chars=' + chars);
+  lines.push('last_line_present=' + (lastOk ? 'PASS' : 'FAIL'));
+  lines.push('old_lines_trimmed=' + (trimmed ? 'PASS' : 'FAIL'));
+  lines.push('nodes_be_low=' + (nodes <= 2600 ? 'PASS' : 'FAIL'));
+  lines.push('nodes_per_line=' + (nodes / count).toFixed(4));
+  out.textContent = lines.join('\n');
+}
+
 async function runSpectrumUiTest(jobId) {
   const out = document.createElement('pre');
   out.id = 'sptest-output';
