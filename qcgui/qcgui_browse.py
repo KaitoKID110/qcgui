@@ -16,6 +16,28 @@ import time
 from pathlib import Path
 
 
+#: VESTA 候选位置。
+#:
+#: 原安装目录在本环境里**只读**，而 VESTA 启动时要写自己的 VESTA.ini ——
+#: 写不进去就打印 "The file (VESTA.ini) was not opend." 并以 0xFFFFFFFF 退出。
+#: 复制到可写目录后即可正常启动，所以这里优先用可写副本。
+_VESTA_CANDIDATES = (
+    r"D:\cao\v2\.apps\VESTA\VESTA.exe",
+    r"D:\化竞资料\VESTA-win64\VESTA-win64\VESTA.exe",
+)
+
+#: 适合交给 VESTA 看三维结构的文件类型。
+_STRUCTURE_EXTS = (".cif", ".xyz", ".pdb", ".molden", ".molden.input")
+
+
+def _vesta_exe():
+    env = os.environ.get("MP_VESTA")
+    for path in ([env] if env else []) + list(_VESTA_CANDIDATES):
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
 #: 按纯文本处理的扩展名 —— 记事本是系统程序，在本环境里能正常起。
 _TEXT_EXTS = (".cif", ".txt", ".xyz", ".out", ".inp", ".json", ".csv", ".log",
               ".gjf", ".com", ".molden", ".molden.input")
@@ -101,6 +123,12 @@ def open_path(path):
     if not os.path.exists(path):
         return False, "路径不存在：" + path
     ext = os.path.splitext(path)[1].lower()
+
+    # 结构文件优先 VESTA（能看三维结构）
+    if ext in _STRUCTURE_EXTS:
+        vesta = _vesta_exe()
+        if vesta and _launch_alive([vesta, path]):
+            return True, "已用 VESTA 打开（三维结构）"
 
     if ext in _TEXT_EXTS:
         nb = _notepad_path()
