@@ -10,9 +10,112 @@ r"""独立的结果文件夹浏览器。
     pythonw qcgui_browse.py "D:\path\to\folder" [窗口标题]
 """
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+#: 按纯文本处理的扩展名 —— 记事本是系统程序，在本环境里能正常起。
+_TEXT_EXTS = (".cif", ".txt", ".xyz", ".out", ".inp", ".json", ".csv", ".log",
+              ".gjf", ".com", ".molden", ".molden.input")
+
+#: 启动后观察多久，确认程序没有立刻崩掉。
+_LAUNCH_GRACE = 1.2
+
+
+def _notepad_path():
+    root = os.environ.get("SystemRoot") or "C:\\Windows"
+    p = os.path.join(root, "System32", "notepad.exe")
+    return p if os.path.isfile(p) else None
+
+
+def _launch_alive(argv):
+    r"""启动并观察：活着 True，立刻退出 False。
+
+    为什么要观察：本机由受限进程启动 VESTA.exe 会**立刻以 0xFFFFFFFF 退出**，
+    Popen 本身不报错 —— 只看 Popen 会把"崩了"当成"已打开"。
+    """
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    try:
+        proc.wait(timeout=_LAUNCH_GRACE)
+    except subprocess.TimeoutExpired:
+        return True
+    return proc.returncode == 0
+
+
+def _registry_progid(ext):
+    try:
+        import winreg
+    except ImportError:
+        return None
+    path = (r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts"
+            + "\\" + ext + r"\UserChoice")
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+            progid, _ = winreg.QueryValueEx(k, "ProgId")
+            if progid:
+                return progid
+    except OSError:
+        pass
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, ext) as k:
+            value, _ = winreg.QueryValueEx(k, None)
+            return value or None
+    except OSError:
+        return None
+
+
+def _assoc_exe(progid):
+    if not progid:
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    path = progid + r"\shell\open\command"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, path) as k:
+            cmd, _ = winreg.QueryValueEx(k, None)
+    except OSError:
+        return None
+    if not cmd:
+        return None
+    cmd = cmd.strip()
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        exe = cmd[1:end] if end > 0 else None
+    else:
+        parts = cmd.split()
+        exe = parts[0] if parts else None
+    return exe if exe and os.path.isfile(exe) else None
+
+
+def open_path(path):
+    r"""打开一个文件，返回 (成功?, 说明)。"""
+    path = os.path.abspath(str(path))
+    if not os.path.exists(path):
+        return False, "路径不存在：" + path
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in _TEXT_EXTS:
+        nb = _notepad_path()
+        if nb and _launch_alive([nb, path]):
+            return True, "已用记事本打开（受环境限制，暂不能用关联程序）"
+
+    exe = _assoc_exe(_registry_progid(ext)) if ext else None
+    if exe and _launch_alive([exe, path]):
+        return True, "已用关联程序打开"
+
+    nb = _notepad_path()
+    if nb and _launch_alive([nb, path]):
+        return True, "已改用记事本打开"
+
+    return False, "没有可用的程序能打开这种文件"
 
 
 def main(argv):
@@ -86,15 +189,15 @@ def main(argv):
             root.title(f"{title} — {folder}")
             reload()
             return
-        try:
-            os.startfile(str(target))       # noqa: S606
-            status.set(f"已交给系统打开: {target.name}")
-        except OSError as exc:
-            # 本机 explorer/关联程序可能起不来，如实说明而不是装成功
+        ok, why = open_path(target)
+        if ok:
+            status.set(f"{why}: {target.name}")
+        else:
+            # 打不开时至少把路径给到用户（可复制）
+            status.set(f"{why}: {target}")
             messagebox.showwarning(
                 "打不开文件",
-                f"系统没法打开这个文件。\n\n{type(exc).__name__}: {exc}\n\n"
-                f"路径（可复制）：\n{target}")
+                f"{why}\n\n路径（可复制）：\n{target}")
 
     def go_up():
         nonlocal folder
