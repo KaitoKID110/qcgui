@@ -228,9 +228,14 @@ class Molecule:
         multiplicity: int | None = None,
         name: str | None = None,
     ) -> "Molecule":
-        """读取 cclib/IQmol 风格 cjson —— 旧版 GUI 的主力格式。"""
+        """读取 cclib/IQmol 风格 cjson —— 旧版 GUI 的主力格式。
+
+        用 ``utf-8-sig`` 读：有些编辑器（如 Windows 记事本）会给 JSON 加 BOM，
+        而 ``json.loads`` 遇到 BOM 会直接报 "Unexpected UTF-8 BOM"。
+        顺手把 BOM 吃掉，不让用户碰到这种与内容无关的失败。
+        """
         p = Path(path)
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
         return cls.from_cjson_data(data, charge, multiplicity, name or p.stem)
 
     @classmethod
@@ -241,35 +246,88 @@ class Molecule:
         multiplicity: int | None = None,
         name: str | None = None,
     ) -> "Molecule":
-        """从已解析的 cjson 字典构造（不落盘，供 Web 上传等场景使用）。"""
-        try:
-            coords = data["atoms"]["coords"]["3d"]
-            numbers = data["elements"]["number"]
-        except (KeyError, TypeError) as exc:
+        """从已解析的 cjson 字典构造（不落盘，供 Web 上传等场景使用）。
+
+        ``elements`` 的位置有两种写法，都要认：
+
+        * **cclib chemical JSON 规范**把元素放在 **``atoms.elements.number``**
+          （Avogadro 2 导出的就是这个；实测 ``FeH2O.cjson`` 只在这里有）；
+        * 早年有些工具把它放在**顶层** ``elements.number``。
+
+        只认后者会让规范文件全部解析失败，而且报错只说"缺少
+        atoms.coords.3d / elements.number"，看不出其实是键的位置不同。
+        """
+        atoms_node = data.get("atoms") if isinstance(data, dict) else None
+        coords = None
+        numbers = None
+
+        # 坐标：规范在 atoms.coords.3d；也容忍顶层 coords
+        for node in (atoms_node, data):
+            if isinstance(node, dict):
+                c = node.get("coords")
+                if isinstance(c, dict) and "3d" in c:
+                    coords = c["3d"]
+                    break
+                if isinstance(c, list):
+                    coords = c
+                    break
+
+        # 元素：规范在 atoms.elements.number；也容忍顶层 elements
+        for node in (atoms_node, data):
+            if isinstance(node, dict):
+                e = node.get("elements")
+                if isinstance(e, dict) and "number" in e:
+                    numbers = e["number"]
+                    break
+                if isinstance(e, list):
+                    numbers = e
+                    break
+
+        if coords is None or numbers is None:
+            # 报错时把"实际看到了什么"带上，省得用户猜
+            seen = []
+            if isinstance(atoms_node, dict):
+                seen.append("atoms." + "/".join(sorted(atoms_node)) if atoms_node else "atoms")
+            if isinstance(data, dict):
+                seen.append("顶层 " + "/".join(sorted(data)))
             raise ValueError(
-                "不是可识别的 cjson（缺少 atoms.coords.3d / elements.number）"
-            ) from exc
+                "不是可识别的 cjson（缺少坐标或元素编号）。"
+                "需要 atoms.coords.3d 与 atoms.elements.number（cclib 规范），"
+                "或顶层 coords / elements。实际看到：" + "；".join(seen)
+            )
+
+        numbers = [int(z) for z in numbers]
+        coords = [float(v) for v in coords]
 
         atoms = tuple(
-            Atom(symbol_from_z(int(z)), float(c[0]), float(c[1]), float(c[2]))
-            for z, c in zip(numbers, coords)
+            Atom(symbol_from_z(z), coords[3 * i], coords[3 * i + 1], coords[3 * i + 2])
+            for i, z in enumerate(numbers)
+            if 3 * i + 2 < len(coords)
         )
         if len(atoms) != len(numbers):
             raise ValueError(
-                f"元素数与坐标数不一致：{len(numbers)} vs {len(coords)}"
+                f"元素数与坐标数不一致：需要 {len(numbers)} 组坐标，"
+                f"实际只有 {len(coords) // 3} 组"
             )
 
         if charge is None:
-            charge = _first_int(data, ("charge",), ("properties", "charge")) or 0
+            charge = _first_int(
+                data,
+                ("charge",),
+                ("properties", "charge"),
+                # cclib 规范的写法（Avogadro 2 导出即此）
+                ("properties", "totalCharge"),
+                ("totalCharge",),
+            ) or 0
         if multiplicity is None:
-            multiplicity = (
-                _first_int(
-                    data,
-                    ("multiplicity", "spin_multiplicity"),
-                    ("properties", "multiplicity"),
-                )
-                or 1
-            )
+            multiplicity = _first_int(
+                data,
+                ("multiplicity", "spin_multiplicity"),
+                ("properties", "multiplicity"),
+                # cclib 规范的写法
+                ("properties", "totalSpinMultiplicity"),
+                ("totalSpinMultiplicity",),
+            ) or 1
         return cls(atoms, int(charge), int(multiplicity), name or "mol")
 
     @classmethod
