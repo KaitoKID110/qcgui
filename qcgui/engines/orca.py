@@ -46,6 +46,9 @@ _JOB_KEYWORDS: dict[JobType, tuple[str, ...]] = {
     JobType.TS: ("OptTS",),
     JobType.TS_FREQ: ("OptTS", "Freq"),
     JobType.IRC: ("IRC",),
+    # ORCA 的 NMR 屏蔽常数：``! ... NMR`` 会算 GIAO 屏蔽张量。
+    # 实测水 HF/STO-3G 能正常终止，结果只在 .out 里（见 _fill_nmr）。
+    JobType.NMR: ("NMR",),
 }
 
 #: 目前只声明**已经实测跑通**的任务类型
@@ -415,6 +418,14 @@ class OrcaEngine(Engine):
         if spec.job_type is JobType.IRC:
             self._fill_irc(result, job_dir, base)
 
+        # NMR 屏蔽常数**不在** orca_2json 的 property.json 里（实测：
+        # 顶层只有 Calculation_Info/Status/Timings/Geometries），
+        # 只在 .out 的定宽表里。这是本项目"结果只从结构化输出取"的
+        # **第二处**明确例外（第一处是 Multiwfn 定宽表）。
+        # 解析失败时留空并记 issue，绝不编数据。
+        if spec.job_type is JobType.NMR:
+            self._fill_nmr(result, text)
+
         # --- 状态判定 ---
         if normal:
             result.status = "done"
@@ -606,6 +617,105 @@ class OrcaEngine(Engine):
 
         if not result.frequencies:
             result.frequencies = _extract_frequencies(geom)
+
+    def _fill_nmr(self, result: Result, text: str) -> None:
+        r"""从 ORCA 输出解析 ``CHEMICAL SHIELDING SUMMARY`` 定宽表。
+
+        为什么必须解析文本：实测 ``! HF STO-3G NMR`` 跑完后，``orca_2json``
+        产出的 ``property.json`` **完全没有 NMR 数据**（顶层只有
+        Calculation_Info / Calculation_Status / Calculation_Timings /
+        Geometries），屏蔽常数只出现在 .out 里：
+
+            --------------------------------
+            CHEMICAL SHIELDING SUMMARY (ppm)
+            --------------------------------
+
+              Nucleus  Element    Isotropic     Anisotropy
+              -------  -------  ------------   ------------
+                  0       O          365.694          4.029
+                  1       H           33.679         15.151
+
+        **量纲注意**：这里给的是**绝对屏蔽常数 σ(ppm)**，不是化学位移 δ。
+        δ = σ(参考物) − σ(样品)，需要 TMS 之类参考物单独计算。qcgui 不内置
+        参考值，所以界面上必须写 σ 并说明换算方式 —— 直接叫"化学位移"会
+        让人误以为能和文献数值直接比。
+        """
+        import re as _re
+
+        lines = text.splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if "CHEMICAL SHIELDING SUMMARY" in line.upper():
+                start = i
+                break
+        if start is None:
+            from ..model import Issue, SEVERITY_MAJOR
+            result.issues.append(Issue(
+                code="nmr_summary_missing",
+                severity=SEVERITY_MAJOR,
+                message="NMR 任务没在输出里找到 CHEMICAL SHIELDING SUMMARY —— "
+                        "屏蔽常数没算出来或输出被截断，界面不给数值。",
+            ))
+            return
+
+        row_re = _re.compile(
+            r"^\s*(\d+)\s+([A-Za-z]{1,3})\s+"
+            r"(-?\d+\.\d+)\s+(-?\d+\.\d+)\s*$"
+        )
+        rows = []
+        seen_header = False
+        for line in lines[start:start + 300]:
+            if "Nucleus" in line and "Element" in line:
+                seen_header = True
+                continue
+            if not seen_header:
+                continue
+            if line.strip() and set(line.strip()) <= set("-"):
+                continue
+            m = row_re.match(line)
+            if m:
+                rows.append({
+                    "index": int(m.group(1)),
+                    "element": m.group(2),
+                    "isotropic": float(m.group(3)),
+                    "anisotropy": float(m.group(4)),
+                })
+                continue
+            if line.strip() and rows:
+                break
+
+        if not rows:
+            from ..model import Issue, SEVERITY_MAJOR
+            result.issues.append(Issue(
+                code="nmr_summary_unparsed",
+                severity=SEVERITY_MAJOR,
+                message="找到了 CHEMICAL SHIELDING SUMMARY 标题，但没解析出数据行 —— "
+                        "ORCA 输出格式可能变了，界面不给数值。",
+            ))
+            return
+
+        # 元素顺序对一下分子：错位的话数值会张冠李戴，宁可判失败
+        symbols = list((result.geometry or {}).get("symbols") or [])
+        if symbols and len(symbols) == len(rows):
+            bad = [r["element"] for i, r in enumerate(rows)
+                   if i < len(symbols) and r["element"] != symbols[i]]
+            if bad:
+                from ..model import Issue, SEVERITY_MAJOR
+                result.issues.append(Issue(
+                    code="nmr_element_mismatch",
+                    severity=SEVERITY_MAJOR,
+                    message="NMR 表里的元素顺序和结构对不上（%s…），"
+                            "数值可能错位，界面不给结论。" % bad[:3],
+                ))
+                return
+
+        result.nmr = {
+            "source": "orca_out_text",
+            "quantity": "isotropic_shielding_ppm",
+            "note": "绝对屏蔽常数 σ，不是化学位移 δ；δ = σ(参考) − σ(样品)，需单独算参考物",
+            "n_nuclei": len(rows),
+            "rows": rows,
+        }
 
     def _fill_irc(self, result: Result, job_dir: Path, base: str) -> None:
         """解析 IRC 轨迹。

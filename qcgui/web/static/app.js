@@ -1569,6 +1569,33 @@ function renderResult(job, result) {
     parts.push(spectrumSectionShell());
   }
 
+  // NMR 屏蔽常数（ORCA 的 &! NMR 任务）
+  //
+  // **注意量纲**：这里显示的是绝对屏蔽常数 σ(ppm)，不是化学位移 δ。
+  // δ = σ(参考物) − σ(样品)，需要 TMS 之类参考物单独算。qcgui 不内置参考值，
+  // 所以标题必须写 σ 并注明换算方式 —— 写成"化学位移"会让人误以为能和
+  // 文献数值直接对比，那是"看起来能用其实错"的典型。
+  const nmr = result.nmr || {};
+  if (nmr.rows && nmr.rows.length) {
+    const rows = nmr.rows.map((r) => `<tr>
+        <td>${esc(String(r.index))}</td>
+        <td>${esc(String(r.element))}</td>
+        <td class="hi">${Number(r.isotropic).toFixed(2)}</td>
+        <td>${Number(r.anisotropy).toFixed(2)}</td>
+      </tr>`).join('');
+    parts.push(`<div class="res-section" id="nmr-section">
+      <h4>NMR 屏蔽常数 σ (ppm) · ${nmr.rows.length} 个核</h4>
+      <table class="data">
+        <thead><tr>
+          <th>核 #</th><th>元素</th><th>各向同性 σ<sub>iso</sub></th><th>各向异性</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p class="hint">表中是<strong>绝对屏蔽常数</strong>，不是化学位移。化学位移 δ = σ(参考物) − σ(样品)，
+        需要另外算一个参考物（如 TMS）才能换算；不要把这里的数值直接和文献 δ 比较。</p>
+    </div>`);
+  }
+
   const irc = result.irc || {};
   if (irc.n_frames) {
     parts.push(`<div class="res-section"><h4>IRC 反应路径</h4><dl class="res-grid">

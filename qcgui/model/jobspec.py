@@ -26,6 +26,7 @@ class JobType(str, Enum):
     NEB_TS = "neb_ts"
     IRC = "irc"
     SCAN = "scan"
+    NMR = "nmr"
 
     @property
     def label(self) -> str:
@@ -42,6 +43,7 @@ _LABELS: dict[JobType, str] = {
     JobType.NEB_TS: "NEB-TS 自动搜索过渡态",
     JobType.IRC: "内禀反应坐标",
     JobType.SCAN: "势能面扫描",
+    JobType.NMR: "NMR 屏蔽常数",
 }
 
 

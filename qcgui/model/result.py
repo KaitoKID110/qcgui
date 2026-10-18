@@ -152,6 +152,13 @@ class Result:
     orbitals: dict = field(default_factory=dict)
     #: IRC 反应路径：帧数、逐帧能量、TS 帧、两端结构、能垒
     irc: dict = field(default_factory=dict)
+    #: NMR 屏蔽常数。ORCA 不把它写进 orca_2json 的 property.json，
+    #: 只能从 .out 的 ``CHEMICAL SHIELDING SUMMARY`` 定宽表解析
+    #: （与 Multiwfn 定宽表同类的**第二处**文本解析例外，见 engines/orca.py）。
+    #: 形如 {"source": "orca_out_text", "quantity": "isotropic_shielding_ppm",
+    #:      "rows": [{"index": 0, "element": "O", "isotropic": 365.694,
+    #:               "anisotropy": 4.029}]}
+    nmr: dict = field(default_factory=dict)
 
     # --- 规模与耗时 ---
     n_atoms: int | None = None
