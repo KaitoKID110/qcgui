@@ -1123,19 +1123,37 @@ async function loadStructureFromPath(path) {
 function readLocalFile(file) {
   const reader = new FileReader();
   reader.onload = async () => {
+    // name 必须**带扩展名**：后端按 .mol/.sdf/.xyz 判断格式。
+    // 以前这里用 replace 把扩展名剥掉了，于是 .mol 会被当成 XYZ 解析而失败。
+    const name = file.name || 'mol';
+    const isMol = /\.(mol|sdf|mdl)$/i.test(name);
     try {
-      const data = await api('/api/structure/text', {
+      const data = await api(isMol ? '/api/structure/mol' : '/api/structure/text', {
         method: 'POST',
-        body: JSON.stringify({ text: reader.result, name: file.name.replace(/\.[^.]+$/, '') }),
+        body: JSON.stringify({ text: reader.result, name }),
       });
       state.moleculePath = null;   // 来自拖放的文本，没有后端路径
       setMolecule(data.molecule);
+      showStructureWarnings(data.warnings, name);
     } catch (err) {
       toast('解析失败: ' + err.message, 'err');
       logLine('解析失败: ' + err.message, 'l-err');
     }
   };
   reader.readAsText(file);
+}
+
+/**
+ * 显示导入结构时的警告（二维坐标、补了氢、生成了三维构象…）。
+ *
+ * 这些必须让用户看见：如果文件是二维的而我们自动生成了三维，
+ * 用户以为用的是原始坐标就会误判结果可信度。
+ */
+function showStructureWarnings(warnings, name) {
+  const list = (warnings || []).filter(Boolean);
+  if (!list.length) return;
+  for (const w of list) logLine('⚠ ' + w, 'l-warn');
+  toast(`${name}: ${list.slice(0, 3).join('；')}`, 'info');
 }
 
 // ------------------------------------------------------------------ 任务
@@ -3418,7 +3436,7 @@ function bindUi() {
   $('btn-open').addEventListener('click', () => {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.xyz,.cjson,.json';
+    input.accept = '.xyz,.cjson,.json,.mol,.sdf,.mdl';
     input.addEventListener('change', () => { if (input.files[0]) readLocalFile(input.files[0]); });
     input.click();
   });

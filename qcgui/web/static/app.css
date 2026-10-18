@@ -773,3 +773,7 @@ table.data td .strong { color: #e8b23a; }
 .res-verdict-nmr b {
   margin-right: 6px;
 }
+
+/* 结构导入警告（二维坐标 / 自动补氢 / 生成三维构象） */
+.l-warn { color: #f0c05a; }
+

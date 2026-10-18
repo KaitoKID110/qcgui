@@ -331,6 +331,42 @@ class Molecule:
         return cls(atoms, int(charge), int(multiplicity), name or "mol")
 
     @classmethod
+    def from_mol(
+        cls,
+        text: str,
+        name: str | None = None,
+        charge: int | None = None,
+        multiplicity: int | None = None,
+    ) -> "Molecule":
+        """解析 MDL MOL / SDF 文本（V2000 与 V3000 都支持）。
+
+        * 只取 SDF 的**第一条**记录（多记录时上层会提示用户）；
+        * 电荷来自 ``M  CHG`` / V3000 的 ``CHG=``，不是靠猜；
+        * 不校验/不使用键信息（本项目的计算只需要坐标与元素）；
+        * **二维坐标不做特殊处理** —— 上层应当先用 cheminfo 生成三维，
+          因为把 z 全为 0 的平面结构直接送去优化会得到不合理结果。
+        """
+        from .molfile import parse_mol
+
+        block = parse_mol(text, name=name)
+        atoms = tuple(
+            Atom(sym, float(c[0]), float(c[1]), float(c[2]))
+            for sym, c in zip(block.symbols, block.coords)
+        )
+        return cls(
+            atoms,
+            int(block.charge if charge is None else charge),
+            int(1 if multiplicity is None else multiplicity),
+            (name or block.name or "mol")[:60],
+        )
+
+    @classmethod
+    def from_mol_file(cls, path: str | Path, **kwargs) -> "Molecule":
+        p = Path(path)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        return cls.from_mol(text, name=kwargs.pop("name", p.stem or "mol"), **kwargs)
+
+    @classmethod
     def from_text(
         cls,
         text: str,
@@ -344,10 +380,19 @@ class Molecule:
         纯 XYZ 用默认值（0 / 1）。注意不能把 None 直接透传下去 ——
         ``int(None)`` 会抛 TypeError。
         """
+        from .molfile import looks_like_mol
+
         stripped = text.lstrip()
         if stripped.startswith("{"):
             return cls.from_cjson_data(
                 json.loads(text), charge=charge, multiplicity=multiplicity, name=name
+            )
+        # MOL/SDF：先看文件名扩展名（最可靠），再看内容特征。
+        # 注意不能只靠内容判断 —— 某些 XYZ 文件第 4 行也恰好是一串整数。
+        suffix = Path(name).suffix.lower() if name else ""
+        if suffix in (".mol", ".sdf", ".mdl") or looks_like_mol(text):
+            return cls.from_mol(
+                text, name=name, charge=charge, multiplicity=multiplicity
             )
         return cls.from_xyz(
             text,
@@ -360,8 +405,11 @@ class Molecule:
     def from_file(cls, path: str | Path, **kwargs) -> "Molecule":
         """按扩展名自动选择读取方式。"""
         p = Path(path)
-        if p.suffix.lower() in (".cjson", ".json"):
+        suffix = p.suffix.lower()
+        if suffix in (".cjson", ".json"):
             return cls.from_cjson(p, **kwargs)
+        if suffix in (".mol", ".sdf", ".mdl"):
+            return cls.from_mol_file(p, **kwargs)
         return cls.from_xyz_file(p, **kwargs)
 
     # ---------- 变换 ----------

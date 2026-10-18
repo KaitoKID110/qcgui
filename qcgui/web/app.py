@@ -636,6 +636,99 @@ def _bounded_int(payload: dict, key: str, default: int, low: int,
     return value
 
 
+def _looks_like_mol_import(text: str, name: str | None) -> bool:
+    """这段文本是否应当按 MOL/SDF 处理。
+
+    优先看文件名扩展名（最可靠）；没有文件名时看内容特征。
+    不能只按内容判断 —— 个别 XYZ 文件第 4 行也可能是整数串。
+    """
+    from pathlib import Path as _Path
+
+    from ..model.molfile import looks_like_mol
+
+    suffix = _Path(name).suffix.lower() if name else ""
+    if suffix in (".mol", ".sdf", ".mdl"):
+        return True
+    if suffix:
+        return False
+    return looks_like_mol(text)
+
+
+def _import_mol_text(text: str, name: str, force_as_is: bool = False):
+    """把 MOL/SDF 文本变成可计算的分子，并返回 (molecule, warnings)。
+
+    规则（都基于实测会出错的情形）：
+    * 带三维坐标**且**有显式氢 → 原样使用（尊重文件里的真实几何）；
+    * 二维、或缺显式氢 → 用 RDKit 生成三维并补氢，并明确告知；
+    * 没有 rdkit 时不能自动修，但也不能假装没事：
+      仍返回原结构 + 警告，让用户自己决定。
+
+    ``force_as_is``：用户明确要求"就用文件里的坐标"（哪怕它是二维的）。
+    """
+    from ..model.molfile import MolParseError, parse_mol
+
+    warnings: list[str] = []
+    try:
+        block = parse_mol(text, name=name)
+    except MolParseError as exc:
+        raise ValueError(str(exc)) from None
+
+    if block.n_records > 1:
+        warnings.append(
+            f"这个 SDF 有 {block.n_records} 条记录，只导入了第一条"
+            f"（{block.name}）；要算别的记录请先单独拆出来"
+        )
+    if block.is_2d:
+        warnings.append("文件是二维坐标（所有 z≈0）")
+    if not block.has_explicit_h:
+        warnings.append("文件里没有显式氢原子")
+
+    needs_3d = block.is_2d or not block.has_explicit_h
+    if force_as_is or not needs_3d:
+        from ..model import Atom, Molecule
+        atoms = tuple(
+            Atom(sym, float(c[0]), float(c[1]), float(c[2]))
+            for sym, c in zip(block.symbols, block.coords)
+        )
+        molecule = Molecule(
+            atoms, int(block.charge), 1, (name or block.name)[:60])
+        if force_as_is and block.is_2d:
+            warnings.append(
+                "按你的要求沿用了二维坐标 —— 直接拿去优化很可能不收敛，"
+                "建议先用「优化」任务把它变成三维"
+            )
+        return molecule, warnings
+
+    # 需要转三维：优先 RDKit（补氢 + ETKDG + MMFF）
+    try:
+        from ..cheminfo import molecule_from_mol
+        molecule = molecule_from_mol(text, name=name)
+    except RuntimeError as exc:            # 没装 rdkit
+        from ..model import Atom, Molecule
+        atoms = tuple(
+            Atom(sym, float(c[0]), float(c[1]), float(c[2]))
+            for sym, c in zip(block.symbols, block.coords)
+        )
+        molecule = Molecule(
+            atoms, int(block.charge), 1, (name or block.name)[:60])
+        warnings.append(
+            f"{exc}；因此沿用了文件里的原始坐标 —— 请自行确认几何是否可用"
+        )
+        return molecule, warnings
+    except ValueError as exc:
+        raise ValueError(str(exc)) from None
+
+    added_h = sum(1 for s in molecule.symbols if s == "H") - sum(
+        1 for s in block.symbols if s == "H")
+    if added_h > 0:
+        warnings.append(f"已自动补上 {added_h} 个氢原子")
+    warnings.append(
+        "已用 RDKit 生成三维构象（ETKDG + MMFF 预优化）：这是合理猜测、"
+        "不是 DFT 级几何，建议先跑一次结构优化"
+    )
+    return molecule, warnings
+
+
 def _nmr_reference_field(payload: dict) -> tuple[tuple[str, float], ...]:
     """解析 NMR 参考值 ``{"H": 33.71, "C": 248.6}``（元素 → 屏蔽常数）。
 
@@ -911,6 +1004,18 @@ def create_app(manager: JobManager | None = None) -> Flask:
             return jsonify({"error": str(exc)}), 400
         if not text.strip():
             return jsonify({"error": "内容为空"}), 400
+        # .mol/.sdf 走专门路径：二维缺氢会自动转三维，并回报 warnings。
+        # 其它格式保持原样（XYZ / cjson）。
+        if _looks_like_mol_import(text, name):
+            try:
+                molecule, warnings = _import_mol_text(text, name or "mol")
+            except (ValueError, TypeError) as exc:
+                return jsonify({"error": str(exc)}), 400
+            return jsonify({
+                "molecule": molecule_to_dict(molecule),
+                "warnings": warnings,
+            })
+
         try:
             molecule = Molecule.from_text(
                 text, name=name, charge=charge, multiplicity=multiplicity,
@@ -918,6 +1023,35 @@ def create_app(manager: JobManager | None = None) -> Flask:
         except (ValueError, TypeError, KeyError) as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"molecule": molecule_to_dict(molecule)})
+
+    @app.post("/api/structure/mol")
+    def api_structure_mol():
+        """导入 .mol / .sdf（二维或缺氢时自动转三维并补氢）。
+
+        返回 ``warnings``：界面必须显示出来 —— "文件是二维的、已生成三维构象"
+        这类信息决定了用户能不能相信这份几何。
+        """
+        payload = _json_payload()
+        try:
+            raw = _string_field(payload, "text")
+            name = _string_field(payload, "name") or None
+            three_d = _string_field(payload, "three_d").strip().lower() or "auto"
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not raw.strip():
+            return jsonify({"error": "MOL 内容为空"}), 400
+        if three_d not in ("auto", "as_is", "force_3d"):
+            return jsonify({"error": "three_d 只能是 auto / as_is / force_3d"}), 400
+        try:
+            molecule, warnings = _import_mol_text(
+                raw, name or "mol", force_as_is=(three_d == "as_is"))
+        except (ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({
+            "molecule": molecule_to_dict(molecule),
+            "warnings": warnings,
+            "source": {"format": "mol", "name": name or "mol", "three_d": three_d},
+        })
 
     @app.post("/api/structure/smiles")
     def api_structure_smiles():
