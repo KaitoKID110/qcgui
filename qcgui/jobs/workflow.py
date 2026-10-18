@@ -477,12 +477,22 @@ class WorkflowRunner:
                            nprocs=int(base.get("nprocs", 4)),
                            maxcore_mb=int(base.get("maxcore_mb", 2000)),
                            solvent=base.get("solvent"),
+                           # 大基组/杂化泛函下优化可能比默认圈数更需要时间。
+                           # 参考物是"算一次缓存很久"的东西，宁可多跑几圈。
+                           extra_blocks=(("geom", "MaxIter 100"),),
                            title=f"参考物 {info['label']} 优化")
         opt_rec = self.manager.submit(opt_spec, blocking=True)
         if opt_rec.status != "done":
             raise ValueError(
                 f"参考物 {info['label']} 优化失败（{opt_rec.status}）: "
                 f"{opt_rec.message or ''}".strip())
+        # "跑完但没收敛"也是状态 done —— 但拿没收敛的几何算参考值不可信。
+        # 这里明确失败并说清补救办法，而不是默默用一个半成品几何。
+        if "没有收敛" in (opt_rec.message or ""):
+            raise ValueError(
+                f"参考物 {info['label']} 的几何优化没有收敛（已跑 {100} 圈上限）—— "
+                f"参考值不可信，因此不给 δ。可换一个较易收敛的泛函/基组，"
+                f"或把该任务单独重跑（任务 {opt_rec.job_id}）。")
 
         # 2) 参考物 NMR
         mol2 = molecule_from_record(self.manager, opt_rec.job_id)

@@ -32,7 +32,8 @@ from pathlib import Path
 #: 参考物几何/算法版本。改了内置几何、或改变了缓存键的构成，就加一，
 #: 让旧缓存自动失效（否则会拿旧条件下的参考值算新条件下的 δ）。
 #: 2：键里加入 extra_keywords / engine。
-REFERENCE_VERSION = 2
+#: 3：TMS 内置几何换成真正收敛过的结构（旧几何有立体冲突，参考值不可信）。
+REFERENCE_VERSION = 3
 
 
 def _normalise_extra_keywords(extra_keywords) -> tuple[str, ...]:
