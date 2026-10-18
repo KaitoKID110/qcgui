@@ -763,3 +763,13 @@ table.data tr.imag-row td .imag { color: #ff7b7b; }
 table.data td .imag { color: #ff9a9a; }
 table.data td .strong { color: #e8b23a; }
 
+/* 结论横幅里的 NMR 摘要行：横幅是最顶端、用户第一眼看到的地方 */
+.res-verdict-nmr {
+  margin: 6px 0 2px;
+  font-size: 12.5px;
+  letter-spacing: 0.2px;
+  color: var(--text, #e6edf7);
+}
+.res-verdict-nmr b {
+  margin-right: 6px;
+}

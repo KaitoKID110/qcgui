@@ -1514,14 +1514,82 @@ function verdictBanner(result) {
     ).join('')}</ul>`
     : '';
 
+  // NMR 结果显示在**横幅里**：分析区块（几何/键级/轨道成分/叠加）会在
+  // 渲染后被依次插到横幅后面，把「概要」挤到下面 —— 窄面板里要滚动才看得到。
+  // 横幅是最顶端、也最符合"关键结论一眼可见"定位的地方。
+  const nmrLine = nmrBannerLine(result);
+
   return `<div class="res-verdict ${meta.cls}">
     <div class="res-verdict-head">
       <span class="res-verdict-icon">${meta.icon}</span>
       <strong>${esc(result.verdict_label || '任务结论')}</strong>
     </div>
     <p class="res-verdict-why">${plain(result.verdict_reason)}</p>
+    ${nmrLine}
     ${detail}
   </div>`;
+}
+
+/**
+ * 结论横幅里的 NMR 一行摘要：按元素给出 δ（没有参考值时给 σ 并注明）。
+ *
+ * 放在横幅里而不是只放概要，原因见 verdictBanner 里的注释。
+ */
+function nmrBannerLine(result) {
+  const nmr = (result && result.nmr) || {};
+  const rows = nmr.rows || [];
+  if (!rows.length) return '';
+  const groups = {};
+  for (const r of rows) {
+    const el = String(r.element || '?');
+    if (!groups[el]) groups[el] = { sigma: [], delta: [] };
+    groups[el].sigma.push(Number(r.isotropic));
+    if (typeof r.delta === 'number') groups[el].delta.push(r.delta);
+  }
+  const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  const anyDelta = Object.values(groups).some((g) => g.delta.length);
+  const bits = Object.entries(groups).map(([el, g]) => (g.delta.length
+    ? `${esc(el)} δ ${avg(g.delta).toFixed(2)}`
+    : `${esc(el)} σ ${avg(g.sigma).toFixed(2)}`));
+  const head = anyDelta ? 'NMR δ (ppm)' : 'NMR σ (ppm)';
+  const tail = anyDelta ? '' : '（无参考物，未给 δ）';
+  const src = (nmr.reference_source === 'cache') ? ' · 参考值来自缓存' : '';
+  return `<p class="res-verdict-nmr"><b>${head}</b> ${bits.join(' · ')}${tail}${src}</p>`;
+}
+
+/**
+ * 「概要」里的 NMR 摘要行。
+ *
+ * 为什么放在概要：详细表格在结果面板靠下，而面板是窄的滚动区，
+ * 用户第一反应是"δ 在哪"。概要里的这一行可以一眼看到按元素汇总的结果，
+ * 逐核明细仍然保留在下方表格里。
+ *
+ * 没有参考值时只显示 σ 并说明"未给 δ"——不能把 σ 误当成 δ。
+ */
+function nmrSummaryRow(result) {
+  const nmr = (result && result.nmr) || {};
+  const rows = nmr.rows || [];
+  if (!rows.length) return '';
+  const groups = {};
+  for (const r of rows) {
+    const el = String(r.element || '?');
+    if (!groups[el]) groups[el] = { sigma: [], delta: [] };
+    groups[el].sigma.push(Number(r.isotropic));
+    if (typeof r.delta === 'number') groups[el].delta.push(r.delta);
+  }
+  const anyDelta = Object.values(groups).some((g) => g.delta.length);
+  const parts = Object.entries(groups).map(([el, g]) => {
+    const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+    if (g.delta.length) {
+      return `${esc(el)} δ ${avg(g.delta).toFixed(2)}`;
+    }
+    return `${esc(el)} σ ${avg(g.sigma).toFixed(2)}`;
+  });
+  const label = anyDelta ? 'NMR δ (ppm)' : 'NMR σ (ppm)';
+  const hint = anyDelta
+    ? ''
+    : ' <span class="muted">（无参考物，只给 σ；勾选工作流的 TMS 参考可算 δ）</span>';
+  return `<dt>${label}</dt><dd class="hi">${parts.join(' · ')}${hint}</dd>`;
 }
 
 function renderResult(job, result) {
@@ -1546,34 +1614,11 @@ function renderResult(job, result) {
     <dt>能量 (Ha)</dt><dd class="hi">${result.final_energy !== null && result.final_energy !== undefined ? result.final_energy.toFixed(10) : '—'}</dd>
     <dt>基函数 / 电子</dt><dd>${result.n_basis_functions ?? '—'} / ${result.n_electrons ?? '—'}</dd>
     ${result.timings && result.timings.SUM !== undefined ? `<dt>耗时</dt><dd>${Number(result.timings.SUM).toFixed(1)} s</dd>` : ''}
+    ${nmrSummaryRow(result)}
   </dl></div>`);
 
-  const t = result.thermo || {};
-  if (Object.keys(t).length) {
-    const kjm = 2625.4996394799, jmolk = 4.3597447222071e-18 * 6.02214076e23;
-    const row = (label, key, factor, unit) => (t[key] !== undefined
-      ? `<dt>${label}</dt><dd>${Number(t[key]).toFixed(6)} Ha · ${(t[key] * factor).toFixed(2)} ${unit}</dd>` : '');
-    parts.push(`<div class="res-section"><h4>热化学 ${t.temperature_K ? '· ' + t.temperature_K + ' K' : ''}</h4><dl class="res-grid">
-      ${row('零点能 ZPE', 'zpe_hartree', kjm, 'kJ/mol')}
-      ${row('内能 U', 'inner_energy_U_hartree', kjm, 'kJ/mol')}
-      ${row('焓 H', 'enthalpy_H_hartree', kjm, 'kJ/mol')}
-      ${row('自由能 G', 'gibbs_free_energy_G_hartree', kjm, 'kJ/mol')}
-      ${t.entropy_S_hartree_per_K !== undefined
-        ? `<dt>熵 S</dt><dd>${(t.entropy_S_hartree_per_K * jmolk).toFixed(2)} J/(mol·K)</dd>` : ''}
-    </dl></div>`);
-  }
-
-  if (result.frequencies && result.frequencies.length) {
-    const real = result.frequencies.filter((f) => Math.abs(f) > 1e-6);
-    parts.push(`<div class="res-section"><h4>振动频率 (cm⁻¹) · 虚频 ${result.n_imaginary_frequencies ?? 0}</h4>
-      <div class="freq-list">${real.map((f) => `<span class="${f < 0 ? 'imag' : ''}">${f.toFixed(1)}</span>`).join('')}</div></div>`);
-
-    // 红外谱图区：仅当任务有频率时才出现（没有频率的任务不占位置）。
-    // 只有一列数字看不出谱形，而"算完频率直接看谱图"正是 GaussView 最常见的用法。
-    // 真实数据由 /spectrum 异步取（图由后端 Pillow 画，前端不引任何绘图库）。
-    parts.push(spectrumSectionShell());
-  }
-
+  // NMR 区块放在这里（概要之后、热化学之前）：对 NMR 任务来说 δ 就是主结果，
+  // 放在最底下要滚动才能看到 —— 实测用户的第一反应是"δ 在哪？"。
   // NMR 屏蔽常数（ORCA 的 &! NMR 任务）
   //
   // **注意量纲**：这里显示的是绝对屏蔽常数 σ(ppm)，不是化学位移 δ。
@@ -1615,6 +1660,32 @@ function renderResult(job, result) {
       </table>
       <p class="hint">${note}</p>
     </div>`);
+  }
+
+  const t = result.thermo || {};
+  if (Object.keys(t).length) {
+    const kjm = 2625.4996394799, jmolk = 4.3597447222071e-18 * 6.02214076e23;
+    const row = (label, key, factor, unit) => (t[key] !== undefined
+      ? `<dt>${label}</dt><dd>${Number(t[key]).toFixed(6)} Ha · ${(t[key] * factor).toFixed(2)} ${unit}</dd>` : '');
+    parts.push(`<div class="res-section"><h4>热化学 ${t.temperature_K ? '· ' + t.temperature_K + ' K' : ''}</h4><dl class="res-grid">
+      ${row('零点能 ZPE', 'zpe_hartree', kjm, 'kJ/mol')}
+      ${row('内能 U', 'inner_energy_U_hartree', kjm, 'kJ/mol')}
+      ${row('焓 H', 'enthalpy_H_hartree', kjm, 'kJ/mol')}
+      ${row('自由能 G', 'gibbs_free_energy_G_hartree', kjm, 'kJ/mol')}
+      ${t.entropy_S_hartree_per_K !== undefined
+        ? `<dt>熵 S</dt><dd>${(t.entropy_S_hartree_per_K * jmolk).toFixed(2)} J/(mol·K)</dd>` : ''}
+    </dl></div>`);
+  }
+
+  if (result.frequencies && result.frequencies.length) {
+    const real = result.frequencies.filter((f) => Math.abs(f) > 1e-6);
+    parts.push(`<div class="res-section"><h4>振动频率 (cm⁻¹) · 虚频 ${result.n_imaginary_frequencies ?? 0}</h4>
+      <div class="freq-list">${real.map((f) => `<span class="${f < 0 ? 'imag' : ''}">${f.toFixed(1)}</span>`).join('')}</div></div>`);
+
+    // 红外谱图区：仅当任务有频率时才出现（没有频率的任务不占位置）。
+    // 只有一列数字看不出谱形，而"算完频率直接看谱图"正是 GaussView 最常见的用法。
+    // 真实数据由 /spectrum 异步取（图由后端 Pillow 画，前端不引任何绘图库）。
+    parts.push(spectrumSectionShell());
   }
 
   const irc = result.irc || {};
