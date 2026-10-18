@@ -818,6 +818,9 @@ def create_app(manager: JobManager | None = None) -> Flask:
     app.config["BUS"] = bus
     app.config["BATCHES"] = batches
     app.config["WORKFLOWS"] = workflows
+    #: 正在预计算参考值的 (方案, 方法, 基组, 溶剂)——防止重复点按钮重复提交
+    _precompute_running: set[tuple] = set()
+    _precompute_lock = threading.Lock()
 
     # ------------------------------------------------------------ 静态资源
 
@@ -1583,6 +1586,65 @@ def create_app(manager: JobManager | None = None) -> Flask:
                 for e in entries
             ],
         })
+
+    @app.post("/api/nmr-references/precompute")
+    def api_nmr_references_precompute():
+        """预热参考值缓存：不跑样品任务，只算参考物。
+
+        计算要几分钟（TMS 的 opt + NMR），所以放后台线程，接口立即返回。
+        前端可以轮询 GET /api/nmr-references 看条目是否出现。
+        """
+        payload = _json_payload()
+        try:
+            scheme = _string_field(payload, "scheme").strip() or "tms"
+            method = _string_field(payload, "method").strip() or "HF"
+            basis = _string_field(payload, "basis").strip()
+            solvent = _string_field(payload, "solvent").strip() or None
+            extra_keywords = _keywords_field(payload)
+            engine = _string_field(payload, "engine").strip() or "orca"
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        # 已有缓存就直接返回，不重复算
+        hit = workflows.reference_cache.get(
+            scheme, method, basis, solvent,
+            extra_keywords=extra_keywords, engine=engine)
+        if hit:
+            return jsonify({"ok": True, "cached": True,
+                            "scheme": scheme, "method": method, "basis": basis,
+                            "references": hit["references"]})
+
+        base = {"method": method, "basis": basis, "solvent": solvent,
+                "extra_keywords": extra_keywords, "engine": engine,
+                "nprocs": _bounded_int(payload, "nprocs", 4, 1, 256, "并行核数"),
+                "maxcore_mb": _bounded_int(payload, "maxcore_mb", 2000, 0,
+                                           1_000_000, "内存")}
+
+        # 同一个 (方案, 方法, 基组, 溶剂) 只允许一个预热在跑，避免重复提交
+        key = (scheme, method, basis, solvent or "")
+        with _precompute_lock:
+            if key in _precompute_running:
+                return jsonify({"ok": True, "running": True,
+                                "message": "该级别的参考值正在计算中"})
+            _precompute_running.add(key)
+
+        def worker():
+            try:
+                result = workflows.precompute_reference(scheme, base)
+                bus.publish("", {"event": "log",
+                                 "line": "✔ 参考值预计算完成：" + scheme.upper()
+                                         + " " + method + "/" + basis
+                                         + " -> " + str(result.get("references"))})
+            except Exception as exc:      # noqa: BLE001 - 后台线程要吞掉异常并报告
+                bus.publish("", {"event": "log",
+                                 "line": "✖ 参考值预计算失败：" + str(exc)})
+            finally:
+                with _precompute_lock:
+                    _precompute_running.discard(key)
+
+        threading.Thread(target=worker, name="nmr-precompute", daemon=True).start()
+        return jsonify({"ok": True, "cached": False, "running": True,
+                        "message": "已开始预计算参考值（TMS 的优化 + NMR）"}), 202
 
     @app.delete("/api/nmr-references")
     def api_nmr_references_clear():

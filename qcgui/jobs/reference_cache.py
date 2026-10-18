@@ -50,6 +50,20 @@ def _normalise_extra_keywords(extra_keywords) -> tuple[str, ...]:
     return tuple(sorted(out))
 
 
+#: 自带基组的复合方法（3c 系列）。对它们来说基组字段无意义：
+#: ORCA 里 `! r2SCAN-3c def2-SVP` 会覆盖复合方法自带的基组，属于错误用法。
+COMPOSITE_METHODS = frozenset({
+    "r2scan-3c", "b97-3c", "pbeh-3c", "hf-3c", "b3lyp-3c", "pbe-3c",
+})
+
+
+def _effective_basis(method: str, basis: str) -> str:
+    """复合方法忽略基组；其它方法照常。"""
+    if (method or "").strip().lower() in COMPOSITE_METHODS:
+        return ""
+    return (basis or "").strip()
+
+
 def _normalise(scheme: str, method: str, basis: str, solvent: str | None,
                extra_keywords=(), engine: str = "orca") -> tuple:
     """缓存键。
@@ -60,7 +74,7 @@ def _normalise(scheme: str, method: str, basis: str, solvent: str | None,
     return (
         (scheme or "").strip().lower(),
         (method or "").strip(),
-        (basis or "").strip(),
+        _effective_basis(method, basis),
         (solvent or "").strip().lower() or None,
         _normalise_extra_keywords(extra_keywords),
         (engine or "orca").strip().lower(),

@@ -132,3 +132,19 @@ def test_clear_removes_everything(tmp_path):
     assert cache.clear() == 2
     assert cache.list_entries() == []
     print("    清空缓存")
+
+def test_composite_method_ignores_basis_in_cache_key(tmp_path):
+    """复合方法（3c 系列）自带基组，键里不该带基组 —— 否则同一方法多条缓存。"""
+    cache = _cache(tmp_path)
+    cache.put("tms", "r2SCAN-3c", "", REFS)
+    # 界面上基组字段可能还留着别的值，不该产生第二条缓存
+    assert cache.get("tms", "r2SCAN-3c", "def2-SVP") is not None, (
+        "复合方法因基组字段不同而没命中 —— 会重复计算参考值"
+    )
+    cache.put("tms", "r2SCAN-3c", "def2-SVP", REFS)
+    assert len(cache.list_entries()) == 1, "复合方法产生了重复缓存条目"
+    # 普通方法仍然按基组区分
+    cache.put("tms", "HF", "STO-3G", REFS)
+    cache.put("tms", "HF", "6-31G*", {"H": 32.896})
+    assert len(cache.list_entries()) == 3
+    print("    复合方法忽略基组；普通方法仍按基组区分")

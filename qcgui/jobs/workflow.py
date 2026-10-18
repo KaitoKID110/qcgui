@@ -527,6 +527,26 @@ class WorkflowRunner:
             extra_keywords=extra_keywords, engine=engine)
         return references, "computed", [opt_rec.job_id, nmr_rec.job_id]
 
+    def precompute_reference(self, scheme: str, base: dict) -> dict:
+        """把参考物的 opt+nmr 跑掉并写缓存，返回参考值。
+
+        这是"预热缓存"的入口：不跑样品任务也能得到参考值。
+        **同步**执行（会跑两条 TMS 任务），调用方应当放到后台线程里。
+        """
+        scheme = (scheme or "").strip().lower()
+        if not scheme:
+            raise ValueError("缺少参考物方案")
+        values, source, jobs = self._ensure_reference(scheme, base or {})
+        return {
+            "scheme": scheme,
+            "method": base.get("method", "HF"),
+            "basis": base.get("basis", "def2-SVP"),
+            "solvent": base.get("solvent"),
+            "reference_source": source,
+            "reference_jobs": list(jobs),
+            "references": dict(values),
+        }
+
     def _build_spec(self, molecule: Molecule, job_type: str,
                     overrides: dict, parent_job: str) -> JobSpec:
         shared = {}

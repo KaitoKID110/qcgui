@@ -3046,10 +3046,24 @@ async function cancelWorkflow() {
  * 参考物（TMS）的 σ 只跟 方法/基组/溶剂/额外关键字 有关，所以同一条件只算一次。
  * 把它显示出来，用户才知道"为什么这次没重算 TMS"。
  */
+/**
+ * 缓存条目的显示名。
+ *
+ * 复合方法（r2SCAN-3c / B97-3c 等）自带基组、没有独立基组，
+ * 直接拼 `${method}/${basis}` 会显示成 "r2SCAN-3c/" 这种带空斜杠的样子。
+ */
+function nmrLevelLabel(entry) {
+  const method = entry.method || '';
+  const basis = entry.basis || '';
+  const core = basis ? `${method}/${basis}` : method;
+  return entry.solvent ? `${core} SMD(${entry.solvent})` : core;
+}
+
 async function refreshNmrCache() {
   try {
     const data = await api('/api/nmr-references');
     const entries = data.entries || [];
+    state.nmrCacheEntries = entries.length;
     const info = $('nmr-cache-info');
     if (!info) return;
     if (!entries.length) {
@@ -3057,14 +3071,56 @@ async function refreshNmrCache() {
       return;
     }
     info.textContent = `参考值缓存：${entries.length} 组（` +
-      entries.map((e) => `${e.method}/${e.basis}`).join('、') + '）';
+      entries.map(nmrLevelLabel).join('、') + '）';
     info.title = entries.map((e) =>
-      `${e.scheme} ${e.method}/${e.basis}${e.solvent ? ' SMD(' + e.solvent + ')' : ''}` +
+      `${e.scheme} ${nmrLevelLabel(e)}` +
       ` → ` + Object.entries(e.references || {}).map(([k, v]) => `${k}=${Number(v).toFixed(2)}`).join(', ') +
       `（来源 ${(e.source_jobs || []).length} 个任务）`).join('\n');
   } catch (err) {
     // 读不到就显示不出来，但不要打断别的操作
   }
+}
+
+/**
+ * 预热参考值缓存：用界面当前的方法/基组/溶剂把 TMS 算好。
+ *
+ * 为什么要这个按钮：参考值只会"在带 TMS 参考的工作流里顺带算"，如果只是想
+ * 先把缓存建好（比如准备批量算 NMR），否则就得先白跑一条完整工作流。
+ */
+async function precomputeNmrCache() {
+  const payload = {
+    scheme: 'tms',
+    method: $('input-method').value.trim() || 'HF',
+    basis: $('input-basis').value.trim(),
+    nprocs: parseInt($('input-nprocs').value || '4', 10),
+    maxcore_mb: parseInt($('input-maxcore').value || '2000', 10),
+  };
+  const solvent = $('select-solvent').value || '';
+  if (solvent && solvent !== '气相') payload.solvent = solvent;
+
+  const res = await api('/api/nmr-references/precompute', {
+    method: 'POST', body: JSON.stringify(payload),
+  });
+  if (res.cached) {
+    toast('该级别已有缓存，无需重算', 'info');
+  } else {
+    toast('已开始预计算参考值（会跑 TMS 的优化 + NMR）', 'ok');
+    logLine(`⚡ 开始预计算参考值：TMS ${payload.method}/${payload.basis}` +
+            (payload.solvent ? ` SMD(${payload.solvent})` : ''), 'l-dim');
+    // 轮询缓存状态：算完会多出一条
+    let tries = 0;
+    if (state._nmrCacheWatch) clearInterval(state._nmrCacheWatch);
+    state._nmrCacheWatch = setInterval(async () => {
+      tries += 1;
+      await refreshNmrCache();
+      const has = (state.nmrCacheEntries || 0) > 0;
+      if (has || tries > 240) {          // 最长约 20 分钟
+        clearInterval(state._nmrCacheWatch);
+        state._nmrCacheWatch = null;
+      }
+    }, 5000);
+  }
+  await refreshNmrCache();
 }
 
 /** 清空磁盘上的参考值缓存。 */
@@ -3474,6 +3530,7 @@ function bindUi() {
   $('btn-workflow').addEventListener('click', () => submitWorkflow().catch(() => {}));
   $('btn-workflow-cancel').addEventListener('click', () => cancelWorkflow().catch(() => {}));
   $('btn-clear-nmr-cache').addEventListener('click', () => clearNmrCache().catch(() => {}));
+  $('btn-precompute-nmr-cache').addEventListener('click', () => precomputeNmrCache().catch(() => {}));
   refreshWorkflows();
   refreshNmrCache();
 
