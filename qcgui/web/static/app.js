@@ -1582,22 +1582,38 @@ function renderResult(job, result) {
   // 文献数值直接对比，那是"看起来能用其实错"的典型。
   const nmr = result.nmr || {};
   if (nmr.rows && nmr.rows.length) {
-    const rows = nmr.rows.map((r) => `<tr>
+    // 有参考值时多一列 δ。δ 只在**有对应参考物**的元素上出现：
+    // 没有参考的元素（例如水里的 O —— TMS 里没有 O）只给 σ。
+    // 拿别的核的参考值顶上会得到看似合理、实则完全错误的数字。
+    const hasDelta = nmr.rows.some((r) => typeof r.delta === 'number');
+    const rows = nmr.rows.map((r) => {
+      const deltaCell = hasDelta
+        ? `<td class="hi">${typeof r.delta === 'number' ? Number(r.delta).toFixed(2) : '—'}</td>`
+        : '';
+      return `<tr>
         <td>${esc(String(r.index))}</td>
         <td>${esc(String(r.element))}</td>
-        <td class="hi">${Number(r.isotropic).toFixed(2)}</td>
+        <td>${Number(r.isotropic).toFixed(2)}</td>
         <td>${Number(r.anisotropy).toFixed(2)}</td>
-      </tr>`).join('');
+        ${deltaCell}
+      </tr>`;
+    }).join('');
+    const deltaHead = hasDelta ? '<th>δ (ppm)</th>' : '';
+    const missing = (nmr.elements_without_reference || []).join('/');
+    const note = hasDelta
+      ? `${esc(String(nmr.note || ''))}
+         ${missing ? `<br><strong>${esc(missing)} 没有对应参考物</strong>，只给 σ 不给 δ。` : ''}`
+      : `表中是<strong>绝对屏蔽常数</strong>，不是化学位移。δ = σ(参考物) − σ(样品)，
+         需要参考物才能换算（可在工作流里勾选「NMR 加 TMS 参考」自动算）。`;
     parts.push(`<div class="res-section" id="nmr-section">
-      <h4>NMR 屏蔽常数 σ (ppm) · ${nmr.rows.length} 个核</h4>
+      <h4>NMR ${hasDelta ? '化学位移 δ 与屏蔽常数 σ' : '屏蔽常数 σ'} (ppm) · ${nmr.rows.length} 个核</h4>
       <table class="data">
         <thead><tr>
-          <th>核 #</th><th>元素</th><th>各向同性 σ<sub>iso</sub></th><th>各向异性</th>
+          <th>核 #</th><th>元素</th><th>各向同性 σ<sub>iso</sub></th><th>各向异性</th>${deltaHead}
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
-      <p class="hint">表中是<strong>绝对屏蔽常数</strong>，不是化学位移。化学位移 δ = σ(参考物) − σ(样品)，
-        需要另外算一个参考物（如 TMS）才能换算；不要把这里的数值直接和文献 δ 比较。</p>
+      <p class="hint">${note}</p>
     </div>`);
   }
 
@@ -2876,11 +2892,17 @@ function bindOrbitalButtons() {
 function workflowStages() {
   const preset = $('select-workflow').value;
   const raw = preset === '' ? $('input-workflow-custom').value : preset;
+  // 勾了「TMS 参考」就把参考方案挂到 NMR 步骤上（其余步骤不受影响）。
+  const useTms = $('input-wf-tms') && $('input-wf-tms').checked;
   return String(raw || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((job_type) => ({ job_type }));
+    .map((job_type) => {
+      const stage = { job_type };
+      if (useTms && job_type === 'nmr') stage.nmr_reference = 'tms';
+      return stage;
+    });
 }
 
 /** 提交工作流。 */

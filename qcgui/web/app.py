@@ -636,6 +636,31 @@ def _bounded_int(payload: dict, key: str, default: int, low: int,
     return value
 
 
+def _nmr_reference_field(payload: dict) -> tuple[tuple[str, float], ...]:
+    """解析 NMR 参考值 ``{"H": 33.71, "C": 248.6}``（元素 → 屏蔽常数）。
+
+    只接受这种形状。格式不对就报 400，**不能悄悄忽略** ——
+    忽略的后果是界面上少一列 δ，而用户以为参考值已经生效了。
+    """
+    raw = payload.get("nmr_reference")
+    if raw is None or raw == "":
+        return ()
+    if not isinstance(raw, dict):
+        raise ValueError("nmr_reference 必须是 {元素: 屏蔽常数} 形式的对象")
+    out: list[tuple[str, float]] = []
+    for element, value in raw.items():
+        if not isinstance(element, str) or not element.strip():
+            raise ValueError("nmr_reference 的元素名必须是非空字符串")
+        try:
+            sigma = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"nmr_reference[{element!r}] 必须是数字，收到 {type(value).__name__}"
+            ) from None
+        out.append((element.strip(), sigma))
+    return tuple(out)
+
+
 def _keywords_field(payload: dict, key: str = "extra_keywords") -> tuple[str, ...]:
     """解析额外关键字；必须是**字符串列表**。
 
@@ -1062,6 +1087,12 @@ def create_app(manager: JobManager | None = None) -> Flask:
                     calc_hess=bool(payload.get("calc_hess", False)),
                     title=_string_field(payload, "title").strip() or molecule.name,
                     parent_job=parent_job,
+                    # NMR 参考值（元素 → σ），用于算 δ = σ(参考) − σ(样品)。
+                    # 只接受显式数值；"自动算参考物"是工作流的能力（要额外跑任务），
+                    # 单任务提交不该偷偷多跑东西。
+                    nmr_reference=_nmr_reference_field(payload),
+                    nmr_reference_scheme=_string_field(
+                        payload, "nmr_reference_scheme").strip(),
                 )
         except (ValueError, TypeError) as exc:
             return jsonify({"error": str(exc)}), 400

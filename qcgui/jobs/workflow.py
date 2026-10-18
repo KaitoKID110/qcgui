@@ -26,11 +26,15 @@ import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 from ..model import Atom, JobSpec, JobType, Molecule
+from ..model.nmr_reference import (
+    REFERENCE_MOLECULES,
+    average_shieldings,
+)
 from .manager import JobManager
 
 #: 事件回调：``(workflow_id, event)``。事件的 ``event`` 字段形如
@@ -177,6 +181,9 @@ class WorkflowRunner:
         self.root.mkdir(parents=True, exist_ok=True)
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: dict[str, threading.Event] = {}
+        #: 参考物屏蔽常数缓存：key = (scheme, method, basis, solvent)，value = {元素: σ}
+        #: 参考物计算很便宜（TMS 17 原子），但没必要每条工作流都重算一次。
+        self._reference_cache: dict[tuple, dict[str, float]] = {}
         self._reconcile()
 
     # ------------------------------------------------------------ 持久化
@@ -354,12 +361,29 @@ class WorkflowRunner:
                                "job_type": stage.job_type,
                                "status": "running"})
 
+            # 该步要求算 δ 的话，先把参考物算出来（会额外产生两条可见的任务记录）
+            reference: tuple[tuple[str, float], ...] = ()
+            reference_scheme = ""
+            want_reference = str(overrides.get("nmr_reference") or "").strip().lower()
+            if want_reference and stage.job_type == "nmr":
+                try:
+                    values = self._ensure_reference(want_reference, overrides)
+                except (ValueError, TypeError) as exc:
+                    self._fail(rec, wf_id, index,
+                               f"参考物计算失败，无法给出 δ：{exc}")
+                    return
+                reference = tuple(sorted(values.items()))
+                reference_scheme = want_reference
+
             try:
                 spec = self._build_spec(current, stage.job_type, overrides,
                                         parent_job if index == 0 else "")
             except (ValueError, TypeError) as exc:
                 self._fail(rec, wf_id, index, f"参数不合法: {exc}")
                 return
+            if reference:
+                spec = replace(spec, nmr_reference=reference,
+                               nmr_reference_scheme=reference_scheme)
 
             record = self.manager.submit(spec, blocking=True)
 
@@ -397,6 +421,67 @@ class WorkflowRunner:
                            "workflow_id": wf_id,
                            "status": _STATUS_DONE,
                            "stages": [s.to_dict() for s in rec.stages]})
+
+    def _ensure_reference(self, scheme: str, base: dict) -> dict[str, float]:
+        """算（或取缓存）参考物的屏蔽常数：``{元素: 平均 σ}``。
+
+        必须**先优化再算 NMR**：实测随手摆的 TMS 甲基构象会让等效核 σ 极差
+        达到 C 10.6 ppm / H 1.2 ppm；优化后收敛到 C 0.77 / H 0.17 ppm。
+        参考值不稳，δ 就跟着不稳。
+        """
+        scheme = (scheme or "").strip().lower()
+        info = REFERENCE_MOLECULES.get(scheme)
+        if info is None:
+            raise ValueError(f"没有内置的参考物: {scheme}")
+
+        key = (scheme, base.get("method"), base.get("basis"), base.get("solvent"))
+        cached = self._reference_cache.get(key)
+        if cached:
+            return cached
+
+        mol = Molecule.from_xyz(info["xyz"])
+
+        # 1) 参考物几何优化（同方法/基组/溶剂）
+        opt_spec = JobSpec(molecule=mol, job_type=JobType.OPT,
+                           method=base.get("method", "HF"),
+                           basis=base.get("basis", "def2-SVP"),
+                           nprocs=int(base.get("nprocs", 4)),
+                           maxcore_mb=int(base.get("maxcore_mb", 2000)),
+                           solvent=base.get("solvent"),
+                           title=f"参考物 {info['label']} 优化")
+        opt_rec = self.manager.submit(opt_spec, blocking=True)
+        if opt_rec.status != "done":
+            raise ValueError(
+                f"参考物 {info['label']} 优化失败（{opt_rec.status}）: "
+                f"{opt_rec.message or ''}".strip())
+
+        # 2) 参考物 NMR
+        mol2 = molecule_from_record(self.manager, opt_rec.job_id)
+        nmr_spec = JobSpec(molecule=mol2, job_type=JobType.NMR,
+                           method=base.get("method", "HF"),
+                           basis=base.get("basis", "def2-SVP"),
+                           nprocs=int(base.get("nprocs", 4)),
+                           maxcore_mb=int(base.get("maxcore_mb", 2000)),
+                           solvent=base.get("solvent"),
+                           title=f"参考物 {info['label']} NMR")
+        nmr_rec = self.manager.submit(nmr_spec, blocking=True)
+        if nmr_rec.status != "done":
+            raise ValueError(
+                f"参考物 {info['label']} NMR 失败（{nmr_rec.status}）: "
+                f"{nmr_rec.message or ''}".strip())
+
+        result = self.manager.store.load_result(nmr_rec.job_id)
+        if result is None or not (result.nmr or {}).get("rows"):
+            raise ValueError(f"参考物 {info['label']} 的 NMR 结果解析失败，"
+                             f"无法给出 δ（不拿假参考值凑数）")
+
+        references = average_shieldings(result.nmr["rows"])
+        covered = set(info["elements"])
+        references = {el: v for el, v in references.items() if el in covered}
+        if not references:
+            raise ValueError(f"参考物 {info['label']} 结果里没有可用的元素参考值")
+        self._reference_cache[key] = references
+        return references
 
     def _build_spec(self, molecule: Molecule, job_type: str,
                     overrides: dict, parent_job: str) -> JobSpec:

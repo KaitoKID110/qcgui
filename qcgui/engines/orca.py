@@ -424,7 +424,7 @@ class OrcaEngine(Engine):
         # **第二处**明确例外（第一处是 Multiwfn 定宽表）。
         # 解析失败时留空并记 issue，绝不编数据。
         if spec.job_type is JobType.NMR:
-            self._fill_nmr(result, text)
+            self._fill_nmr(result, text, spec)
 
         # --- 状态判定 ---
         if normal:
@@ -618,7 +618,7 @@ class OrcaEngine(Engine):
         if not result.frequencies:
             result.frequencies = _extract_frequencies(geom)
 
-    def _fill_nmr(self, result: Result, text: str) -> None:
+    def _fill_nmr(self, result: Result, text: str, spec: JobSpec | None = None) -> None:
         r"""从 ORCA 输出解析 ``CHEMICAL SHIELDING SUMMARY`` 定宽表。
 
         为什么必须解析文本：实测 ``! HF STO-3G NMR`` 跑完后，``orca_2json``
@@ -709,13 +709,43 @@ class OrcaEngine(Engine):
                 ))
                 return
 
-        result.nmr = {
+        # ---- δ = σ(参考) − σ(样品) ----
+        #
+        # 参考值必须由**同一方法/基组现算**提供（workflow 会先跑参考物的
+        # 优化 + NMR）。没有参考值的元素一律不给 δ —— 拿别的核的参考值顶上
+        # 会得到完全错误的数字，那比"没有"更糟。
+        references: dict[str, float] = {}
+        scheme = ""
+        if spec is not None:
+            references = {str(el): float(v) for el, v in (spec.nmr_reference or ())}
+            scheme = spec.nmr_reference_scheme or ""
+        missing: list[str] = []
+        if references:
+            from ..model.nmr_reference import compute_deltas
+            rows, missing = compute_deltas(rows, references)
+
+        note = "绝对屏蔽常数 σ，不是化学位移 δ；δ = σ(参考) − σ(样品)，需单独算参考物"
+        if references:
+            # 说明里不要用 markdown 星号：前端会对内容做转义，星号会原样显示出来。
+            # 「某元素没有参考物」单独放在 elements_without_reference 里由界面渲染，
+            # 否则和 note 叠加会出现两遍（实测踩过）。
+            tag = scheme.upper() if scheme else "参考物"
+            note = (f"δ = σ({tag}) − σ(样品)，参考物用同一方法/基组现算；"
+                    "未做经验标定，换泛函/基组后 δ 会偏移")
+
+        payload = {
             "source": "orca_out_text",
             "quantity": "isotropic_shielding_ppm",
-            "note": "绝对屏蔽常数 σ，不是化学位移 δ；δ = σ(参考) − σ(样品)，需单独算参考物",
+            "note": note,
             "n_nuclei": len(rows),
             "rows": rows,
         }
+        if references:
+            payload["reference_scheme"] = scheme
+            payload["references"] = dict(references)
+            if missing:
+                payload["elements_without_reference"] = list(missing)
+        result.nmr = payload
 
     def _fill_irc(self, result: Result, job_dir: Path, base: str) -> None:
         """解析 IRC 轨迹。

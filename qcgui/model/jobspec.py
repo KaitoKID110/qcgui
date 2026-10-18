@@ -75,6 +75,12 @@ class JobSpec:
     #: 参考 ACH-Orca-Workbench 的"用父任务优化后的几何"设计。
     parent_job: str = ""
 
+    #: NMR 参考物的屏蔽常数：``(("H", 33.713), ("C", 248.638), ...)``。
+    #: 只有 NMR 任务会用；由 workflow 用**同一方法/基组现算**参考物后填入。
+    #: 存成 tuple 而不是 dict，是为了保持 JobSpec 不可变/可哈希的一贯风格。
+    nmr_reference: tuple[tuple[str, float], ...] = ()
+    #: 参考方案标识（如 ``"tms"``），仅作追溯与界面展示。
+    nmr_reference_scheme: str = ""
     #: 使用的配方 id（仅作追溯，不参与计算）
     recipe_id: str = ""
 
@@ -121,6 +127,8 @@ class JobSpec:
             "extra_blocks": [list(b) for b in self.extra_blocks],
             "calc_hess": self.calc_hess,
             "parent_job": self.parent_job,
+            "nmr_reference": [list(item) for item in self.nmr_reference],
+            "nmr_reference_scheme": self.nmr_reference_scheme,
             "recipe_id": self.recipe_id,
             "title": self.title,
             "molecule": {
@@ -162,6 +170,12 @@ class JobSpec:
             ),
             calc_hess=bool(data.get("calc_hess", False)),
             parent_job=data.get("parent_job", "") or "",
+            nmr_reference=tuple(
+                (str(item[0]), float(item[1]))
+                for item in (data.get("nmr_reference") or ())
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ),
+            nmr_reference_scheme=data.get("nmr_reference_scheme", "") or "",
             recipe_id=data.get("recipe_id", "") or "",
             title=data.get("title", ""),
         )

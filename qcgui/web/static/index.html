@@ -187,6 +187,13 @@
           <input type="text" id="input-workflow-custom" class="input"
                  placeholder="自定义步骤，逗号分隔，如 opt,freq,nmr"
                  style="display:none">
+          <label class="checkbox" id="wrap-wf-tms">
+            <input type="checkbox" id="input-wf-tms">
+            <span>NMR 加 TMS 参考（自动算 δ）</span>
+          </label>
+          <p class="hint">勾选后，工作流会先用<strong>同一方法/基组</strong>优化 TMS
+            并算它的 NMR，再算样品，给出 δ = σ(TMS) − σ(样品)。
+            只有 TMS 覆盖的元素（¹H/¹³C/²⁹Si）会显示 δ。</p>
           <p class="hint">每一步自动用上一步的结果几何；电荷/多重度沿用上一步。
             整个链在服务端跑，关掉页面也会继续。</p>
           <div class="run-row">
