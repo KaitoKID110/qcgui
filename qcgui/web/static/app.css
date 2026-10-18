@@ -458,6 +458,113 @@ table.data th { color: var(--text-dim); font-weight: 500; }
 table.data td.num { font-family: var(--mono); text-align: right; }
 table.data tr.min td { color: #9ecbff; }
 
+
+/* ------------------------------------------------------------ 工作流 */
+.workflow-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft, rgba(255, 255, 255, 0.08));
+}
+
+.workflow-block select {
+  width: 100%;
+}
+
+.workflow-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.wf-item {
+  border: 1px solid var(--line-soft, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+}
+
+.wf-item.ok {
+  border-color: rgba(90, 200, 130, 0.5);
+}
+
+.wf-item.err {
+  border-color: rgba(230, 100, 100, 0.6);
+}
+
+.wf-item.run {
+  border-color: rgba(240, 190, 90, 0.6);
+}
+
+.wf-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.wf-head b {
+  font-size: 12.5px;
+}
+
+.wf-status {
+  font-weight: 600;
+}
+
+.wf-item.ok .wf-status {
+  color: #6ad48f;
+}
+
+.wf-item.err .wf-status {
+  color: #f08080;
+}
+
+.wf-item.run .wf-status {
+  color: #f0c05a;
+}
+
+.wf-stages {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.wf-stage {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  white-space: nowrap;
+}
+
+.wf-stage.ok {
+  background: rgba(90, 200, 130, 0.18);
+  color: #8ee0a8;
+}
+
+.wf-stage.err {
+  background: rgba(230, 100, 100, 0.18);
+  color: #f0a0a0;
+}
+
+.wf-stage.run {
+  background: rgba(240, 190, 90, 0.18);
+  color: #f5d08a;
+}
+
+.wf-arrow {
+  opacity: 0.45;
+}
+
+.wf-job {
+  margin-left: 4px;
+  text-decoration: underline;
+  opacity: 0.9;
+}
+
 /* ------------------------------------------------------------------ 日志 */
 
 .panel-log { height: 190px; }

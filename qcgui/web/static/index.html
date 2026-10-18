@@ -163,7 +163,38 @@
         <button class="btn primary big" id="btn-run">▶ 运行</button>
         <button class="btn danger" id="btn-cancel" disabled>■ 取消</button>
       </div>
-      <button class="btn ghost full" id="btn-batch" title="多选结构，算相对能量">批量中间体…</button>
+        <button class="btn ghost full" id="btn-batch" title="多选结构，算相对能量">批量中间体…</button>
+
+        <!-- ---------------- 工作流（自动串链） ----------------
+             为什么要这个：像"优化完结构接着算 NMR"这种组合，以前得手工做两次
+             （跑 opt → 跑完再到「几何来源」里选它 → 改成 NMR → 再跑）。
+             中间忘选几何来源就会算未优化的结构，而界面上一切正常。
+             工作流把这条链交给服务端，一步设好，之后不用再管。 -->
+        <div class="workflow-block">
+          <div class="panel-sub"><h3>工作流（自动串链）</h3></div>
+          <div class="charge-row">
+            <label>预设
+              <select id="select-workflow" class="input">
+                <option value="opt,nmr">优化 → NMR</option>
+                <option value="opt,freq">优化 → 频率</option>
+                <option value="opt,freq,nmr">优化 → 频率 → NMR</option>
+                <option value="opt,opt_freq">优化 → 优化+频率</option>
+                <option value="opt,ts_freq">优化 → 过渡态+频率</option>
+                <option value="">自定义…</option>
+              </select>
+            </label>
+          </div>
+          <input type="text" id="input-workflow-custom" class="input"
+                 placeholder="自定义步骤，逗号分隔，如 opt,freq,nmr"
+                 style="display:none">
+          <p class="hint">每一步自动用上一步的结果几何；电荷/多重度沿用上一步。
+            整个链在服务端跑，关掉页面也会继续。</p>
+          <div class="run-row">
+            <button class="btn" id="btn-workflow">⚡ 运行工作流</button>
+            <button class="btn ghost" id="btn-workflow-cancel" disabled>取消</button>
+          </div>
+          <div id="workflow-list" class="workflow-list"></div>
+        </div>
     </div>
   </aside>
 

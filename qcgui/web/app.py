@@ -32,6 +32,7 @@ from ..external import (
     view_with_avogadro,
 )
 from ..jobs import BatchRunner, JobManager
+from ..jobs.workflow import WorkflowRunner, molecule_from_record
 from ..model import JobSpec, JobType, Molecule, geometry_parameters, scan_warnings
 from ..model import JobSpec, JobType, Molecule, scan_warnings
 from ..model.spectrum import (
@@ -780,6 +781,10 @@ def create_app(manager: JobManager | None = None) -> Flask:
     bus = EventBus()
     mgr = manager or JobManager(jobs_root())
     _attach_bus(mgr, bus)
+    #: 工作流执行器。服务端跑，不依赖浏览器是否开着。
+    #: 它的事件也走同一条事件总线（job_id 位置放 workflow_id），
+    #: 这样前端既有的 SSE 通道不用改就能收到进度。
+    workflows = WorkflowRunner(mgr, on_event=lambda wid, ev: bus.publish(wid, ev))
     batches: dict[str, dict] = {}
     batches_lock = threading.Lock()
     batch_seq = {"n": 0}
@@ -787,6 +792,7 @@ def create_app(manager: JobManager | None = None) -> Flask:
     app.config["MANAGER"] = mgr
     app.config["BUS"] = bus
     app.config["BATCHES"] = batches
+    app.config["WORKFLOWS"] = workflows
 
     # ------------------------------------------------------------ 静态资源
 
@@ -1472,6 +1478,77 @@ def create_app(manager: JobManager | None = None) -> Flask:
         )
 
     # ---------------------------------------------------------------- 批量
+
+    # ------------------------------------------------------------ 工作流
+    #
+    # 为什么放在服务端：工作流的价值就是"设好就不用管"。如果靠浏览器驱动，
+    # 一关标签页链就断了，那还不如手工点两次。
+
+    @app.post("/api/workflows")
+    def api_workflow_create():
+        payload = _json_payload()
+        raw_stages = payload.get("stages")
+        if not isinstance(raw_stages, list) or not raw_stages:
+            return jsonify({"error": "stages 必须是非空数组"}), 400
+
+        # 起点结构：和 /api/jobs 一样，支持直接给 molecule，或用上游任务几何
+        try:
+            parent_job = _string_field(payload, "geometry_from_job").strip()
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            if parent_job:
+                molecule = molecule_from_record(mgr, parent_job)
+            else:
+                raw_mol = payload.get("molecule")
+                if not isinstance(raw_mol, dict):
+                    return jsonify({"error": "缺少 molecule 或 geometry_from_job"}), 400
+                molecule = molecule_from_payload(raw_mol)
+        except (ValueError, TypeError, KeyError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        # 共享设置：把顶层的计算设置并入每个步骤（步骤内可覆盖）
+        shared_keys = ("method", "basis", "nprocs", "maxcore_mb", "solvent",
+                       "extra_keywords", "extra_blocks")
+        shared = {k: payload[k] for k in shared_keys if k in payload}
+        try:
+            stages = []
+            for raw in raw_stages:
+                if not isinstance(raw, dict):
+                    return jsonify({"error": "每个步骤必须是对象"}), 400
+                merged = dict(shared)
+                merged.update(raw)
+                stages.append(merged)
+            rec = workflows.submit(molecule, stages, parent_job=parent_job)
+        except (ValueError, TypeError, KeyError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - 兜底也要给出可读信息
+            return jsonify({"error": f"工作流启动失败: {exc}"}), 500
+
+        return jsonify({"workflow": rec.to_dict()}), 201
+
+    @app.get("/api/workflows")
+    def api_workflows():
+        try:
+            limit = _int_field({"limit": request.args.get("limit")}, "limit", 20) or 20
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        limit = max(1, min(limit, 100))
+        return jsonify({"workflows": [w.to_dict() for w in workflows.list_recent(limit)]})
+
+    @app.get("/api/workflows/<wf_id>")
+    def api_workflow(wf_id: str):
+        rec = workflows.get(wf_id)
+        if rec is None:
+            return jsonify({"error": "工作流不存在"}), 404
+        return jsonify({"workflow": rec.to_dict()})
+
+    @app.post("/api/workflows/<wf_id>/cancel")
+    def api_workflow_cancel(wf_id: str):
+        ok = workflows.cancel(wf_id)
+        rec = workflows.get(wf_id)
+        return jsonify({"ok": ok,
+                        "workflow": rec.to_dict() if rec else None})
 
     @app.post("/api/batch")
     def api_batch_create():

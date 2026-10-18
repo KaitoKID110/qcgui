@@ -214,6 +214,11 @@ def _clean_temp_after_each_test():
     for entry in TMP_ROOT.iterdir():
         if entry.name in before:
             continue
+        # pytest 自己的 tmp_path 基目录（pytest-of-<user> / pytest-N）**跨用例复用**，
+        # 删掉它会让后续所有用 tmp_path 的用例报 FileNotFoundError。
+        # 这是实测踩过的坑，不是理论风险。
+        if entry.name.startswith(("pytest-of-", "pytest-")):
+            continue
         try:
             if entry.is_dir():
                 shutil.rmtree(entry, ignore_errors=True)

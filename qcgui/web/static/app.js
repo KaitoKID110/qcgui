@@ -269,6 +269,7 @@ async function loadRecipes() {
     state.recipes = data.recipes || [];
   } catch (err) {
     state.recipes = [];
+  state.workflows = [];
     logLine('配方加载失败: ' + err.message, 'l-err');
   }
   const select = $('select-recipe');
@@ -520,6 +521,10 @@ async function applyUrlParams() {
   // ?logburst=N：日志渲染压力自检（N 行日志灌进真实渲染路径）
   if (params.get('logburst')) {
     await runLogBurstTest(parseInt(params.get('logburst'), 10) || 100000);
+  }
+  // ?wftest=opt,nmr：工作流界面自检（真跑一条链）
+  if (params.get('wftest')) {
+    await runWorkflowUiTest(params.get('wftest'));
   }
 }
 
@@ -2862,6 +2867,243 @@ function bindOrbitalButtons() {
   if (av) av.addEventListener('click', () => openOrbitalsInAvogadro(av.dataset.job));
 }
 
+// ------------------------------------------------------------------ 工作流
+//
+// 为什么放在服务端：工作流的价值是"设好就不用管"。如果靠浏览器推进，
+// 一关标签页链就断了，还不如手工点两次。
+
+/** 当前选中的步骤列表（预设或自定义）。 */
+function workflowStages() {
+  const preset = $('select-workflow').value;
+  const raw = preset === '' ? $('input-workflow-custom').value : preset;
+  return String(raw || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((job_type) => ({ job_type }));
+}
+
+/** 提交工作流。 */
+async function submitWorkflow() {
+  const stages = workflowStages();
+  if (!stages.length) throw new Error('工作流至少要有一步');
+
+  const geometryFrom = $('select-geometry').value || null;
+  if (!state.molecule && !geometryFrom) {
+    throw new Error('请先载入结构，或在「几何来源」里选一个已完成的任务');
+  }
+
+  // 共享设置与单任务一致：方法/基组/溶剂/并行参数
+  const payload = {
+    stages,
+    method: $('input-method').value.trim() || 'HF',
+    basis: $('input-basis').value.trim(),
+    nprocs: parseInt($('input-nprocs').value || '4', 10),
+    maxcore_mb: parseInt($('input-maxcore').value || '2000', 10),
+    geometry_from_job: geometryFrom,
+  };
+  const solvent = $('select-solvent').value || '';
+  if (solvent && solvent !== '气相') payload.solvent = solvent;
+  if (!geometryFrom && state.molecule) {
+    payload.molecule = {
+      symbols: state.molecule.symbols,
+      coords: state.molecule.coords,
+      charge: parseInt($('input-charge').value || '0', 10),
+      multiplicity: parseInt($('input-mult').value || '1', 10),
+      name: state.molecule.name || 'mol',
+    };
+  }
+
+  $('btn-workflow').disabled = true;
+  try {
+    const data = await api('/api/workflows', {
+      method: 'POST', body: JSON.stringify(payload),
+    });
+    const wf = data.workflow || {};
+    logLine(`⚡ 工作流已启动（${stages.map((s) => s.job_type).join(' → ')}）：${wf.workflow_id}`);
+    toast('工作流已启动，服务端会依次执行', 'ok');
+    await refreshWorkflows();
+    startWorkflowWatch();
+    refreshJobs().catch(() => {});
+  } catch (err) {
+    toast('工作流启动失败: ' + err.message, 'err');
+    logLine('✖ 工作流启动失败：' + err.message, 'l-err');
+    throw err;
+  } finally {
+    $('btn-workflow').disabled = false;
+  }
+}
+
+/** 取消最近一条在跑的工作流。 */
+async function cancelWorkflow() {
+  const running = (state.workflows || []).find((w) => w.status === 'running');
+  if (!running) {
+    toast('没有正在运行的工作流', 'info');
+    return;
+  }
+  await api('/api/workflows/' + encodeURIComponent(running.workflow_id) + '/cancel',
+            { method: 'POST' });
+  logLine('✖ 已请求取消工作流 ' + running.workflow_id, 'l-err');
+  await refreshWorkflows();
+}
+
+/** 拉工作流列表并渲染。 */
+async function refreshWorkflows() {
+  try {
+    const data = await api('/api/workflows?limit=5');
+    state.workflows = data.workflows || [];
+    renderWorkflows();
+    const anyRunning = state.workflows.some((w) => w.status === 'running');
+    $('btn-workflow-cancel').disabled = !anyRunning;
+  } catch (err) {
+    logLine('读取工作流失败: ' + err.message, 'l-err');
+  }
+}
+
+/** 有工作流在跑时轮询；全结束自动停。 */
+function startWorkflowWatch(intervalMs = 3000) {
+  if (state._wfWatch) return;
+  state._wfWatch = setInterval(async () => {
+    await refreshWorkflows();
+    const anyRunning = (state.workflows || []).some((w) => w.status === 'running');
+    if (!anyRunning) {
+      clearInterval(state._wfWatch);
+      state._wfWatch = null;
+      refreshJobs().catch(() => {});   // 链跑完了，任务列表也刷新一下
+    }
+  }, intervalMs);
+}
+
+const WF_STATUS_TEXT = {
+  running: '运行中', done: '已完成', failed: '失败',
+  cancelled: '已取消', interrupted: '被中断',
+};
+const STAGE_STATUS_TEXT = {
+  pending: '等待', running: '运行中', done: '完成',
+  failed: '失败', cancelled: '已取消', skipped: '跳过',
+};
+
+/** 渲染工作流进度。 */
+function renderWorkflows() {
+  const box = $('workflow-list');
+  if (!box) return;
+  const list = state.workflows || [];
+  if (!list.length) {
+    box.innerHTML = '<p class="hint">还没有工作流</p>';
+    return;
+  }
+  box.innerHTML = list.map((wf) => {
+    const stages = (wf.stages || []).map((st, i) => {
+      const cls = st.status === 'done' ? 'ok'
+        : st.status === 'failed' ? 'err'
+          : st.status === 'running' ? 'run' : '';
+      // 有 job_id 就给链接：用户最想知道"这一步的结果在哪"
+      const link = st.job_id
+        ? `<a href="#" class="wf-job" data-job="${esc(st.job_id)}">看结果</a>`
+        : '';
+      return `<span class="wf-stage ${cls}" title="${esc(st.message || '')}">
+          ${i + 1}. ${esc(st.job_type)} · ${esc(STAGE_STATUS_TEXT[st.status] || st.status)}
+          ${link}</span>`;
+    }).join('<span class="wf-arrow">→</span>');
+    const statusCls = wf.status === 'done' ? 'ok'
+      : wf.status === 'failed' ? 'err' : wf.status === 'running' ? 'run' : '';
+    return `<div class="wf-item ${statusCls}">
+        <div class="wf-head">
+          <b>${esc(wf.molecule || 'mol')}</b>
+          <span class="wf-status">${esc(WF_STATUS_TEXT[wf.status] || wf.status)}</span>
+          <span class="muted">${esc(wf.workflow_id)}</span>
+        </div>
+        <div class="wf-stages">${stages}</div>
+        ${wf.message ? `<div class="hint">${esc(wf.message)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  // 点"看结果"直接选中那个任务
+  box.querySelectorAll('.wf-job').forEach((a) => {
+    a.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      selectJob(a.dataset.job).catch(() => {});
+    });
+  });
+}
+
+/**
+ * `?wftest=opt,nmr`：工作流界面自检。
+ *
+ * 走的是**和用户点按钮完全相同**的 submitWorkflow 路径，然后轮询到结束，
+ * 把每步状态写进 `#wftest-output` 供抓取。
+ */
+async function runWorkflowUiTest(stepsCsv) {
+  const out = document.createElement('pre');
+  out.id = 'wftest-output';
+  out.style.display = 'none';
+  document.body.appendChild(out);
+  const lines = [];
+
+  try {
+    // 1) 载入一个结构（水），这样工作流有起点
+    const water = {
+      symbols: ['O', 'H', 'H'],
+      coords: [[0, 0, 0.1173], [0, 0.7572, -0.4692], [0, -0.7572, -0.4692]],
+      charge: 0, multiplicity: 1, name: 'water',
+    };
+    const loaded = await api('/api/structure/text', {
+      method: 'POST',
+      body: JSON.stringify({
+        text: '3\nwater\nO 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692\n',
+        name: 'water',
+      }),
+    });
+    state.molecule = loaded.molecule;
+    lines.push('molecule=' + (state.molecule ? state.molecule.n_atoms + ' atoms' : 'FAIL'));
+
+    // 2) 设置成自定义步骤并提交（与用户操作一致）
+    $('select-workflow').value = '';
+    $('input-workflow-custom').style.display = '';
+    $('input-workflow-custom').value = stepsCsv;
+    if ($('select-geometry')) $('select-geometry').value = '';
+    $('input-nprocs').value = '2';
+    lines.push('stages=' + stepsCsv);
+
+    await submitWorkflow();
+    const wf = (state.workflows || [])[0];
+    lines.push('submitted=' + (wf ? wf.workflow_id : 'FAIL'));
+    if (!wf) throw new Error('提交后没拿到工作流记录');
+
+    // 3) 轮询到结束
+    const deadline = Date.now() + 300000;
+    let last = '';
+    let info = wf;
+    while (Date.now() < deadline) {
+      await refreshWorkflows();
+      info = (state.workflows || []).find((w) => w.workflow_id === wf.workflow_id);
+      const snap = info ? info.status + ':' + info.stages.map((s) => s.status).join(',') : '';
+      if (snap !== last) {
+        lines.push('progress=' + snap);
+        last = snap;
+      }
+      if (info && info.status !== 'running') break;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    lines.push('final=' + (info ? info.status : 'FAIL'));
+    for (const st of (info ? info.stages : [])) {
+      lines.push(`  stage ${st.job_type} status=${st.status} job=${st.job_id || '-'}`);
+    }
+
+    // 4) 进度面板真的画出来了吗（DOM 检查，不只看状态）
+    const rendered = $('workflow-list').querySelectorAll('.wf-stage').length;
+    lines.push('rendered_stages=' + rendered);
+    const links = $('workflow-list').querySelectorAll('.wf-job').length;
+    lines.push('result_links=' + links);
+
+  } catch (err) {
+    lines.push('ERROR ' + (err && err.message ? err.message : String(err)));
+  }
+
+  out.textContent = lines.join('\n');
+}
+
 // ------------------------------------------------------------------ SSE
 
 function connectEvents() {
@@ -3079,6 +3321,15 @@ function bindUi() {
     btn.addEventListener('click', () => openExternal(btn.dataset.external));
   });
   $('btn-open-folder').addEventListener('click', () => openExternal('explorer'));
+
+  // ---------- 工作流（自动串链） ----------
+  $('select-workflow').addEventListener('change', () => {
+    const custom = $('select-workflow').value === '';
+    $('input-workflow-custom').style.display = custom ? '' : 'none';
+  });
+  $('btn-workflow').addEventListener('click', () => submitWorkflow().catch(() => {}));
+  $('btn-workflow-cancel').addEventListener('click', () => cancelWorkflow().catch(() => {}));
+  refreshWorkflows();
 
   // 日志
   $('btn-clear-log').addEventListener('click', () => { $('log').textContent = ''; });
