@@ -35,6 +35,7 @@ from ..model.nmr_reference import (
     REFERENCE_MOLECULES,
     average_shieldings,
 )
+from .reference_cache import NmrReferenceCache
 from .manager import JobManager
 
 #: 事件回调：``(workflow_id, event)``。事件的 ``event`` 字段形如
@@ -181,9 +182,11 @@ class WorkflowRunner:
         self.root.mkdir(parents=True, exist_ok=True)
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: dict[str, threading.Event] = {}
-        #: 参考物屏蔽常数缓存：key = (scheme, method, basis, solvent)，value = {元素: σ}
-        #: 参考物计算很便宜（TMS 17 原子），但没必要每条工作流都重算一次。
-        self._reference_cache: dict[tuple, dict[str, float]] = {}
+        #: 参考物屏蔽常数缓存（**磁盘**）：同一方法/基组只需算一次 TMS。
+        #: 位置在任务库下（默认 <jobs_root>/nmr-references），跨重启有效。
+        cache_root = (Path(root) if root is not None
+                      else Path(manager.store.root) / "nmr-references")
+        self.reference_cache = NmrReferenceCache(cache_root)
         self._reconcile()
 
     # ------------------------------------------------------------ 持久化
@@ -364,16 +367,29 @@ class WorkflowRunner:
             # 该步要求算 δ 的话，先把参考物算出来（会额外产生两条可见的任务记录）
             reference: tuple[tuple[str, float], ...] = ()
             reference_scheme = ""
+            reference_source = ""
+            reference_jobs: tuple[str, ...] = ()
             want_reference = str(overrides.get("nmr_reference") or "").strip().lower()
             if want_reference and stage.job_type == "nmr":
                 try:
-                    values = self._ensure_reference(want_reference, overrides)
+                    values, reference_source, jobs = self._ensure_reference(
+                        want_reference, overrides)
                 except (ValueError, TypeError) as exc:
                     self._fail(rec, wf_id, index,
                                f"参考物计算失败，无法给出 δ：{exc}")
                     return
                 reference = tuple(sorted(values.items()))
                 reference_scheme = want_reference
+                reference_jobs = tuple(jobs)
+                self._emit(wf_id, {
+                    "event": "workflow_stage",
+                    "workflow_id": wf_id,
+                    "index": index,
+                    "job_type": stage.job_type,
+                    "status": "running",
+                    "message": ("参考值：复用缓存" if reference_source == "cache"
+                                else "参考值：本次现算"),
+                })
 
             try:
                 spec = self._build_spec(current, stage.job_type, overrides,
@@ -383,7 +399,9 @@ class WorkflowRunner:
                 return
             if reference:
                 spec = replace(spec, nmr_reference=reference,
-                               nmr_reference_scheme=reference_scheme)
+                               nmr_reference_scheme=reference_scheme,
+                               nmr_reference_source=reference_source,
+                               nmr_reference_jobs=reference_jobs)
 
             record = self.manager.submit(spec, blocking=True)
 
@@ -422,7 +440,8 @@ class WorkflowRunner:
                            "status": _STATUS_DONE,
                            "stages": [s.to_dict() for s in rec.stages]})
 
-    def _ensure_reference(self, scheme: str, base: dict) -> dict[str, float]:
+    def _ensure_reference(self, scheme: str, base: dict
+                         ) -> tuple[dict[str, float], str, list[str]]:
         """算（或取缓存）参考物的屏蔽常数：``{元素: 平均 σ}``。
 
         必须**先优化再算 NMR**：实测随手摆的 TMS 甲基构象会让等效核 σ 极差
@@ -434,17 +453,27 @@ class WorkflowRunner:
         if info is None:
             raise ValueError(f"没有内置的参考物: {scheme}")
 
-        key = (scheme, base.get("method"), base.get("basis"), base.get("solvent"))
-        cached = self._reference_cache.get(key)
-        if cached:
-            return cached
+        method = base.get("method", "HF")
+        basis = base.get("basis", "def2-SVP")
+        solvent = base.get("solvent")
+        extra_keywords = base.get("extra_keywords") or ()
+        engine = base.get("engine", "orca")
+
+        # 先看磁盘缓存。键里含方法/基组/溶剂/额外关键字 —— 任何一项不同都不能复用，
+        # 否则会拿另一套设置的参考值算这次的 δ，而界面上看不出异常。
+        hit = self.reference_cache.get(scheme, method, basis, solvent,
+                                       extra_keywords=extra_keywords,
+                                       engine=engine)
+        if hit:
+            return (hit["references"], "cache",
+                    [str(j) for j in (hit.get("source_jobs") or [])])
 
         mol = Molecule.from_xyz(info["xyz"])
 
         # 1) 参考物几何优化（同方法/基组/溶剂）
         opt_spec = JobSpec(molecule=mol, job_type=JobType.OPT,
-                           method=base.get("method", "HF"),
-                           basis=base.get("basis", "def2-SVP"),
+                           method=method,
+                           basis=basis,
                            nprocs=int(base.get("nprocs", 4)),
                            maxcore_mb=int(base.get("maxcore_mb", 2000)),
                            solvent=base.get("solvent"),
@@ -458,8 +487,8 @@ class WorkflowRunner:
         # 2) 参考物 NMR
         mol2 = molecule_from_record(self.manager, opt_rec.job_id)
         nmr_spec = JobSpec(molecule=mol2, job_type=JobType.NMR,
-                           method=base.get("method", "HF"),
-                           basis=base.get("basis", "def2-SVP"),
+                           method=method,
+                           basis=basis,
                            nprocs=int(base.get("nprocs", 4)),
                            maxcore_mb=int(base.get("maxcore_mb", 2000)),
                            solvent=base.get("solvent"),
@@ -480,8 +509,13 @@ class WorkflowRunner:
         references = {el: v for el, v in references.items() if el in covered}
         if not references:
             raise ValueError(f"参考物 {info['label']} 结果里没有可用的元素参考值")
-        self._reference_cache[key] = references
-        return references
+
+        # 写磁盘缓存：带上来源任务 id，以后复用能追溯
+        self.reference_cache.put(
+            scheme, method, basis, references,
+            source_jobs=[opt_rec.job_id, nmr_rec.job_id], solvent=solvent,
+            extra_keywords=extra_keywords, engine=engine)
+        return references, "computed", [opt_rec.job_id, nmr_rec.job_id]
 
     def _build_spec(self, molecule: Molecule, job_type: str,
                     overrides: dict, parent_job: str) -> JobSpec:

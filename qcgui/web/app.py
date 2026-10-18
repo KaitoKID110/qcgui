@@ -1558,6 +1558,37 @@ def create_app(manager: JobManager | None = None) -> Flask:
 
         return jsonify({"workflow": rec.to_dict()}), 201
 
+    # ------------------------------------------------------------ NMR 参考值缓存
+    #
+    # 参考物（TMS）要用当前方法/基组现算，代价是"优化 + NMR"两条任务。
+    # 同一套方法反复用时没必要重算，所以缓存在磁盘上。这两个接口让用户
+    # 能看到缓存里到底有什么、以及随时清掉（方法变了但缓存没失效时的兜底）。
+
+    @app.get("/api/nmr-references")
+    def api_nmr_references():
+        entries = workflows.reference_cache.list_entries()
+        return jsonify({
+            "count": len(entries),
+            "entries": [
+                {
+                    "scheme": e.get("scheme"),
+                    "method": e.get("method"),
+                    "basis": e.get("basis"),
+                    "solvent": e.get("solvent"),
+                    "references": e.get("references"),
+                    "source_jobs": e.get("source_jobs") or [],
+                    "created_at": e.get("created_at"),
+                    "reference_version": e.get("reference_version"),
+                }
+                for e in entries
+            ],
+        })
+
+    @app.delete("/api/nmr-references")
+    def api_nmr_references_clear():
+        removed = workflows.reference_cache.clear()
+        return jsonify({"ok": True, "removed": removed})
+
     @app.get("/api/workflows")
     def api_workflows():
         try:

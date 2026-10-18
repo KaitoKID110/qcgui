@@ -730,7 +730,9 @@ class OrcaEngine(Engine):
             # 「某元素没有参考物」单独放在 elements_without_reference 里由界面渲染，
             # 否则和 note 叠加会出现两遍（实测踩过）。
             tag = scheme.upper() if scheme else "参考物"
-            note = (f"δ = σ({tag}) − σ(样品)，参考物用同一方法/基组现算；"
+            reused = bool(spec is not None and spec.nmr_reference_source == "cache")
+            origin = "（复用同方法/基组的缓存结果）" if reused else "（本次现算）"
+            note = (f"δ = σ({tag}) − σ(样品)，参考物用同一方法/基组{origin}；"
                     "未做经验标定，换泛函/基组后 δ 会偏移")
 
         payload = {
@@ -743,6 +745,12 @@ class OrcaEngine(Engine):
         if references:
             payload["reference_scheme"] = scheme
             payload["references"] = dict(references)
+            if spec is not None:
+                # 溯源：δ 用的参考值是现算的、还是复用缓存？来自哪几个任务？
+                if spec.nmr_reference_source:
+                    payload["reference_source"] = spec.nmr_reference_source
+                if spec.nmr_reference_jobs:
+                    payload["reference_jobs"] = list(spec.nmr_reference_jobs)
             if missing:
                 payload["elements_without_reference"] = list(missing)
         result.nmr = payload

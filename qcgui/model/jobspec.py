@@ -81,6 +81,11 @@ class JobSpec:
     nmr_reference: tuple[tuple[str, float], ...] = ()
     #: 参考方案标识（如 ``"tms"``），仅作追溯与界面展示。
     nmr_reference_scheme: str = ""
+    #: 参考值来源：``"computed"``（本次现算）或 ``"cache"``（复用磁盘缓存）。
+    #: 写进结果里，历史任务也能看出这个 δ 的参考值是怎么来的。
+    nmr_reference_source: str = ""
+    #: 算出参考值的任务 id（现算时是 TMS 的 opt/nmr；复用缓存时是当时那两个）。
+    nmr_reference_jobs: tuple[str, ...] = ()
     #: 使用的配方 id（仅作追溯，不参与计算）
     recipe_id: str = ""
 
@@ -129,6 +134,8 @@ class JobSpec:
             "parent_job": self.parent_job,
             "nmr_reference": [list(item) for item in self.nmr_reference],
             "nmr_reference_scheme": self.nmr_reference_scheme,
+            "nmr_reference_source": self.nmr_reference_source,
+            "nmr_reference_jobs": list(self.nmr_reference_jobs),
             "recipe_id": self.recipe_id,
             "title": self.title,
             "molecule": {
@@ -176,6 +183,10 @@ class JobSpec:
                 if isinstance(item, (list, tuple)) and len(item) == 2
             ),
             nmr_reference_scheme=data.get("nmr_reference_scheme", "") or "",
+            nmr_reference_source=data.get("nmr_reference_source", "") or "",
+            nmr_reference_jobs=tuple(
+                str(j) for j in (data.get("nmr_reference_jobs") or ())
+            ),
             recipe_id=data.get("recipe_id", "") or "",
             title=data.get("title", ""),
         )

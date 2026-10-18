@@ -2969,6 +2969,41 @@ async function cancelWorkflow() {
   await refreshWorkflows();
 }
 
+/**
+ * 刷新"参考值缓存"状态。
+ *
+ * 参考物（TMS）的 σ 只跟 方法/基组/溶剂/额外关键字 有关，所以同一条件只算一次。
+ * 把它显示出来，用户才知道"为什么这次没重算 TMS"。
+ */
+async function refreshNmrCache() {
+  try {
+    const data = await api('/api/nmr-references');
+    const entries = data.entries || [];
+    const info = $('nmr-cache-info');
+    if (!info) return;
+    if (!entries.length) {
+      info.textContent = '参考值缓存：空（下次会现算 TMS）';
+      return;
+    }
+    info.textContent = `参考值缓存：${entries.length} 组（` +
+      entries.map((e) => `${e.method}/${e.basis}`).join('、') + '）';
+    info.title = entries.map((e) =>
+      `${e.scheme} ${e.method}/${e.basis}${e.solvent ? ' SMD(' + e.solvent + ')' : ''}` +
+      ` → ` + Object.entries(e.references || {}).map(([k, v]) => `${k}=${Number(v).toFixed(2)}`).join(', ') +
+      `（来源 ${(e.source_jobs || []).length} 个任务）`).join('\n');
+  } catch (err) {
+    // 读不到就显示不出来，但不要打断别的操作
+  }
+}
+
+/** 清空磁盘上的参考值缓存。 */
+async function clearNmrCache() {
+  const data = await api('/api/nmr-references', { method: 'DELETE' });
+  toast(`已清空 ${data.removed || 0} 组参考值缓存`, 'ok');
+  logLine(`已清空参考值缓存（${data.removed || 0} 组），下次会重新计算 TMS`, 'l-dim');
+  await refreshNmrCache();
+}
+
 /** 拉工作流列表并渲染。 */
 async function refreshWorkflows() {
   try {
@@ -2992,6 +3027,7 @@ function startWorkflowWatch(intervalMs = 3000) {
       clearInterval(state._wfWatch);
       state._wfWatch = null;
       refreshJobs().catch(() => {});   // 链跑完了，任务列表也刷新一下
+      refreshNmrCache().catch(() => {});  // 可能新增了参考值缓存
     }
   }, intervalMs);
 }
@@ -3161,6 +3197,21 @@ function connectEvents() {
         }
       } else {
         queueLogLine(data.line || '');
+      }
+      return;
+    }
+
+    // 工作流事件：进度由 refreshWorkflows 统一渲染，这里只把重要提示写进日志
+    if (kind && kind.startsWith('workflow_')) {
+      if (kind === 'workflow_stage' && data.message) {
+        logLine(`⚡ 工作流第 ${(data.index ?? 0) + 1} 步（${data.job_type}）：${data.message}`, 'l-dim');
+      } else if (kind === 'workflow_done') {
+        logLine('✔ 工作流全部完成', 'l-ok');
+        refreshWorkflows().catch(() => {});
+        refreshJobs().catch(() => {});
+      } else if (kind === 'workflow_failed') {
+        logLine('✖ 工作流失效：' + (data.message || ''), 'l-err');
+        refreshWorkflows().catch(() => {});
       }
       return;
     }
@@ -3351,7 +3402,9 @@ function bindUi() {
   });
   $('btn-workflow').addEventListener('click', () => submitWorkflow().catch(() => {}));
   $('btn-workflow-cancel').addEventListener('click', () => cancelWorkflow().catch(() => {}));
+  $('btn-clear-nmr-cache').addEventListener('click', () => clearNmrCache().catch(() => {}));
   refreshWorkflows();
+  refreshNmrCache();
 
   // 日志
   $('btn-clear-log').addEventListener('click', () => { $('log').textContent = ''; });
