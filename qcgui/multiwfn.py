@@ -43,6 +43,20 @@ def multiwfn_available() -> tuple[bool, str]:
     return True, exe
 
 
+def _ensure_repaired_molden(molden: Path) -> None:
+    """Multiwfn 读 molden 时按 Σ核电荷−电子数 判断净电荷。
+
+    用了 ECP 的体系（如含 Au 的 def2 计算）必须先把 [Atoms] 第三列改成有效
+    核电荷，否则 Multiwfn 会报 "net charge is quite large"，部分分析结果不可信。
+    这里对**以前生成的旧文件**也补一次修复（函数内部幂等）。
+    """
+    try:
+        from .molden import repair_molden_file
+        repair_molden_file(molden)
+    except Exception:      # noqa: BLE001 - 修复失败不该拦住分析本身
+        pass
+
+
 def run_orbital_composition(
     molden_path: str | Path,
     job_dir: str | Path,
@@ -74,6 +88,7 @@ def run_orbital_composition(
     if not molden.is_file():
         result.problems.append(f"找不到波函数文件：{molden.name}（先跑 orca_2mkl -molden）")
         return result
+    _ensure_repaired_molden(molden)
 
     sub = ORBITAL_PARTITIONS.get(partition, ("1", "", ""))[0]
     orbital = ORBITAL_CHOICES.get(request, ("h", ""))[0]
@@ -146,6 +161,7 @@ def run_bond_order_analysis(
     if not molden.is_file():
         result.problems.append(f"找不到波函数文件：{molden.name}（先跑 orca_2mkl -molden）")
         return result
+    _ensure_repaired_molden(molden)
 
     script = _menu_script(kind)
     try:

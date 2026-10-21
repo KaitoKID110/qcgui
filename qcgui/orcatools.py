@@ -229,6 +229,28 @@ def export_mo_cube(
 
 # ---------------------------------------------------------------- Molden
 
+def _fix_molden_charges(path: Path) -> str:
+    """修正 ECP 体系的核电荷列，返回一句给用户看的话（可为空）。
+
+    为什么必须做：用了赝势时 orca_2mkl 写的 ``[Atoms]`` 第三列是**完整核电荷**，
+    而 molden 里的电子数只有价电子。Multiwfn 按 ``Σ核电荷 − 电子数`` 判断净电荷，
+    于是会报 "net charge is quite large"（实测 Au 配合物报 61）并让部分分析
+    结果不可信。改法是写入**有效核电荷**（Z − 被 ECP 替换的芯电子数）。
+
+    修复本身失败不应影响格式转换，只把原因带回去。
+    """
+    try:
+        from .molden import repair_molden_file
+        report = repair_molden_file(path)
+    except Exception as exc:  # noqa: BLE001 - 附带增强，不能拖垮主流程
+        return f"；Molden 核电荷修正跳过（{exc}）"
+    if report.changed:
+        return "；" + report.message()
+    if report.notes and any("ECP" in n for n in report.notes):
+        return "；" + "；".join(report.notes)
+    return ""
+
+
 def make_molden(job_dir: str | Path, gbw: str | Path, timeout: float = 300.0) -> ToolRun:
     """用 ``orca_2mkl`` 把 .gbw 转成 Molden，供 Multiwfn 等外部程序读取。"""
     exe = find_tool("orca_2mkl")
@@ -256,12 +278,14 @@ def make_molden(job_dir: str | Path, gbw: str | Path, timeout: float = 300.0) ->
     ]
     for path in candidates:
         if path.is_file() and path.stat().st_size > 0:
-            return ToolRun(True, "orca_2mkl", f"已生成 {path.name}", command,
+            extra = _fix_molden_charges(path)
+            return ToolRun(True, "orca_2mkl", f"已生成 {path.name}{extra}", command,
                            (proc.stdout or "")[-1000:], [str(path)])
 
     found = sorted(job_dir.glob("*.molden*"))
     if found:
-        return ToolRun(True, "orca_2mkl", f"已生成 {found[0].name}", command,
+        extra = _fix_molden_charges(found[0])
+        return ToolRun(True, "orca_2mkl", f"已生成 {found[0].name}{extra}", command,
                        (proc.stdout or "")[-1000:], [str(found[0])])
     return ToolRun(False, "orca_2mkl",
                    f"未找到 Molden 文件。输出末尾：{((proc.stdout or '') + (proc.stderr or ''))[-600:]}",
