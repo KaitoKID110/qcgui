@@ -50,6 +50,7 @@ from ..model.spectrum import (
 )
 from ..model.trajectory import read_xyz_frames
 from ..orcatools import export_mo_cube, make_molden, probe as probe_orca_tools
+from ..model.jobspec import SYMMETRY_LABELS as _SYMMETRY_LABELS
 from ..paths import jobs_root
 from ..recipes import all_recipes, delete_user_recipe, get_recipe, save_user_recipe
 from ..units import HARTREE_TO_KCAL, HARTREE_TO_KJMOL
@@ -943,6 +944,11 @@ def create_app(manager: JobManager | None = None) -> Flask:
                 "tools": tool_status(config),
                 "config": config,
                 "job_types": _supported_job_types(engines),
+                # 对称性模式由后端提供，前端不写死第二份，避免两边不一致
+                "symmetry_modes": [
+                    {"value": value, "label": label}
+                    for value, label in _SYMMETRY_LABELS.items()
+                ],
                 "solvents": SOLVENT_CHOICES,
                 "units": {"hartree_to_kjmol": HARTREE_TO_KJMOL, "hartree_to_kcal": HARTREE_TO_KCAL},
             }
@@ -1228,6 +1234,9 @@ def create_app(manager: JobManager | None = None) -> Flask:
                     # 只接受显式数值；"自动算参考物"是工作流的能力（要额外跑任务），
                     # 单任务提交不该偷偷多跑东西。
                     nmr_reference=_nmr_reference_field(payload),
+                    # 对称性：见 model/jobspec.py 的 SYMMETRY_MODES
+                    # （空字符串 = 不加关键字，即 ORCA 默认处理）
+                    symmetry=_string_field(payload, "symmetry").strip(),
                     nmr_reference_scheme=_string_field(
                         payload, "nmr_reference_scheme").strip(),
                 )

@@ -159,6 +159,9 @@ class Result:
     #:      "rows": [{"index": 0, "element": "O", "isotropic": 365.694,
     #:               "anisotropy": 4.029}]}
     nmr: dict = field(default_factory=dict)
+    #: 对称性信息：检测到的点群、是否把坐标完美化、完美化后的坐标等。
+    #: 结构见 ``engines/orca.py::_fill_symmetry``。
+    symmetry: dict = field(default_factory=dict)
 
     # --- 规模与耗时 ---
     n_atoms: int | None = None

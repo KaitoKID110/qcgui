@@ -1363,6 +1363,7 @@ function currentSpecPayload() {
     // 扫描时任务类型由扫描面板锁定为几何优化，不看下拉（下拉此时也是禁用的）
     job_type: scan ? 'opt' : $('select-jobtype').value,
     calc_hess: $('input-calc-hess').checked,
+    symmetry: $('select-symmetry') ? $('select-symmetry').value : '',
   }, shared);
 }
 
@@ -1549,6 +1550,31 @@ function verdictBanner(result) {
 }
 
 /**
+ * 概要里的对称性信息。
+ *
+ * 必须显示：开「自动检测并使用」后 ORCA 会把坐标完美化到它检测到的点群，
+ * 实际计算的几何可能和载入的不同 —— 不写出来，用户会以为算的是原始坐标。
+ */
+function symmetryRows(result) {
+  const sym = (result && result.symmetry) || {};
+  if (!Object.keys(sym).length) return '';
+  const rows = [];
+  if (sym.input_point_group) {
+    rows.push(`<dt>点群（检测）</dt><dd class="hi">${esc(String(sym.input_point_group))}</dd>`);
+  }
+  if (sym.reduced_point_group) {
+    rows.push(`<dt>约化点群</dt><dd>${esc(String(sym.reduced_point_group))}</dd>`);
+  }
+  if (sym.final_point_group && sym.final_point_group !== sym.input_point_group) {
+    rows.push(`<dt>点群（最终几何）</dt><dd>${esc(String(sym.final_point_group))}</dd>`);
+  }
+  if (sym.perfected) {
+    rows.push('<dt>坐标</dt><dd>已被 ORCA 完美化到该点群（与载入的几何略有差异）</dd>');
+  }
+  return rows.join('');
+}
+
+/**
  * 结论横幅里的 NMR 一行摘要：按元素给出 δ（没有参考值时给 σ 并注明）。
  *
  * 放在横幅里而不是只放概要，原因见 verdictBanner 里的注释。
@@ -1633,6 +1659,7 @@ function renderResult(job, result) {
     <dt>基函数 / 电子</dt><dd>${result.n_basis_functions ?? '—'} / ${result.n_electrons ?? '—'}</dd>
     ${result.timings && result.timings.SUM !== undefined ? `<dt>耗时</dt><dd>${Number(result.timings.SUM).toFixed(1)} s</dd>` : ''}
     ${nmrSummaryRow(result)}
+    ${symmetryRows(result)}
   </dl></div>`);
 
   // NMR 区块放在这里（概要之后、热化学之前）：对 NMR 任务来说 δ 就是主结果，

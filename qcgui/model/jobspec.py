@@ -75,6 +75,10 @@ class JobSpec:
     #: 参考 ACH-Orca-Workbench 的"用父任务优化后的几何"设计。
     parent_job: str = ""
 
+    #: 对称性设置。取值见 :data:`SYMMETRY_MODES`：
+    #: ``""``（默认，不加关键字）/ ``use``（! UseSym）/ ``off``（! NoUseSym）/
+    #: ``c2v``（! UseC2v）/ ``d2``（! UseD2）/ ``prefer_c2v`` / ``prefer_d2``。
+    symmetry: str = ""
     #: NMR 参考物的屏蔽常数：``(("H", 33.713), ("C", 248.638), ...)``。
     #: 只有 NMR 任务会用；由 workflow 用**同一方法/基组现算**参考物后填入。
     #: 存成 tuple 而不是 dict，是为了保持 JobSpec 不可变/可哈希的一贯风格。
@@ -133,6 +137,7 @@ class JobSpec:
             "calc_hess": self.calc_hess,
             "parent_job": self.parent_job,
             "nmr_reference": [list(item) for item in self.nmr_reference],
+            "symmetry": self.symmetry,
             "nmr_reference_scheme": self.nmr_reference_scheme,
             "nmr_reference_source": self.nmr_reference_source,
             "nmr_reference_jobs": list(self.nmr_reference_jobs),
@@ -182,6 +187,7 @@ class JobSpec:
                 for item in (data.get("nmr_reference") or ())
                 if isinstance(item, (list, tuple)) and len(item) == 2
             ),
+            symmetry=data.get("symmetry", "") or "",
             nmr_reference_scheme=data.get("nmr_reference_scheme", "") or "",
             nmr_reference_source=data.get("nmr_reference_source", "") or "",
             nmr_reference_jobs=tuple(
@@ -205,3 +211,31 @@ class JobSpec:
     def identity(self) -> str:
         """指纹 + 人类可读摘要，便于任务目录命名。"""
         return f"{self.fingerprint()}"
+
+
+#: 对称性模式 → ORCA 关键字。值为空元组表示"不加任何关键字"。
+#:
+#: 实话实说：ORCA 只提供 ``UseSym``（检测并使用对称性）与
+#: ``UseC2v`` / ``UseD2`` / ``PreferC2v`` / ``PreferD2`` 这几个提示性关键字。
+#: 实测 ``UseC2v`` **不能**把 Cs 结构强制成 C2v，所以界面上的措辞是
+#: "自动检测" / "提示偏好"，不能写成"强制指定点群"。
+SYMMETRY_MODES: dict[str, tuple[str, ...]] = {
+    "": (),
+    "use": ("UseSym",),
+    "off": ("NoUseSym",),
+    "c2v": ("UseSym", "UseC2v"),
+    "d2": ("UseSym", "UseD2"),
+    "prefer_c2v": ("UseSym", "PreferC2v"),
+    "prefer_d2": ("UseSym", "PreferD2"),
+}
+
+#: 界面下拉用的中文说明
+SYMMETRY_LABELS: dict[str, str] = {
+    "": "默认（不加对称性关键字，C1）",
+    "use": "自动检测并使用对称性（ORCA 会把坐标完美化）",
+    "off": "显式关闭对称性（NoUseSym）",
+    "c2v": "自动检测 + 倾向 C2v（UseC2v）",
+    "d2": "自动检测 + 倾向 D2（UseD2）",
+    "prefer_c2v": "自动检测 + 偏好 C2v（PreferC2v）",
+    "prefer_d2": "自动检测 + 偏好 D2（PreferD2）",
+}

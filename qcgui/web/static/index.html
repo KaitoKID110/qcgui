@@ -154,6 +154,20 @@
         <label>内存/进程 <input type="number" id="input-maxcore" class="input" value="2000" min="0" step="500"></label>
       </div>
 
+      <label>对称性
+        <select id="select-symmetry" class="input">
+          <option value="">默认（不加对称性关键字）</option>
+          <option value="use">自动检测并使用（ORCA 会完美化坐标）</option>
+          <option value="off">显式关闭（NoUseSym）</option>
+          <option value="c2v">自动检测 + 倾向 C2v</option>
+          <option value="d2">自动检测 + 倾向 D2</option>
+          <option value="prefer_c2v">自动检测 + 偏好 C2v</option>
+          <option value="prefer_d2">自动检测 + 偏好 D2</option>
+        </select>
+      </label>
+      <p class="hint">ORCA 只能<strong>自动检测</strong>点群（并把坐标完美化到该群），
+        不能强制指定任意点群。想让分子保持某个点群，需要先把结构做成那个对称性。</p>
+
       <label class="checkbox" id="wrap-calc-hess">
         <input type="checkbox" id="input-calc-hess">
         <span>过渡态优化前先算精确 Hessian</span>

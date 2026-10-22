@@ -224,6 +224,22 @@ class OrcaEngine(Engine):
         keywords = [k for k in (spec.method, spec.basis) if k]
         keywords.extend(_JOB_KEYWORDS[spec.job_type])
         keywords.extend(k for k in spec.extra_keywords if k)
+        # 对称性关键字放在这里统一追加。用户若在 extra_keywords 里自己写了
+        # UseSym/NoUseSym，以用户的为准（下面会去重，避免同一关键字出现两次）。
+        from ..model.jobspec import SYMMETRY_MODES
+        mode = (getattr(spec, "symmetry", "") or "").strip()
+        if mode and mode not in SYMMETRY_MODES:
+            raise ValueError(
+                f"未知的对称性模式: {mode!r}，可用：{sorted(k for k in SYMMETRY_MODES if k)}")
+        user_sym = {k for k in spec.extra_keywords if k.lower() in
+                    {"usesym", "usesymmetry", "nousym", "nousymmetry", "nosym",
+                     "nosymmetry", "usec2v", "used2", "preferc2v", "preferd2",
+                     "usesym", "usesymmetry"}}
+        for keyword in SYMMETRY_MODES.get(mode, ()):      # type: ignore[arg-type]
+            if user_sym:                                  # 用户自己指定了就不重复加
+                break
+            if keyword not in keywords:
+                keywords.append(keyword)
         # ORCA 对重复关键字直接报 INPUT ERROR（不是忽略），必须去重兜住
         keywords = _dedupe_keywords(keywords)
 
@@ -425,6 +441,7 @@ class OrcaEngine(Engine):
         # 解析失败时留空并记 issue，绝不编数据。
         if spec.job_type is JobType.NMR:
             self._fill_nmr(result, text, spec)
+        self._fill_symmetry(result, text)
 
         # --- 状态判定 ---
         if normal:
@@ -617,6 +634,68 @@ class OrcaEngine(Engine):
 
         if not result.frequencies:
             result.frequencies = _extract_frequencies(geom)
+
+    def _fill_symmetry(self, result: Result, text: str) -> None:
+        """解析 ORCA 的对称性信息：检测到的点群 + 完美化后的坐标。
+
+        为什么要解析并显示：开 ``UseSym`` 后 ORCA 会把坐标**完美化**到它检测到的
+        点群 —— 这意味着实际计算的几何可能和你载入的不完全一样。不告诉用户，
+        他会以为算的就是原始坐标。
+        """
+        import re
+
+        payload: dict = {}
+        found = re.search(r"Auto-detected point group\s*\.{2,}\s*(\S+)", text)
+        if found:
+            payload["input_point_group"] = found.group(1)
+        reduced = re.search(r"Reduced point group\s*\.{2,}\s*(\S+)", text)
+        if reduced:
+            payload["reduced_point_group"] = reduced.group(1)
+        threshold = re.search(r"Threshold in use\s*\.{2,}\s*([0-9.eE+-]+)\s*au", text)
+        if threshold:
+            try:
+                payload["symmetry_threshold_au"] = float(threshold.group(1))
+            except ValueError:
+                pass
+
+        # 完美化坐标（Angstrom 那张表）
+        coords: list[dict] = []
+        block = re.search(
+            r"Symmetry-perfected Cartesians for point group (\S+?):(.*?)(?:\n\s*\n\s*\*|\n\s*CARTESIAN)",
+            text, re.S)
+        if block:
+            payload["perfected_point_group"] = block.group(1)
+            section = block.group(2)
+            ang_marker = section.find("(x, y, z; Ang)")
+            if ang_marker >= 0:
+                for line in section[ang_marker:].splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[1].isalpha():
+                        try:
+                            coords.append({
+                                "symbol": parts[1],
+                                "xyz": [float(parts[2]), float(parts[3]), float(parts[4])],
+                            })
+                        except ValueError:
+                            continue
+        if coords:
+            payload["perfected_coords"] = coords
+            payload["perfected"] = True
+        elif payload.get("input_point_group"):
+            payload["perfected"] = False
+
+        # 优化过程中/结束时打印的点群（取最后一次）
+        groups = re.findall(r"^\s*Point group\s*\.{2,}\s*(\S+)\s*$", text, re.M)
+        if groups:
+            payload["final_point_group"] = groups[-1]
+
+        if payload:
+            payload["note"] = (
+                "开启对称性后 ORCA 检测到点群并把坐标完美化到该群；"
+                "实际计算的几何可能与载入的略有差异（见完美化后的坐标）"
+                if payload.get("perfected") else
+                "ORCA 报告了对称性信息（未做坐标完美化）")
+            result.symmetry = payload
 
     def _fill_nmr(self, result: Result, text: str, spec: JobSpec | None = None) -> None:
         r"""从 ORCA 输出解析 ``CHEMICAL SHIELDING SUMMARY`` 定宽表。
