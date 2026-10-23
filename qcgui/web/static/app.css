@@ -777,3 +777,45 @@ table.data td .strong { color: #e8b23a; }
 /* 结构导入警告（二维坐标 / 自动补氢 / 生成三维构象） */
 .l-warn { color: #f0c05a; }
 
+/* ------------------------------------------------ 工作流步骤表 */
+.wf-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.wf-step {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 24px;
+  gap: 6px;
+  align-items: center;
+}
+
+.wf-step-index {
+  font-size: 11px;
+  opacity: 0.6;
+  text-align: center;
+}
+
+.wf-step input,
+.wf-step select {
+  min-width: 0;
+  font-size: 12px;
+  padding: 3px 5px;
+}
+
+.wf-step-del {
+  border: none;
+  background: transparent;
+  color: #f08080;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.wf-step-del:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+

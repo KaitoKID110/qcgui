@@ -93,6 +93,19 @@
       <label class="field">
         <span>方法 / 泛函</span>
         <input type="text" id="input-method" class="input" list="method-list" value="B3LYP">
+      <datalist id="method-list">
+        <option value="HF">Hartree-Fock</option>
+        <option value="B3LYP">常用混合泛函</option>
+        <option value="PBE0">PBE0</option>
+        <option value="M06-2X">M06-2X</option>
+        <option value="wB97X-D3">wB97X-D3（含色散）</option>
+        <option value="r2SCAN-3c">r2SCAN-3c（复合方法，快速）</option>
+        <option value="WP04">WP04：为 ¹H NMR 位移拟合（LibXC 612）</option>
+        <option value="WC04">WC04：为 ¹³C NMR 位移拟合</option>
+        <option value="MP2">MP2</option>
+        <option value="DLPNO-MP2">DLPNO-MP2（本地 MP2，快）</option>
+        <option value="CCSD(T)">CCSD(T)</option>
+      </datalist>
         <datalist id="method-list">
           <option value="HF"><option value="B3LYP"><option value="B3LYP-D4">
           <option value="PBE0"><option value="PBE"><option value="M06-2X">
@@ -186,30 +199,31 @@
              工作流把这条链交给服务端，一步设好，之后不用再管。 -->
         <div class="workflow-block">
           <div class="panel-sub"><h3>工作流（自动串链）</h3></div>
+
           <div class="charge-row">
-            <label>预设
-              <select id="select-workflow" class="input">
-                <option value="opt,nmr">优化 → NMR</option>
-                <option value="opt,freq">优化 → 频率</option>
-                <option value="opt,freq,nmr">优化 → 频率 → NMR</option>
-                <option value="opt,opt_freq">优化 → 优化+频率</option>
-                <option value="opt,ts_freq">优化 → 过渡态+频率</option>
-                <option value="">自定义…</option>
-              </select>
+            <label>模板
+              <select id="select-workflow" class="input"></select>
+            </label>
+            <label>&nbsp;
+              <button class="btn ghost small" id="btn-wf-save" title="把当前步骤存成模板">存为模板</button>
+            </label>
+            <label>&nbsp;
+              <button class="btn ghost small" id="btn-wf-delete" title="删除当前用户模板">删除</button>
             </label>
           </div>
-          <input type="text" id="input-workflow-custom" class="input"
-                 placeholder="自定义步骤，逗号分隔，如 opt,freq,nmr"
-                 style="display:none">
+
+          <div id="workflow-steps" class="wf-steps"></div>
+          <div class="run-row">
+            <button class="btn ghost small" id="btn-wf-add-step">+ 添加步骤</button>
+          </div>
+
           <label class="checkbox" id="wrap-wf-tms">
             <input type="checkbox" id="input-wf-tms">
             <span>NMR 加 TMS 参考（自动算 δ）</span>
           </label>
-          <p class="hint">勾选后，工作流会先用<strong>同一方法/基组</strong>优化 TMS
-            并算它的 NMR，再算样品，给出 δ = σ(TMS) − σ(样品)。
-            只有 TMS 覆盖的元素（¹H/¹³C/²⁹Si）会显示 δ。</p>
-          <p class="hint">每一步自动用上一步的结果几何；电荷/多重度沿用上一步。
-            整个链在服务端跑，关掉页面也会继续。</p>
+          <p class="hint">每一步默认沿用上面的方法/基组；在步骤里填了就<b>只覆盖该步</b>。
+            每步自动用上一步的结果几何。整个链在服务端跑，关掉页面也会继续。</p>
+
           <div class="run-row">
             <button class="btn" id="btn-workflow">⚡ 运行工作流</button>
             <button class="btn ghost" id="btn-workflow-cancel" disabled>取消</button>
@@ -217,11 +231,11 @@
           <div class="wf-cache-row">
             <span class="hint" id="nmr-cache-info">参考值缓存：—</span>
             <button class="btn ghost small" id="btn-precompute-nmr-cache"
-                    title="用当前的方法/基组/溶剂把 TMS 参考值算好并缓存（不跑样品）">预计算</button>
+                    title="用当前的方法/基组把 TMS 参考值算好并缓存（不跑样品）">预计算</button>
             <button class="btn ghost small" id="btn-clear-nmr-cache"
                     title="删除磁盘上的参考物屏蔽常数缓存，下次会重新计算">清空</button>
           </div>
-          <div id="workflow-list" class="workflow-list"></div>
+        <div id="workflow-list" class="workflow-list"></div>
         </div>
     </div>
   </aside>

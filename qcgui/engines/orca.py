@@ -221,7 +221,14 @@ class OrcaEngine(Engine):
            必须是纯 ASCII。ORCA 遇到 BOM 或任何非 ASCII 字符会直接报
            ``non-ASCII character(s) found`` 并以退出码 50 终止。
         """
-        keywords = [k for k in (spec.method, spec.basis) if k]
+        # LibXC 方法（WP04/WC04）不能写进 ! 行，要翻译成 %method 块。
+        # 实测：! WP04 会报 INPUT ERROR；写成 %method Functional ...
+        # 时 ORCA 才会加载 "Using LibXC functional ID 612"。
+        from ..model.methods import resolve_method
+        libxc = resolve_method(spec.method)
+        simple_method = "" if libxc else spec.method
+
+        keywords = [k for k in (simple_method, spec.basis) if k]
         keywords.extend(_JOB_KEYWORDS[spec.job_type])
         keywords.extend(k for k in spec.extra_keywords if k)
         # 对称性关键字放在这里统一追加。用户若在 extra_keywords 里自己写了
@@ -270,6 +277,13 @@ class OrcaEngine(Engine):
             for row in str(body).splitlines():
                 lines.append("  " + row.strip() if row.strip() else "")
             lines.append("end")
+        if libxc:
+            # 用户若自己写了 %method 块，就不重复加（ORCA 不接受重复块）
+            has_method_block = any(
+                str(name).strip().lstrip("%").lower() == "method"
+                for name, _body in spec.extra_blocks)
+            if not has_method_block:
+                lines += ["%method", f"  Functional {libxc.libxc_name}", "end"]
 
         lines.append("")
         lines.append(spec.molecule.orca_xyz_block())

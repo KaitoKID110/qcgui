@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -91,6 +92,10 @@ class StageRecord:
     status: str = "pending"
     job_id: str = ""
     message: str = ""
+    #: 这一步实际用的方法/基组/溶剂（每步可以不同；界面会显示）
+    method: str = ""
+    basis: str = ""
+    solvent: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -98,6 +103,9 @@ class StageRecord:
             "status": self.status,
             "job_id": self.job_id,
             "message": self.message,
+            "method": self.method,
+            "basis": self.basis,
+            "solvent": self.solvent,
         }
 
 
@@ -151,6 +159,9 @@ class WorkflowRecord:
                 status=str(s.get("status") or "pending"),
                 job_id=str(s.get("job_id") or ""),
                 message=str(s.get("message") or ""),
+                method=str(s.get("method") or ""),
+                basis=str(s.get("basis") or ""),
+                solvent=str(s.get("solvent") or ""),
             )
             for s in (data.get("stages") or [])
         ]
@@ -196,10 +207,16 @@ class WorkflowRunner:
 
     def _save(self, rec: WorkflowRecord) -> None:
         try:
-            self._path(rec.workflow_id).write_text(
+            path = self._path(rec.workflow_id)
+            # 原子写：先写临时文件再 os.replace。
+            # 直接 write_text 时并发的 GET /api/workflows/<id> 可能读到半截
+            # JSON（实测返回 None，界面会闪一下"工作流不存在"）。
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(
                 json.dumps(rec.to_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            os.replace(tmp, path)
         except OSError:
             # 落盘失败不该让工作流停下；内存里的状态仍然是对的
             pass
@@ -397,6 +414,11 @@ class WorkflowRunner:
             except (ValueError, TypeError) as exc:
                 self._fail(rec, wf_id, index, f"参数不合法: {exc}")
                 return
+            # 记下这一步实际用的级别（界面要显示"每步用什么算的"）
+            stage.method = str(getattr(spec, "method", "") or "")
+            stage.basis = str(getattr(spec, "basis", "") or "")
+            stage.solvent = str(getattr(spec, "solvent", "") or "")
+            self._save(rec)
             if reference:
                 spec = replace(spec, nmr_reference=reference,
                                nmr_reference_scheme=reference_scheme,

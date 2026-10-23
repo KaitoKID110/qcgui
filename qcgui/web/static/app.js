@@ -2999,26 +2999,226 @@ function bindOrbitalButtons() {
   if (av) av.addEventListener('click', () => openOrbitalsInAvogadro(av.dataset.job));
 }
 
+/**
+ * 选到 NMR 专用泛函（WP04/WC04）时自动补推荐基组。
+ *
+ * 为什么不静默替换：用户在基组框里已经填了东西就不该动它。
+ * 只有留空时才补，并说明为什么。
+ */
+function autoFillNmrBasis() {
+  const method = ($('input-method').value || '').trim().toUpperCase();
+  const basisInput = $('input-basis');
+  if (!basisInput) return;
+  if ((method === 'WP04' || method === 'WC04') && !basisInput.value.trim()) {
+    basisInput.value = 'pcSseg-2';
+    logLine('已自动填入推荐基组 pcSseg-2（NMR 屏蔽常数专用基组）', 'l-dim');
+  }
+}
+
 // ------------------------------------------------------------------ 工作流
 //
 // 为什么放在服务端：工作流的价值是"设好就不用管"。如果靠浏览器推进，
 // 一关标签页链就断了，还不如手工点两次。
 
-/** 当前选中的步骤列表（预设或自定义）。 */
+//: 内置模板。每个步骤可以只写 job_type（沿用全局方法/基组），
+//: 也可以带 method/basis —— 那一步就用这个级别算。
+//: 「优化 → 单点能」是最常见的组合：低级别优化、高级别算能量。
+const WF_PRESETS = {
+  'opt,energy': {
+    label: '优化 → 单点能（沿用同一级别）',
+    stages: [{ job_type: 'opt' }, { job_type: 'energy' }],
+  },
+  'opt,energy-high': {
+    label: '优化(当前级别) → 单点能(B3LYP/def2-TZVP)',
+    stages: [{ job_type: 'opt' },
+             { job_type: 'energy', method: 'B3LYP', basis: 'def2-TZVP' }],
+  },
+  'opt,nmr': {
+    label: '优化 → NMR（沿用同一级别）',
+    stages: [{ job_type: 'opt' }, { job_type: 'nmr' }],
+  },
+  'opt,nmr-wp04': {
+    label: '优化 → ¹H NMR(δ, WP04/pcSseg-2)',
+    stages: [{ job_type: 'opt' },
+             { job_type: 'nmr', method: 'WP04', basis: 'pcSseg-2' }],
+  },
+  'opt,nmr-wp04-wc04': {
+    label: '优化 → ¹H δ(WP04) → ¹³C δ(WC04)',
+    stages: [{ job_type: 'opt' },
+             { job_type: 'nmr', method: 'WP04', basis: 'pcSseg-2' },
+             { job_type: 'nmr', method: 'WC04', basis: 'pcSseg-2' }],
+  },
+  'opt,freq': {
+    label: '优化 → 频率（热化学/IR）',
+    stages: [{ job_type: 'opt' }, { job_type: 'freq' }],
+  },
+  'opt,freq,nmr': {
+    label: '优化 → 频率 → NMR',
+    stages: [{ job_type: 'opt' }, { job_type: 'freq' }, { job_type: 'nmr' }],
+  },
+  'opt,opt_freq': {
+    label: '优化 → 优化+频率',
+    stages: [{ job_type: 'opt' }, { job_type: 'opt_freq' }],
+  },
+  'opt,ts_freq': {
+    label: '优化 → 过渡态+频率',
+    stages: [{ job_type: 'opt' }, { job_type: 'ts_freq' }],
+  },
+};
+
+//: 每个步骤可选的任务类型（后端 /api/status 会给出引擎支持的那部分，
+//: 这里只是兜底顺序与中文名）
+const WF_JOB_TYPES = [
+  ['opt', '几何优化'], ['energy', '单点能'], ['freq', '频率'],
+  ['opt_freq', '优化+频率'], ['ts', '过渡态'], ['ts_freq', '过渡态+频率'],
+  ['irc', 'IRC'], ['nmr', 'NMR'],
+];
+
+const WF_TEMPLATE_KEY = 'qcgui.workflowTemplates';
+
+/** 读用户自定义模板（localStorage）。 */
+function wfTemplates() {
+  try {
+    return JSON.parse(localStorage.getItem(WF_TEMPLATE_KEY) || '{}');
+  } catch (e) {
+    return {};
+  }
+}
+
+/** 写用户自定义模板。 */
+function saveWfTemplates(obj) {
+  try {
+    localStorage.setItem(WF_TEMPLATE_KEY, JSON.stringify(obj));
+  } catch (e) { /* 隐私模式下写不了，忽略 */ }
+}
+
+/** 重建「模板」下拉：内置 + 用户模板。 */
+function refreshWorkflowTemplateList() {
+  const sel = $('select-workflow');
+  if (!sel) return;
+  const current = sel.value;
+  const opts = Object.entries(WF_PRESETS)
+    .map(([key, p]) => `<option value="${esc(key)}">${esc(p.label)}</option>`);
+  const user = wfTemplates();
+  const userOpts = Object.keys(user)
+    .map((name) => `<option value="user:${esc(name)}">我的模板：${esc(name)}</option>`);
+  sel.innerHTML = opts.concat(userOpts).join('') + '<option value="custom">自定义（手动编辑步骤）</option>';
+  if (current) sel.value = current;
+}
+
+/** 把步骤数组渲染成可编辑的行。 */
+function renderWorkflowSteps(stages) {
+  const box = $('workflow-steps');
+  if (!box) return;
+  box.innerHTML = '';
+  const list = (stages && stages.length) ? stages : [{ job_type: 'opt' }];
+  list.forEach((stage, index) => addWorkflowStepRow(stage, index, list.length));
+  updateWorkflowStepLabels();
+}
+
+/** 追加一行步骤。 */
+function addWorkflowStepRow(stage = {}, index = null, total = null) {
+  const box = $('workflow-steps');
+  if (!box) return;
+  const row = document.createElement('div');
+  row.className = 'wf-step';
+  const jobType = (stage.job_type || 'opt');
+  const options = WF_JOB_TYPES
+    .map(([v, label]) => `<option value="${v}"${v === jobType ? ' selected' : ''}>${label}</option>`)
+    .join('');
+  row.innerHTML = `<span class="wf-step-index"></span>
+    <select class="input wf-step-type">${options}</select>
+    <input class="input wf-step-method" placeholder="方法（留空=沿用）"
+           value="${esc(stage.method || '')}">
+    <input class="input wf-step-basis" placeholder="基组（留空=沿用）"
+           value="${esc(stage.basis || '')}">
+    <button class="wf-step-del" title="删除这一步">×</button>`;
+  box.appendChild(row);
+  row.querySelector('.wf-step-del').addEventListener('click', () => {
+    if (box.children.length <= 1) return;
+    row.remove();
+    updateWorkflowStepLabels();
+  });
+  // 方法填 WP04/WC04 时自动补上推荐基组（用户可再改）
+  const methodInput = row.querySelector('.wf-step-method');
+  const basisInput = row.querySelector('.wf-step-basis');
+  methodInput.addEventListener('change', () => {
+    const alias = methodInput.value.trim().toUpperCase();
+    if ((alias === 'WP04' || alias === 'WC04') && !basisInput.value.trim()) {
+      basisInput.value = 'pcSseg-2';
+    }
+  });
+  updateWorkflowStepLabels();
+}
+
+/** 更新行号 & 删除按钮可用性（只剩一行时不能删）。 */
+function updateWorkflowStepLabels() {
+  const box = $('workflow-steps');
+  if (!box) return;
+  [...box.children].forEach((row, i) => {
+    row.querySelector('.wf-step-index').textContent = String(i + 1);
+    row.querySelector('.wf-step-del').disabled = box.children.length <= 1;
+  });
+}
+
+/** 读步骤表 → 提交用的 stages 数组。 */
 function workflowStages() {
-  const preset = $('select-workflow').value;
-  const raw = preset === '' ? $('input-workflow-custom').value : preset;
-  // 勾了「TMS 参考」就把参考方案挂到 NMR 步骤上（其余步骤不受影响）。
+  const box = $('workflow-steps');
+  if (!box) return [];
   const useTms = $('input-wf-tms') && $('input-wf-tms').checked;
-  return String(raw || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((job_type) => {
-      const stage = { job_type };
-      if (useTms && job_type === 'nmr') stage.nmr_reference = 'tms';
-      return stage;
-    });
+  const stages = [];
+  for (const row of box.children) {
+    const job_type = row.querySelector('.wf-step-type').value;
+    const stage = { job_type };
+    const method = row.querySelector('.wf-step-method').value.trim();
+    const basis = row.querySelector('.wf-step-basis').value.trim();
+    if (method) stage.method = method;
+    if (basis) stage.basis = basis;
+    // 勾了「TMS 参考」就给所有 NMR 步骤挂上参考方案
+    if (useTms && job_type === 'nmr') stage.nmr_reference = 'tms';
+    stages.push(stage);
+  }
+  return stages;
+}
+
+/** 按模板填充步骤表。 */
+function applyWorkflowPreset(key) {
+  if (!key || key === 'custom') return;
+  if (key.startsWith('user:')) {
+    const name = key.slice(5);
+    const tpl = wfTemplates()[name];
+    if (tpl && tpl.length) renderWorkflowSteps(tpl);
+    return;
+  }
+  const preset = WF_PRESETS[key];
+  if (preset) renderWorkflowSteps(preset.stages);
+}
+
+/** 把当前步骤存成用户模板。 */
+function saveWorkflowTemplate() {
+  const stages = workflowStages();
+  if (!stages.length) { toast('没有可保存的步骤', 'err'); return; }
+  const name = (prompt('模板名称（例如：我的 ¹H NMR 流程）') || '').trim();
+  if (!name) return;
+  const all = wfTemplates();
+  all[name] = stages;
+  saveWfTemplates(all);
+  refreshWorkflowTemplateList();
+  $('select-workflow').value = 'user:' + name;
+  toast(`已保存模板「${name}」`, 'ok');
+  logLine(`已保存工作流模板「${name}」：${stages.map((s) => s.job_type).join(' → ')}`, 'l-dim');
+}
+
+/** 删除当前选中的用户模板。 */
+function deleteWorkflowTemplate() {
+  const key = $('select-workflow').value;
+  if (!key.startsWith('user:')) { toast('只有"我的模板"可以删除', 'info'); return; }
+  const name = key.slice(5);
+  const all = wfTemplates();
+  delete all[name];
+  saveWfTemplates(all);
+  refreshWorkflowTemplateList();
+  toast(`已删除模板「${name}」`, 'ok');
 }
 
 /** 提交工作流。 */
@@ -3231,8 +3431,12 @@ function renderWorkflows() {
       const link = st.job_id
         ? `<a href="#" class="wf-job" data-job="${esc(st.job_id)}">看结果</a>`
         : '';
+      // 每步实际用的方法/基组：不同步骤常用不同级别，必须显示
+      const level = (st.method || st.basis)
+        ? `（${esc(st.method || '—')}/${esc(st.basis || '—')}${st.solvent ? ' SMD(' + esc(st.solvent) + ')' : ''}）`
+        : '';
       return `<span class="wf-stage ${cls}" title="${esc(st.message || '')}">
-          ${i + 1}. ${esc(st.job_type)} · ${esc(STAGE_STATUS_TEXT[st.status] || st.status)}
+          ${i + 1}. ${esc(st.job_type)}${level} · ${esc(STAGE_STATUS_TEXT[st.status] || st.status)}
           ${link}</span>`;
     }).join('<span class="wf-arrow">→</span>');
     const statusCls = wf.status === 'done' ? 'ok'
@@ -3288,9 +3492,7 @@ async function runWorkflowUiTest(stepsCsv) {
     lines.push('molecule=' + (state.molecule ? state.molecule.n_atoms + ' atoms' : 'FAIL'));
 
     // 2) 设置成自定义步骤并提交（与用户操作一致）
-    $('select-workflow').value = '';
-    $('input-workflow-custom').style.display = '';
-    $('input-workflow-custom').value = stepsCsv;
+    renderWorkflowSteps(stepsCsv.split(',').map((t) => ({ job_type: t.trim() })));
     if ($('select-geometry')) $('select-geometry').value = '';
     $('input-nprocs').value = '2';
     lines.push('stages=' + stepsCsv);
@@ -3472,6 +3674,7 @@ function bindUi() {
     if (e.target.value) loadStructureFromPath(e.target.value);
   });
 
+  $('input-method').addEventListener('change', autoFillNmrBasis);
   $('btn-smiles').addEventListener('click', async () => {
     const smiles = prompt('输入 SMILES：');
     if (!smiles) return;
@@ -3568,10 +3771,21 @@ function bindUi() {
   $('btn-open-folder').addEventListener('click', () => openExternal('explorer'));
 
   // ---------- 工作流（自动串链） ----------
-  $('select-workflow').addEventListener('change', () => {
-    const custom = $('select-workflow').value === '';
-    $('input-workflow-custom').style.display = custom ? '' : 'none';
+  refreshWorkflowTemplateList();
+  $('select-workflow').addEventListener('change', (e) => {
+    applyWorkflowPreset(e.target.value);
   });
+  $('btn-wf-add-step').addEventListener('click', () => {
+    addWorkflowStepRow({ job_type: 'energy' });
+    updateWorkflowStepLabels();
+  });
+  $('btn-wf-save').addEventListener('click', saveWorkflowTemplate);
+  $('btn-wf-delete').addEventListener('click', deleteWorkflowTemplate);
+  // 默认给一个「优化 → 单点能」的起始模板
+  if ($('workflow-steps') && !$('workflow-steps').children.length) {
+    applyWorkflowPreset('opt,energy');
+    $('select-workflow').value = 'opt,energy';
+  }
   $('btn-workflow').addEventListener('click', () => submitWorkflow().catch(() => {}));
   $('btn-workflow-cancel').addEventListener('click', () => cancelWorkflow().catch(() => {}));
   $('btn-clear-nmr-cache').addEventListener('click', () => clearNmrCache().catch(() => {}));
