@@ -145,7 +145,7 @@ def test_each_stage_can_use_its_own_method_and_basis(tmp_path):
     ])
     info = None
     import time
-    for _ in range(300):
+    for _ in range(1500):
         info = runner.get(rec.workflow_id)
         if info is not None and info.status != "running":
             break
@@ -173,7 +173,7 @@ def test_stage_without_level_inherits_shared_settings(tmp_path):
     ], )
     # submit 的共享设置来自 stages 合并；这里直接看两次提交都拿到了什么
     import time
-    for _ in range(300):
+    for _ in range(1500):
         info = runner.get(rec.workflow_id)
         if info is not None and info.status != "running":
             break

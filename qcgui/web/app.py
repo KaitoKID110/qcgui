@@ -1243,6 +1243,14 @@ def create_app(manager: JobManager | None = None) -> Flask:
         except (ValueError, TypeError) as exc:
             return jsonify({"error": str(exc)}), 400
 
+        # 复合方法自带基组：把可能被默认值/用户输入带进来的基组清空，
+        # 否则 ORCA 的 `! r2SCAN-3c def2-SVP` 会覆盖复合方法的基组。
+        try:
+            from ..model.methods import effective_basis
+            spec.basis = effective_basis(spec.method, spec.basis)
+        except Exception:
+            pass
+
         # 提交前就检查扫描设置。实测过的两种翻车：起点离分子实际值太远
         # （优化第一步硬扳，掉到别的反应通道）、区间跨过 180°
         # （ORCA 内坐标奇点，直接 exit 2）。算力已经花出去就晚了，所以放在这里。

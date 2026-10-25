@@ -214,6 +214,168 @@ class OrcaEngine(Engine):
 
     # ---------------------------------------------------------- 生成输入
 
+    # ------------------------------------------------------------ 片段刚性
+    def _rigid_fragment_setup(self, molecule, groups) -> tuple[dict, list[str]]:
+        """把"刚性片段"翻译成 ORCA 的片段优化指令。
+
+        返回 ``(atom→fragment 标签, %geom 内部要写的行)``。
+
+        规则（都按 ORCA 实测语法）：
+        * 每个刚性片段一个编号（从 1 开始），**其余原子合成一个自由片段**；
+        * ``ConstrainFragments { 1 } { 2 } … end``：这些片段内部坐标全部冻结
+          → 内部无相对位移，但可以整体平移/转动；
+        * ``ConnectFragments``：按真实成键关系连接片段，``O`` 表示优化连接坐标；
+          没有成键关系的用最近原子对自动连接（ORCA 允许省略原子指定）。
+        """
+        n_atoms = len(molecule.atoms)
+        # 清洗：去重、排序、剔除空片段；重叠片段直接报错（否则同原子被约束两次）
+        cleaned: list[tuple[int, ...]] = []
+        used: set[int] = set()
+        for group in groups or ():
+            atoms = sorted({int(i) for i in group})
+            if not atoms:
+                continue
+            if atoms[0] < 0 or atoms[-1] >= n_atoms:
+                raise ValueError(
+                    f"rigid_groups 越界：最大下标 {atoms[-1]}，"
+                    f"但分子只有 {n_atoms} 个原子")
+            overlap = used & set(atoms)
+            if overlap:
+                raise ValueError(
+                    f"rigid_groups 有重叠原子 {sorted(overlap)}："
+                    "同一原子不能属于两个刚性片段")
+            used |= set(atoms)
+            cleaned.append(tuple(atoms))
+        if not cleaned:
+            return {}, []
+
+        labels: dict[int, int] = {}
+        for fragment, atoms in enumerate(cleaned, start=1):
+            for idx in atoms:
+                labels[idx] = fragment
+
+        # 片段之间的真实连接（用距离判键，和环识别同一套逻辑）
+        from ..model.perceive import bond_graph
+        graph = bond_graph(molecule)
+
+        # 自由原子必须**按连通分量再拆**：ORCA 要求每个片段自身连通。
+        # 实测：把 37 个自由原子（实为 1 个核心 + 6 个甲基）合成一个片段时，
+        # ORCA 报 "There are still 37 open fragments" 并在建立内坐标时终止。
+        next_fragment = len(cleaned) + 1
+        seen: set[int] = set()
+        for start in range(n_atoms):
+            if start in labels or start in seen:
+                continue
+            stack = [start]
+            seen.add(start)
+            component = []
+            while stack:
+                cur = stack.pop()
+                component.append(cur)
+                for nbr in graph.neighbors[cur]:
+                    if nbr in labels or nbr in seen:
+                        continue
+                    seen.add(nbr)
+                    stack.append(nbr)
+            for idx in component:
+                labels[idx] = next_fragment
+            next_fragment += 1
+        edges: dict[tuple[int, int], tuple[int, int]] = {}
+        for i in range(n_atoms):
+            for j in graph.neighbors[i]:
+                if j <= i:
+                    continue
+                fi, fj = labels[i], labels[j]
+                if fi == fj:
+                    continue
+                key = (min(fi, fj), max(fi, fj))
+                # 同一对片段有多处成键时，用最短的那对原子做连接更合理
+                prev = edges.get(key)
+                import math
+                def dist(a: int, b: int) -> float:
+                    p, q = molecule.atoms[a], molecule.atoms[b]
+                    return math.dist((p.x, p.y, p.z), (q.x, q.y, q.z))
+                if prev is None or dist(i, j) < dist(*prev):
+                    edges[key] = (i, j)
+
+        # 片段图：按真实成键取生成树（BFS）
+        fragment_ids = sorted(set(labels.values()))
+        adjacency: dict[int, list[tuple[int, tuple[int, int] | None]]] = {
+            f: [] for f in fragment_ids}
+        for (fa, fb), (ai, bj) in edges.items():
+            adjacency[fa].append((fb, (ai, bj)))
+            adjacency[fb].append((fa, (ai, bj)))
+        tree_edges: list[tuple[int, int, tuple[int, int] | None]] = []
+        visited: set[int] = set()
+        for root in fragment_ids:
+            if root in visited:
+                continue
+            visited.add(root)
+            queue = [root]
+            while queue:
+                cur = queue.pop(0)
+                for nxt, atom_pair in adjacency[cur]:
+                    if nxt in visited:
+                        continue
+                    visited.add(nxt)
+                    tree_edges.append((cur, nxt, atom_pair))
+                    queue.append(nxt)
+
+        # 仍然没连上的片段（没有任何成键邻居，例如两个独立分子片段）：
+        # 用最近原子对自动连接，保证整个体系连通。
+        unconnected = [f for f in fragment_ids if f not in visited]
+        if unconnected:
+            import math as _math
+
+            def _dist_pair(fa: int, fb: int):
+                best = None
+                for ia in range(n_atoms):
+                    if labels[ia] != fa:
+                        continue
+                    for ib in range(n_atoms):
+                        if labels[ib] != fb:
+                            continue
+                        pa, pb = molecule.atoms[ia], molecule.atoms[ib]
+                        d = _math.dist((pa.x, pa.y, pa.z), (pb.x, pb.y, pb.z))
+                        if best is None or d < best[0]:
+                            best = (d, ia, ib)
+                return best
+
+            anchor = unconnected[0]
+            for other in unconnected[1:]:
+                pair = _dist_pair(anchor, other)
+                tree_edges.append((anchor, other, None if pair is None
+                                   else (pair[1], pair[2])))
+
+        lines: list[str] = []
+        constraint = "  ConstrainFragments"
+        for fragment in range(1, len(cleaned) + 1):
+            constraint += f" {{ {fragment} }}"
+        constraint += " end"
+        lines.append(constraint)
+        lines.append("  ConnectFragments")
+        for fa, fb, atom_pair in tree_edges:
+            if atom_pair is None:
+                # 没有成键关系（例如两个环各自独立）：让 ORCA 取最近原子对
+                lines.append(f"    {{ {fa} {fb} O }}")
+            else:
+                lines.append(f"    {{ {fa} {fb} O {atom_pair[0]} {atom_pair[1]} }}")
+        lines.append("  end")
+        return labels, lines
+
+    def _labeled_xyz_block(self, molecule, labels: dict) -> str:
+        """坐标块，每个原子带片段标签：``C(1) 0.0 0.0 0.0``。"""
+        lines = [f"* xyz {molecule.charge} {molecule.multiplicity}"]
+        for idx, atom in enumerate(molecule.atoms):
+            fragment = labels.get(idx)
+            if fragment is None:
+                lines.append(atom.to_orca_line())
+            else:
+                lines.append(
+                    f"{atom.symbol}({fragment}) {atom.x:.8f} {atom.y:.8f} {atom.z:.8f}")
+        lines.append("*")
+        return "\n".join(lines)
+
     def build_input_text(self, spec: JobSpec) -> str:
         """构造 ORCA 输入文本。
 
@@ -228,7 +390,10 @@ class OrcaEngine(Engine):
         libxc = resolve_method(spec.method)
         simple_method = "" if libxc else spec.method
 
-        keywords = [k for k in (simple_method, spec.basis) if k]
+        # 安全网：复合方法不能再带基组（否则 ORCA 会用它覆盖复合方法自带的基组）。
+        from ..model.methods import effective_basis
+        safe_basis = effective_basis(spec.method, spec.basis)
+        keywords = [k for k in (simple_method, safe_basis) if k]
         keywords.extend(_JOB_KEYWORDS[spec.job_type])
         keywords.extend(k for k in spec.extra_keywords if k)
         # 对称性关键字放在这里统一追加。用户若在 extra_keywords 里自己写了
@@ -270,13 +435,66 @@ class OrcaEngine(Engine):
                 f'  SMDsolvent "{spec.solvent}"',
                 "end",
             ]
+        # 刚性片段：先在坐标块之前准备好（标签要给坐标块用）
+        rigid_labels: dict = {}
+        rigid_inner: list[str] = []
+        rigid_groups = tuple(getattr(spec, "rigid_groups", ()) or ())
+        if rigid_groups:
+            if getattr(spec, "frozen_atoms", ()):
+                raise ValueError(
+                    "frozen_atoms（笛卡尔固定）与 rigid_groups（片段整体刚性）"
+                    "不能同时使用：两者语义不同，混用会让结果无法解释")
+            rigid_labels, rigid_inner = self._rigid_fragment_setup(
+                spec.molecule, rigid_groups)
+
+        # 所有 %geom 内容合并成一个块（ORCA 不接受重复的 %geom）：
+        #   Calc_Hess + 片段刚性 + 用户额外的 geom 块
+        geom_body: list[str] = []
         if spec.calc_hess and spec.job_type in (JobType.TS, JobType.TS_FREQ):
-            lines += ["%geom", "  Calc_Hess true", "end"]
+            geom_body.append("  Calc_Hess true")
+        geom_body.extend(rigid_inner)
         for name, body in spec.extra_blocks:
+            if str(name).strip().lstrip("%").lower() == "geom":
+                geom_body.extend("  " + row.strip() if row.strip() else ""
+                                 for row in str(body).splitlines())
+        if geom_body:
+            lines.append("%geom")
+            lines.extend(geom_body)
+            lines.append("end")
+        for name, body in spec.extra_blocks:
+            if str(name).strip().lstrip("%").lower() == "geom":
+                continue
             lines.append("%" + str(name).lstrip("%"))
             for row in str(body).splitlines():
                 lines.append("  " + row.strip() if row.strip() else "")
             lines.append("end")
+
+        frozen = getattr(spec, "frozen_atoms", ()) or ()
+        if frozen:
+            # ORCA 的笛卡尔约束：{ C a:b C } 表示把 a..b 号原子固定在初始坐标。
+            # 实测（甲苯，HF/STO-3G）：冻结苯基后环内 C–C 漂移 0.0000 Å，
+            # 而环-甲基连接键照常优化 —— 正是"刚性基团 + 柔性连接"的用法。
+            indices = sorted({int(i) for i in frozen})
+            if indices[0] < 0 or indices[-1] >= len(spec.molecule.atoms):
+                raise ValueError(
+                    f"frozen_atoms 越界：最大下标 {indices[-1]}，"
+                    f"但分子只有 {len(spec.molecule.atoms)} 个原子")
+            ranges: list[tuple[int, int]] = []
+            start = prev = indices[0]
+            for idx in indices[1:]:
+                if idx == prev + 1:
+                    prev = idx
+                    continue
+                ranges.append((start, prev))
+                start = prev = idx
+            ranges.append((start, prev))
+            constraint_lines = ["%geom", "  Constraints"]
+            for a, b in ranges:
+                constraint_lines.append(
+                    f"    {{ C {a}:{b} C }}" if b > a else f"    {{ C {a} C }}")
+            constraint_lines += ["  end", "end"]
+            lines += constraint_lines
+
         if libxc:
             # 用户若自己写了 %method 块，就不重复加（ORCA 不接受重复块）
             has_method_block = any(
@@ -286,7 +504,10 @@ class OrcaEngine(Engine):
                 lines += ["%method", f"  Functional {libxc.libxc_name}", "end"]
 
         lines.append("")
-        lines.append(spec.molecule.orca_xyz_block())
+        if rigid_labels:
+            lines.append(self._labeled_xyz_block(spec.molecule, rigid_labels))
+        else:
+            lines.append(spec.molecule.orca_xyz_block())
         lines.append("")
         return "\n".join(lines)
 
@@ -456,6 +677,7 @@ class OrcaEngine(Engine):
         if spec.job_type is JobType.NMR:
             self._fill_nmr(result, text, spec)
         self._fill_symmetry(result, text)
+        self._fill_constraints(result, spec)
 
         # --- 状态判定 ---
         if normal:
@@ -648,6 +870,39 @@ class OrcaEngine(Engine):
 
         if not result.frequencies:
             result.frequencies = _extract_frequencies(geom)
+
+    def _fill_constraints(self, result: Result, spec: JobSpec) -> None:
+        """把"这一步冻结了哪些原子"记进结果。
+
+        冻结原子意味着**它们根本没参与优化**，看结果时必须能知道这一点，
+        否则会把"约束下的收敛"误当成"完全优化"。
+        """
+        n_atoms = len(spec.molecule.atoms)
+        rigid = tuple(getattr(spec, "rigid_groups", ()) or ())
+        if rigid:
+            n_rigid = sum(len(g) for g in rigid)
+            result.constraints = {
+                "mode": "rigid_fragments",
+                "rigid_groups": [[int(i) for i in g] for g in rigid],
+                "n_groups": len(rigid),
+                "n_frozen": n_rigid,
+                "n_atoms": n_atoms,
+                "note": (f"本轮是片段优化：{len(rigid)} 个环系（共 {n_rigid}/{n_atoms} "
+                         f"个原子）内部坐标冻结、**可作为刚体整体移动**，"
+                         f"片段之间的连接坐标照常优化"),
+            }
+            return
+        frozen = tuple(getattr(spec, "frozen_atoms", ()) or ())
+        if not frozen:
+            return
+        result.constraints = {
+            "mode": "cartesian",
+            "frozen_atoms": [int(i) for i in frozen],
+            "n_frozen": len(frozen),
+            "n_atoms": n_atoms,
+            "note": (f"本轮优化把 {len(frozen)}/{n_atoms} 个原子固定在初始坐标"
+                     f"（笛卡尔约束，不允许任何位移）"),
+        }
 
     def _fill_symmetry(self, result: Result, text: str) -> None:
         """解析 ORCA 的对称性信息：检测到的点群 + 完美化后的坐标。

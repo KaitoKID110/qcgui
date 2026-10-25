@@ -1550,6 +1550,22 @@ function verdictBanner(result) {
 }
 
 /**
+ * 概要里的几何约束信息（第一轮冻结的刚性基团）。
+ *
+ * 必须显示：冻结的原子固定在初始坐标、没有参与优化。不写出来，
+ * 用户会把"约束下的收敛"当成"完整优化"。
+ */
+function constraintRows(result) {
+  const c = (result && result.constraints) || {};
+  if (!c.n_frozen) return '';
+  if (c.mode === 'rigid_fragments') {
+    return `<dt>几何约束</dt><dd>${c.n_groups} 个环系整体刚性`
+      + `（${c.n_frozen}/${c.n_atoms || '?'} 个原子：内部无相对位移、可整体移动）</dd>`;
+  }
+  return `<dt>几何约束</dt><dd>${c.n_frozen}/${c.n_atoms || '?'} 个原子固定在初始坐标</dd>`;
+}
+
+/**
  * 概要里的对称性信息。
  *
  * 必须显示：开「自动检测并使用」后 ORCA 会把坐标完美化到它检测到的点群，
@@ -1660,6 +1676,7 @@ function renderResult(job, result) {
     ${result.timings && result.timings.SUM !== undefined ? `<dt>耗时</dt><dd>${Number(result.timings.SUM).toFixed(1)} s</dd>` : ''}
     ${nmrSummaryRow(result)}
     ${symmetryRows(result)}
+    ${constraintRows(result)}
   </dl></div>`);
 
   // NMR 区块放在这里（概要之后、热化学之前）：对 NMR 任务来说 δ 就是主结果，
@@ -2999,6 +3016,25 @@ function bindOrbitalButtons() {
   if (av) av.addEventListener('click', () => openOrbitalsInAvogadro(av.dataset.job));
 }
 
+/** 复合方法名（自带基组，不能再指定基组）。 */
+const COMPOSITE_METHODS = ['r2scan-3c', 'b97-3c', 'pbeh-3c', 'hf-3c',
+                           'b3lyp-3c', 'pbe-3c', 'rpbeh-3c'];
+
+/** 方法是复合方法时清空基组并提示：否则会覆盖复合方法自带的基组。 */
+function enforceCompositeBasis(inputId, basisId) {
+  const methodInput = $(inputId);
+  const basisInput = $(basisId);
+  if (!methodInput || !basisInput) return;
+  const name = (methodInput.value || '').trim().toLowerCase();
+  if (COMPOSITE_METHODS.includes(name)) {
+    if (basisInput.value.trim()) {
+      basisInput.value = '';
+      logLine(`「${methodInput.value}」自带基组，已清空基组输入`
+              + '（否则会覆盖复合方法的基组，实际算的就不是它了）', 'l-warn');
+    }
+  }
+}
+
 /**
  * 选到 NMR 专用泛函（WP04/WC04）时自动补推荐基组。
  *
@@ -3033,6 +3069,12 @@ const WF_PRESETS = {
     stages: [{ job_type: 'opt' },
              { job_type: 'energy', method: 'B3LYP', basis: 'def2-TZVP' }],
   },
+  'fast-then-tight': {
+    label: '快速优化(r2SCAN-3c) → 高精度单点(B3LYP/def2-TZVP)',
+    // 分级策略：便宜级别拿几何，目标级别算能量 —— 省时间主要靠这个。
+    stages: [{ job_type: 'opt', method: 'r2SCAN-3c' },
+             { job_type: 'energy', method: 'B3LYP', basis: 'def2-TZVP' }],
+  },
   'opt,nmr': {
     label: '优化 → NMR（沿用同一级别）',
     stages: [{ job_type: 'opt' }, { job_type: 'nmr' }],
@@ -3055,6 +3097,13 @@ const WF_PRESETS = {
   'opt,freq,nmr': {
     label: '优化 → 频率 → NMR',
     stages: [{ job_type: 'opt' }, { job_type: 'freq' }, { job_type: 'nmr' }],
+  },
+  'freeze-then-opt': {
+    label: '第一步：Ph 等环系整体刚性（内部无相对位移）→ 第二步：全部放开',
+    // freeze_rings: true → 服务端自动识别环系，把它们设为**片段优化**：
+    // 环内部坐标全部冻结（环内原子间无相对位移），但环可以整体平移/转动，
+    // 与其余部分的连接键照常优化。不是把原子钉死在空间坐标上。
+    stages: [{ job_type: 'opt', freeze_rings: true }, { job_type: 'opt' }],
   },
   'opt,opt_freq': {
     label: '优化 → 优化+频率',
@@ -3122,9 +3171,10 @@ function addWorkflowStepRow(stage = {}, index = null, total = null) {
   if (!box) return;
   const row = document.createElement('div');
   row.className = 'wf-step';
+  if (stage.freeze_rings) row.dataset.freezeRings = '1';
   const jobType = (stage.job_type || 'opt');
   const options = WF_JOB_TYPES
-    .map(([v, label]) => `<option value="${v}"${v === jobType ? ' selected' : ''}>${label}</option>`)
+    .map(([v, label]) => `<option value="${v}"${v === jobType ? ' selected' : ''}>${label}${v === 'opt' && stage.freeze_rings ? '（环系整体刚性）' : ''}</option>`)
     .join('');
   row.innerHTML = `<span class="wf-step-index"></span>
     <select class="input wf-step-type">${options}</select>
@@ -3132,6 +3182,10 @@ function addWorkflowStepRow(stage = {}, index = null, total = null) {
            value="${esc(stage.method || '')}">
     <input class="input wf-step-basis" placeholder="基组（留空=沿用）"
            value="${esc(stage.basis || '')}">
+    <label class="wf-step-freeze" title="把检测到的环系（Ph 等）设为刚性片段：内部无相对位移，但可整体平移/转动；片段间连接键照常优化">
+      <input type="checkbox" class="wf-step-freeze-box"${stage.freeze_rings ? ' checked' : ''}>
+      <span>环系整体刚性</span>
+    </label>
     <button class="wf-step-del" title="删除这一步">×</button>`;
   box.appendChild(row);
   row.querySelector('.wf-step-del').addEventListener('click', () => {
@@ -3174,6 +3228,10 @@ function workflowStages() {
     const basis = row.querySelector('.wf-step-basis').value.trim();
     if (method) stage.method = method;
     if (basis) stage.basis = basis;
+    const freezeBox = row.querySelector('.wf-step-freeze-box');
+    if ((freezeBox && freezeBox.checked) || row.dataset.freezeRings === '1') {
+      stage.freeze_rings = true;
+    }
     // 勾了「TMS 参考」就给所有 NMR 步骤挂上参考方案
     if (useTms && job_type === 'nmr') stage.nmr_reference = 'tms';
     stages.push(stage);
@@ -3674,7 +3732,10 @@ function bindUi() {
     if (e.target.value) loadStructureFromPath(e.target.value);
   });
 
-  $('input-method').addEventListener('change', autoFillNmrBasis);
+  $('input-method').addEventListener('change', () => {
+    enforceCompositeBasis('input-method', 'input-basis');
+    autoFillNmrBasis();
+  });
   $('btn-smiles').addEventListener('click', async () => {
     const smiles = prompt('输入 SMILES：');
     if (!smiles) return;

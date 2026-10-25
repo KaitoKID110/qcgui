@@ -44,6 +44,38 @@ from .manager import JobManager
 WorkflowEventHandler = Callable[[str, dict], None]
 
 _STATUS_RUNNING = "running"
+
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否还活着（跨平台，且不会像 os.kill(pid,0) 那样在 Windows 上误杀）。"""
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            SYNCHRONIZE = 0x00100000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            try:
+                # WAIT_TIMEOUT(258) = 还活着；WAIT_OBJECT_0(0) = 已退出
+                return kernel32.WaitForSingleObject(handle, 0) == 258
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return True if not os.name == "nt" else False
+
+
+
+
+#: 心跳超过这么久没更新，才认为工作流真的死了。
+#: 取 180 秒：大体系单步优化几分钟内可能没有状态变化，
+#: 但心跳线程每 30 秒刷新一次。
+_STALE_SECONDS = 180.0
 _STATUS_DONE = "done"
 _STATUS_FAILED = "failed"
 _STATUS_CANCELLED = "cancelled"
@@ -125,6 +157,12 @@ class WorkflowRecord:
     multiplicity: int = 1
     #: 共享的计算设置（方法/基组/溶剂/核数…），每一步都可以覆盖
     shared: dict = field(default_factory=dict)
+    #: 最后更新时间（心跳）。reconcile 用它判断这个 running 是否还活着，
+    #: 避免另一个进程新建 runner 时把**正在跑**的工作流误标成中断。
+    updated_at: float = 0.0
+    #: 拥有这个工作流的进程号。reconcile 用它判断"原进程是否还活着"，
+    #: 避免服务重启后工作流卡在 running（心跳新但没人推进）。
+    runner_pid: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -137,6 +175,8 @@ class WorkflowRecord:
             "charge": self.charge,
             "multiplicity": self.multiplicity,
             "shared": dict(self.shared),
+            "updated_at": self.updated_at,
+            "runner_pid": self.runner_pid,
             "stages": [s.to_dict() for s in self.stages],
         }
 
@@ -152,6 +192,8 @@ class WorkflowRecord:
             charge=int(data.get("charge") or 0),
             multiplicity=int(data.get("multiplicity") or 1),
             shared=dict(data.get("shared") or {}),
+            updated_at=float(data.get("updated_at") or 0.0),
+            runner_pid=int(data.get("runner_pid") or 0),
         )
         rec.stages = [
             StageRecord(
@@ -193,6 +235,8 @@ class WorkflowRunner:
         self.root.mkdir(parents=True, exist_ok=True)
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: dict[str, threading.Event] = {}
+        #: 每个工作流的心跳停止事件
+        self._heartbeat_stop: dict[str, threading.Event] = {}
         #: 参考物屏蔽常数缓存（**磁盘**）：同一方法/基组只需算一次 TMS。
         #: 位置在任务库下（默认 <jobs_root>/nmr-references），跨重启有效。
         cache_root = (Path(root) if root is not None
@@ -207,6 +251,8 @@ class WorkflowRunner:
 
     def _save(self, rec: WorkflowRecord) -> None:
         try:
+            rec.updated_at = time.time()
+            rec.runner_pid = os.getpid()
             path = self._path(rec.workflow_id)
             # 原子写：先写临时文件再 os.replace。
             # 直接 write_text 时并发的 GET /api/workflows/<id> 可能读到半截
@@ -233,7 +279,19 @@ class WorkflowRunner:
                     json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError, TypeError):
                 continue
-            if rec.status == _STATUS_RUNNING:
+            if rec.status != _STATUS_RUNNING:
+                continue
+            # 心跳新鲜 → 另一个活着的进程正在跑它，不能动。
+            # （实测事故：测试进程新建 runner 把生产进程正在跑的工作流
+            #   标成了中断，而对应的 ORCA 还在算。）
+            age = time.time() - float(rec.updated_at or 0.0)
+            owner = int(getattr(rec, "runner_pid", 0) or 0)
+            if owner and owner != os.getpid() and _pid_alive(owner):
+                continue        # 归属进程还活着 → 别动
+            if rec.updated_at and age < _STALE_SECONDS and (not owner or owner == os.getpid()):
+                # 心跳新鲜且没有/是自己进程：同一进程里的另一个 runner 也不能动它
+                continue
+            if True:
                 rec.status = _STATUS_INTERRUPTED
                 rec.message = "服务重启，工作流中断（不是计算失败）—— 需要的话重新运行一次"
                 for st in rec.stages:
@@ -243,13 +301,27 @@ class WorkflowRunner:
                 self._save(rec)
 
     def get(self, wf_id: str) -> WorkflowRecord | None:
+        """读取工作流状态。
+
+        写入用的是"临时文件 + os.replace"；Windows 上在替换的瞬间读取可能
+        拿到共享冲突（PermissionError）。这里重试几次再放弃 —— 否则界面会
+        偶发闪一下"工作流不存在"（实测过一次）。
+        """
         path = self._path(wf_id)
         if not path.is_file():
             return None
-        try:
-            return WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, TypeError):
-            return None
+        last_error: Exception | None = None
+        for _attempt in range(6):
+            try:
+                return WorkflowRecord.from_dict(
+                    json.loads(path.read_text(encoding="utf-8")))
+            except PermissionError as exc:      # 正被替换 → 稍等重试
+                last_error = exc
+                time.sleep(0.02)
+            except (OSError, ValueError, TypeError) as exc:
+                last_error = exc
+                time.sleep(0.01)
+        return None if last_error is None else None
 
     def list_recent(self, limit: int = 20) -> list[WorkflowRecord]:
         out: list[WorkflowRecord] = []
@@ -323,8 +395,23 @@ class WorkflowRunner:
         )
         with self._lock:
             self._threads[wf_id] = thread
+            self._heartbeat_stop[wf_id] = threading.Event()
         thread.start()
+        threading.Thread(
+            target=self._heartbeat,
+            args=(wf_id, self._heartbeat_stop[wf_id]),
+            name=f"workflow-hb-{wf_id}",
+            daemon=True,
+        ).start()
         return rec
+
+    def _heartbeat(self, wf_id: str, stop: threading.Event) -> None:
+        """运行期间每 30 秒刷新 updated_at，证明这个工作流还活着。"""
+        while not stop.wait(30.0):
+            rec = self.get(wf_id)
+            if rec is None or rec.status != _STATUS_RUNNING:
+                return
+            self._save(rec)
 
     def cancel(self, wf_id: str) -> bool:
         """取消工作流：停掉正在跑的步骤，剩余步骤标 skipped。"""
@@ -414,6 +501,37 @@ class WorkflowRunner:
             except (ValueError, TypeError) as exc:
                 self._fail(rec, wf_id, index, f"参数不合法: {exc}")
                 return
+            # stage 选项 freeze_rings: true → 自动识别环系（苯环等）并冻结，
+            # 用于"第一轮刚性近似优化"。
+            stage_note = ""      # 这一步的附加说明（冻结信息等），不能被任务 message 覆盖
+            want_freeze = bool(overrides.get("freeze_rings"))
+            if want_freeze:
+                from ..model.perceive import frozen_atoms_for_rings, ring_groups
+                frozen = frozen_atoms_for_rings(current)
+                groups = ring_groups(current)
+                n_atoms = len(current.atoms)
+                if not frozen:
+                    stage_note = "没有检测到环系，跳过冻结"
+                elif len(frozen) >= n_atoms - 1:
+                    # 整个分子都是刚性骨架（例如 B12H12 硼簇）：冻结全部原子
+                    # 等于没有自由度可优化，白跑一轮，也可能让优化器无内坐标可用。
+                    stage_note = (
+                        f"检测到 {len(groups)} 个环系覆盖 {len(frozen)}/{n_atoms} "
+                        f"个原子 —— 几乎整个分子都是刚性骨架，冻结无意义，"
+                        f"本轮按普通优化执行")
+                else:
+                    spec = replace(spec, rigid_groups=tuple(groups))
+                    stage_note = (f"环系整体刚性：{len(groups)} 个片段 / "
+                                  f"{len(frozen)} 个原子（内部坐标冻结、可整体移动）"
+                                     f"（{len(groups)} 个环系）：下标 "
+                                     + ",".join(str(i) for i in frozen[:12])
+                                     + ("…" if len(frozen) > 12 else ""))
+
+            # 说明先写进 message（运行中也能看到"这一步冻结了什么"）
+            if stage_note:
+                stage.message = stage_note
+                self._save(rec)
+
             # 记下这一步实际用的级别（界面要显示"每步用什么算的"）
             stage.method = str(getattr(spec, "method", "") or "")
             stage.basis = str(getattr(spec, "basis", "") or "")
@@ -429,7 +547,9 @@ class WorkflowRunner:
 
             stage.job_id = record.job_id
             stage.status = record.status
-            stage.message = record.message or ""
+            # 保留冻结等附加说明；任务自身的 message 若非空也一并带上
+            stage.message = "；".join(
+                part for part in (stage_note, record.message or "") if part)
             self._save(rec)
             self._emit(wf_id, {"event": "workflow_stage",
                                "workflow_id": wf_id,
@@ -590,6 +710,14 @@ class WorkflowRunner:
             shared["nprocs"] = int(shared["nprocs"])
         if "maxcore_mb" in shared:
             shared["maxcore_mb"] = int(shared["maxcore_mb"])
+        # 复合方法（r2SCAN-3c 等）自带基组：必须显式给空字符串，
+        # 否则 JobSpec 默认的 def2-SVP 会覆盖复合方法的基组，
+        # 实际算的就变成 `! r2SCAN-3c def2-SVP`（方法与名字不符）。
+        from ..model.methods import effective_basis
+        method_value = str(shared.get("method") or "")
+        if method_value:
+            shared["basis"] = effective_basis(method_value,
+                                              str(shared.get("basis") or ""))
         return JobSpec(molecule=molecule, job_type=JobType(job_type),
                        parent_job=parent_job, **shared)
 

@@ -159,6 +159,10 @@ class Result:
     #:      "rows": [{"index": 0, "element": "O", "isotropic": 365.694,
     #:               "anisotropy": 4.029}]}
     nmr: dict = field(default_factory=dict)
+    #: 几何约束信息：``{"frozen_atoms": [...], "n_frozen": N, "note": "..."}``。
+    #: 第一轮"刚性基团冻结"必须记录下来 —— 否则看结果时无法知道
+    #: 哪些原子被固定在初始坐标、根本没参与优化。
+    constraints: dict = field(default_factory=dict)
     #: 对称性信息：检测到的点群、是否把坐标完美化、完美化后的坐标等。
     #: 结构见 ``engines/orca.py::_fill_symmetry``。
     symmetry: dict = field(default_factory=dict)

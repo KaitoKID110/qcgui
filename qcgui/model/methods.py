@@ -78,3 +78,24 @@ def suggested_basis(method: str) -> str:
     if alias in ("WP04", "WC04"):
         return "pcSseg-2"
     return ""
+
+
+#: 自带基组的复合方法（3c 系列等）。对这些方法**不能**再指定基组：
+#: ORCA 里 ``! r2SCAN-3c def2-SVP`` 会用 def2-SVP 覆盖复合方法自带的基组，
+#: 于是实际算的就不是 r2SCAN-3c 了 —— 而界面上方法名还显示 r2SCAN-3c。
+COMPOSITE_METHODS: frozenset[str] = frozenset({
+    "r2scan-3c", "b97-3c", "pbeh-3c", "hf-3c", "b3lyp-3c", "pbe-3c",
+    "rpbeh-3c", "r2scan-3c-v", "b97-3c-v",
+})
+
+
+def is_composite(method: str) -> bool:
+    """该方法是否自带基组（复合方法）。"""
+    return (method or "").strip().lower() in COMPOSITE_METHODS
+
+
+def effective_basis(method: str, basis: str) -> str:
+    """实际应该写进 ORCA 输入的基组：复合方法一律为空。"""
+    if is_composite(method):
+        return ""
+    return (basis or "").strip()

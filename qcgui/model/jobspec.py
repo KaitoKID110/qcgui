@@ -75,6 +75,15 @@ class JobSpec:
     #: 参考 ACH-Orca-Workbench 的"用父任务优化后的几何"设计。
     parent_job: str = ""
 
+    #: 刚性片段（"环系整体刚性"）：每个元素是一组原子下标。
+    #: 语义是**片段内部坐标冻结、片段可整体平移/转动**（ORCA 片段优化），
+    #: 与 ``frozen_atoms``（笛卡尔固定、连整体运动都不许）不同。
+    rigid_groups: tuple[tuple[int, ...], ...] = ()
+    #: 第一轮"刚性基团"要冻结的原子下标（0 基）。
+    #: 引擎会生成 ``%geom Constraints { C a:b C }``（ORCA 实测：冻结后
+    #: 环内键长漂移 0.0000 Å）。典型用法：第一轮冻住苯环等刚性基团，
+    #: 第二轮放开做完整优化。
+    frozen_atoms: tuple[int, ...] = ()
     #: 对称性设置。取值见 :data:`SYMMETRY_MODES`：
     #: ``""``（默认，不加关键字）/ ``use``（! UseSym）/ ``off``（! NoUseSym）/
     #: ``c2v``（! UseC2v）/ ``d2``（! UseD2）/ ``prefer_c2v`` / ``prefer_d2``。
@@ -137,6 +146,8 @@ class JobSpec:
             "calc_hess": self.calc_hess,
             "parent_job": self.parent_job,
             "nmr_reference": [list(item) for item in self.nmr_reference],
+            "frozen_atoms": list(self.frozen_atoms),
+            "rigid_groups": [list(g) for g in self.rigid_groups],
             "symmetry": self.symmetry,
             "nmr_reference_scheme": self.nmr_reference_scheme,
             "nmr_reference_source": self.nmr_reference_source,
@@ -186,6 +197,13 @@ class JobSpec:
                 (str(item[0]), float(item[1]))
                 for item in (data.get("nmr_reference") or ())
                 if isinstance(item, (list, tuple)) and len(item) == 2
+            ),
+            frozen_atoms=tuple(
+                int(i) for i in (data.get("frozen_atoms") or ())
+            ),
+            rigid_groups=tuple(
+                tuple(int(i) for i in group)
+                for group in (data.get("rigid_groups") or ())
             ),
             symmetry=data.get("symmetry", "") or "",
             nmr_reference_scheme=data.get("nmr_reference_scheme", "") or "",
